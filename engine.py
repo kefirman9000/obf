@@ -1,7 +1,9 @@
 """Core logic for OBF (Options Bot Farm): strategies, simulation, wildcard tournament,
 historical candles and local storage. No GUI code lives here."""
 import csv
+import bisect
 import json
+import threading
 import math
 import os
 import importlib
@@ -163,6 +165,24 @@ def http_get(url, timeout=10, retries=0):
 ALPACA = {"key": "", "secret": "", "paper": True}  # filled in when you log in (data needs a free Alpaca key too)
 DATA_URL = "https://data.alpaca.markets"
 FEED = "iex"  # the free real-time stock feed; "sip" with a paid data plan
+HIST_SIP = True  # history older than 15 minutes from the full market feed (free); the newest bars stay on FEED
+_PACE = {"calls": []}
+_PACE_LOCK = threading.Lock()
+DATA_PER_MIN = 190  # Alpaca's free plan allows 200 data calls a minute
+
+
+def _pace():
+    """Keeps data calls under the free plan's limit, so long downloads slow down instead of failing."""
+    while True:
+        with _PACE_LOCK:
+            now = time.time()
+            calls = [t for t in _PACE["calls"] if now - t < 60]
+            _PACE["calls"] = calls
+            if len(calls) < DATA_PER_MIN:
+                calls.append(now)
+                return
+            wait = 60 - (now - calls[0]) + 0.05
+        time.sleep(min(max(wait, 0.05), 5))
 
 
 def trade_url():
@@ -179,6 +199,8 @@ def alp(method, url, body=None, timeout=12, retries=1, creds=None):
     if not cr.get("key") or not cr.get("secret"):
         raise NeedLogin("Log in with your Alpaca API key first (Account > Log in). Paper keys are free.")
     data = None if body is None else json.dumps(body).encode()
+    if url.startswith(DATA_URL):
+        _pace()
     delay = 1.0
     for attempt in range(retries + 1):
         req = urllib.request.Request(url, data=data, method=method, headers={
@@ -254,17 +276,41 @@ def fetch_ohlcv(coin, gran_seconds, count, quote="USD", cache=True):
     start = datetime.now(timezone.utc) - timedelta(days=days)
     if newest is not None and len(rows) >= count:
         start = datetime.fromtimestamp(newest, timezone.utc)
-    url0 = (f"{DATA_URL}/v2/stocks/{urllib.parse.quote(coin)}/bars?timeframe={_tf(gran_seconds)}&limit=10000"
-            f"&adjustment=split&feed={FEED}&start={start.strftime('%Y-%m-%dT%H:%M:%SZ')}")
-    token, pages = None, 0
-    while pages < 40:
-        data = alp("GET", url0 + (f"&page_token={token}" if token else ""), timeout=20)
-        for b in data.get("bars") or []:
-            rows[int(_iso_ts(b["t"]))] = (float(b["c"]), float(b["h"]), float(b["l"]), float(b["v"]))
-        token = data.get("next_page_token")
-        pages += 1
-        if not token:
-            break
+    base = (f"{DATA_URL}/v2/stocks/{urllib.parse.quote(coin)}/bars?timeframe={_tf(gran_seconds)}&limit=10000"
+            f"&adjustment=split&start={start.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    # history from the full market (every exchange; free when it's older than 15 minutes), the newest bars from FEED.
+    # The free real-time feed (IEX) only sees a few % of the volume, so its volumes are scaled up to match.
+    cut = datetime.now(timezone.utc) - timedelta(minutes=16)
+    legs = ([(f"&feed=sip&end={cut.strftime('%Y-%m-%dT%H:%M:%SZ')}", "sip"), ("&feed=" + FEED, FEED)]
+            if HIST_SIP and FEED != "sip" and start < cut else [("&feed=" + FEED, FEED)])
+    got = {}
+    for extra_q, feed in legs:
+        token, pages, part = None, 0, {}
+        while pages < 60:
+            try:
+                data = alp("GET", base + extra_q + (f"&page_token={token}" if token else ""), timeout=20)
+            except RuntimeError:
+                if feed == "sip":  # not allowed on this account: everything from FEED instead
+                    break
+                raise
+            for b in data.get("bars") or []:
+                part[int(_iso_ts(b["t"]))] = (float(b["c"]), float(b["h"]), float(b["l"]), float(b["v"]))
+            token = data.get("next_page_token")
+            pages += 1
+            if not token:
+                break
+        got[feed] = part
+    sip, live = got.get("sip") or {}, got.get(FEED) or {}
+    if sip and live and FEED != "sip":
+        both = [t for t in live if t in sip and live[t][3] > 0]
+        ratio = (sum(sip[t][3] for t in both) / max(1e-9, sum(live[t][3] for t in both))) if len(both) >= 5 else VOL_RATIO.get(coin, 0)
+        if ratio > 0:
+            VOL_RATIO[coin] = ratio
+        live = {t: (r[0], r[1], r[2], r[3] * (VOL_RATIO.get(coin) or 1)) for t, r in live.items() if t not in sip}
+    elif live and FEED != "sip" and VOL_RATIO.get(coin):
+        live = {t: (r[0], r[1], r[2], r[3] * VOL_RATIO[coin]) for t, r in live.items()}
+    rows.update(sip)
+    rows.update(live)
     every = sorted(rows)
     keys = every[-count:]
     seq = [rows[t] for t in keys]
@@ -278,6 +324,9 @@ def fetch_ohlcv(coin, gran_seconds, count, quote="USD", cache=True):
         except OSError:
             pass
     return dict(c=[r[0] for r in seq], h=[r[1] for r in seq], l=[r[2] for r in seq], v=[r[3] for r in seq], t=keys)
+
+
+VOL_RATIO = {}  # ticker -> full-market volume / free-feed volume, learned from bars both feeds have
 
 
 def fetch_candles(coin, gran_seconds, count, quote="USD"):
@@ -367,6 +416,123 @@ def pick_contract(chain, S, typ, dte, otm_pct, now=None):
     if not cands:
         return None
     return min(cands, key=lambda r: (abs(r["exp"] - want_exp) / 86400 / max(3, dte)) + abs(r["K"] - want_K) / S * 10)
+
+
+# ---------------- Economic calendar (release dates from FRED, the St. Louis Fed's free data service) ----------------
+# kind: (FRED release id, name, release hour and minute in New York)
+EVENT_KINDS = {
+    "cpi":    (10, "CPI inflation", 8, 30),
+    "jobs":   (50, "Jobs report", 8, 30),
+    "fomc":   (101, "Fed decision", 14, 0),
+    "gdp":    (53, "GDP", 8, 30),
+    "pce":    (54, "PCE inflation", 8, 30),
+    "retail": (9, "Retail sales", 8, 30),
+}
+BIG_EVENTS = ("cpi", "jobs", "fomc")
+_EVENTS = {"data": None, "mtime": 0}
+
+
+def _ny_offset(d):
+    """Hours New York is behind UTC on date d (daylight saving: 2nd Sunday of March to 1st Sunday of November)."""
+    def nth_sunday(y, m, nth):
+        first = datetime(y, m, 1)
+        return 1 + (6 - first.weekday()) % 7 + 7 * (nth - 1)
+    start = datetime(d.year, 3, nth_sunday(d.year, 3, 2))
+    end = datetime(d.year, 11, nth_sunday(d.year, 11, 1))
+    return 4 if start <= datetime(d.year, d.month, d.day) < end else 5
+
+
+def ny_time(date_str, hh, mm):
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+    return d.replace(hour=hh, minute=mm, tzinfo=timezone.utc).timestamp() + _ny_offset(d) * 3600
+
+
+def _events_path():
+    return os.path.join(HOME_DIR, "cache", "events.json")
+
+
+def fetch_events(fred_key, start="2015-01-01"):
+    """Downloads past and scheduled release times for every EVENT_KINDS entry and saves them. -> {kind: [ts, ...]}"""
+    out, errs = {}, []
+    for kind, (rid, name, hh, mm) in EVENT_KINDS.items():
+        url = ("https://api.stlouisfed.org/fred/release/dates?file_type=json&include_release_dates_with_no_data=true"
+               f"&sort_order=asc&limit=10000&realtime_start={start}&release_id={rid}&api_key={urllib.parse.quote(fred_key.strip())}")
+        try:
+            d = json.loads(http_get(url, timeout=20, retries=2))
+            out[kind] = sorted({ny_time(r["date"], hh, mm) for r in d.get("release_dates") or [] if r.get("date")})
+        except Exception as e:
+            errs.append(f"{name}: {e}")
+    if not out:
+        raise RuntimeError("; ".join(errs) or "no release dates came back")
+    os.makedirs(os.path.dirname(_events_path()), exist_ok=True)
+    tmp = _events_path() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(dict(fetched=time.time(), events=out), f)
+    os.replace(tmp, _events_path())
+    _EVENTS["data"] = None
+    return out, errs
+
+
+def events():
+    """{kind: [release times]} from the saved calendar ({} if it was never downloaded). Re-read when the file changes,
+    so worker processes see it too."""
+    try:
+        mt = os.path.getmtime(_events_path())
+    except OSError:
+        return {}
+    if _EVENTS["data"] is None or mt != _EVENTS["mtime"]:
+        try:
+            with open(_events_path()) as f:
+                _EVENTS["data"] = {k: v for k, v in (json.load(f).get("events") or {}).items() if k in EVENT_KINDS}
+        except (OSError, ValueError):
+            _EVENTS["data"] = {}
+        _EVENTS["mtime"] = mt
+    return _EVENTS["data"]
+
+
+def events_fetched():
+    try:
+        with open(_events_path()) as f:
+            return float(json.load(f).get("fetched") or 0)
+    except (OSError, ValueError):
+        return 0.0
+
+
+def next_event(ts, kinds=BIG_EVENTS):
+    """(kind, time) of the next release after ts, or (None, None)."""
+    best = (None, None)
+    ev = events()
+    for k in kinds:
+        lst = ev.get(k) or []
+        i = bisect.bisect_right(lst, ts)
+        if i < len(lst) and (best[1] is None or lst[i] < best[1]):
+            best = (k, lst[i])
+    return best
+
+
+def last_event(ts, kinds=BIG_EVENTS):
+    best = (None, None)
+    ev = events()
+    for k in kinds:
+        lst = ev.get(k) or []
+        i = bisect.bisect_right(lst, ts) - 1
+        if i >= 0 and (best[1] is None or lst[i] > best[1]):
+            best = (k, lst[i])
+    return best
+
+
+def upcoming_events(now=None, days=14):
+    now = now or time.time()
+    ev = events()
+    out = [(t, k) for k in EVENT_KINDS for t in ev.get(k) or [] if now - 3600 <= t <= now + days * 86400]
+    return sorted(out)
+
+
+def _bar_time(extra, c, sim=None):
+    t = ((extra or {}).get(c) or {}).get("t")
+    if t:
+        return t[-1]
+    return getattr(sim, "now", None) or time.time()
 
 
 # ---------------- Interactive Brokers (through IB Gateway / Trader Workstation on your computer) ----------------
@@ -1525,15 +1691,22 @@ VETOES = {
     "chase":   dict(lo=1.0, hi=10.0, side="buy", name="No chasing",
                     text=lambda x: f"never buys more than {x:g}% above its 20-decision average"),
     "revenge": dict(lo=1, hi=50, side="buy", name="No revenge trades",
-                    text=lambda x: f"never re-buys a coin within {int(x)} decisions of losing on it"),
+                    text=lambda x: f"never re-buys a ticker within {int(x)} decisions of losing on it"),
     "thin":    dict(lo=0.2, hi=1.0, side="buy", name="No thin markets",
                     text=lambda x: f"never buys when volume is under {x:g}x normal"),
     "mktdown": dict(lo=0.3, hi=5.0, side="buy", name="No buying into a sell-off",
-                    text=lambda x: f"never buys while the market (BTC) is down {x:g}%+ over 10 decisions"),
+                    text=lambda x: f"never buys while the market (SPY) is down {x:g}%+ over 10 decisions"),
+    "preev":   dict(lo=2, hi=72, side="open", name="Quiet before big news",
+                    text=lambda x: f"never opens a contract in the {x:g} hours before CPI, the jobs report or a Fed decision"),
+    "prefed":  dict(lo=2, hi=72, side="open", name="Quiet before the Fed",
+                    text=lambda x: f"never opens a contract in the {x:g} hours before a Fed decision"),
+    "postev":  dict(lo=0.5, hi=24, side="open", name="Let the news settle",
+                    text=lambda x: f"never opens a contract in the {x:g} hours after CPI, the jobs report or a Fed decision"),
     "panic":   dict(lo=0.5, hi=5.0, side="sell", name="No panic selling",
                     text=lambda x: f"never sells on its strategy right after a {x:g}%+ one-bar drop (stops still work)"),
 }
 MAX_VETOES = 3
+EVENT_VETOES = ("preev", "prefed", "postev")  # only grown once the economic calendar is downloaded
 
 
 def clean_vetoes(d):
@@ -1582,8 +1755,17 @@ def _veto(v, k, x, c, closes, n, extra, coins):
             return False
         base = sum(vol[-L - 1:-1]) / L
         return base > 0 and vol[-1] < x * base
+    if k in ("preev", "prefed", "postev"):
+        if not events():
+            return False
+        now = _bar_time(extra, c, v.sim)
+        if k == "postev":
+            _, t = last_event(now)
+            return t is not None and now - t < x * 3600
+        _, t = next_event(now, ("fomc",) if k == "prefed" else BIG_EVENTS)
+        return t is not None and t - now < x * 3600
     if k == "mktdown":
-        ref = "BTC" if "BTC" in coins else None
+        ref = "SPY" if "SPY" in coins else ("BTC" if "BTC" in coins else None)
         if ref:
             q = closes[ref]
             return len(q) > L and (q[-1] / q[-1 - L] - 1) * 100 <= -x
@@ -1959,9 +2141,12 @@ def bot_step(v, closes, n, coins, extra=None):
                     s = None  # fee-aware: a profit this small would be eaten by the fees, so keep holding
             if opt and s == "sell" and sim.pos.get(c, 0) <= 0 and int(tr.get("omode", 3) or 3) == 1:
                 s = None  # calls-only bot with nothing to close
-            if s and v.vetoes and (s == "buy" or sim.pos.get(c, 0) > 0):
+            if s and v.vetoes and (s == "buy" or sim.pos.get(c, 0) > 0 or opt):
+                opening = sim.pos.get(c, 0) <= 0
                 for k, x in v.vetoes.items():
-                    if VETOES[k]["side"] == s and _veto(v, k, x, c, closes, n, extra, coins):
+                    side = VETOES[k]["side"]
+                    if ((side == s or (side == "open" and opening)) and not (side == "sell" and opening)
+                            and _veto(v, k, x, c, closes, n, extra, coins)):
                         if not any(w[0] == k and w[1] == c for w in v.veto_wait):  # one open what-if per rule and coin
                             v.veto_wait.append((k, c, s, last[c], n + 10 * v.tf))
                         s = None
@@ -1988,7 +2173,7 @@ def bot_step(v, closes, n, coins, extra=None):
         if t:
             if t["side"] == "buy":
                 if v.review and c not in v.entry_flags:  # which never-rules WOULD have blocked this buy (for the review)
-                    v.entry_flags[c] = [k for k, spec in VETOES.items() if spec["side"] == "buy" and k not in v.vetoes
+                    v.entry_flags[c] = [k for k, spec in VETOES.items() if spec["side"] in ("buy", "open") and k not in v.vetoes
                                         and _veto(v, k, (spec["lo"] + spec["hi"]) / 2, c, closes, n, extra, coins)]
                 v.entries[c] = v.entries.get(c, 0) + 1
                 v.since.setdefault(c, n)
@@ -2358,7 +2543,7 @@ class Tournament:
             return {}
         out = {}
         for _ in range(self.rng.randint(1, 2)):
-            k = self.review_pick([k for k in VETOES if k not in out])
+            k = self.review_pick([k for k in VETOES if k not in out and (k not in EVENT_VETOES or events())])
             out[k] = self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"])
         return clean_vetoes(out)
 
@@ -2385,7 +2570,7 @@ class Tournament:
                 out[k] = x
                 stats[k] = [st[0] / 2, st[1] / 2]
         if len(out) < MAX_VETOES and self.rng.random() < 0.15 * self.mut_bias("rules"):
-            k = self.review_pick([k for k in VETOES if k not in out])
+            k = self.review_pick([k for k in VETOES if k not in out and (k not in EVENT_VETOES or events())])
             out[k] = self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"])
         out = clean_vetoes(out)
         return out, {k: s for k, s in stats.items() if k in out}

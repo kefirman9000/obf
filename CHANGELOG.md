@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.0
+**Better history and the economic calendar**
+
+- **Full-market history**: backtests, Training camp, Free roam and the farms now learn from candles built from every
+  exchange (free on Alpaca for anything older than 15 minutes), instead of the IEX-only slice. The newest 15 minutes
+  still come from the free real-time feed, and its volume is scaled up to match so volume rules stay consistent.
+- **Download pacer**: long history downloads now slow themselves to Alpaca's free-plan limit (200 calls a minute) instead
+  of failing halfway.
+- **Economic calendar** (Tools, or the new "Upcoming news" card): CPI, jobs reports, Fed decisions, GDP, PCE and retail
+  sales, past and scheduled, from FRED (the St. Louis Fed's free data service; one free key). It refreshes itself weekly.
+- **News-day never-rules**: bots can now grow "quiet before big news", "quiet before the Fed" and "let the news settle".
+  Like the other never-rules, every trade they skip is graded afterwards, everywhere the farm learns, back to 2016. The
+  calendar window shows which rules are spreading and what they saved or cost. (They only appear once the calendar is
+  downloaded.)
+- Never-rules now also guard opening a put, not only buying calls. Leftover crypto wording in two rules fixed.
+
 ## 1.2.0
 **Interactive Brokers**
 
