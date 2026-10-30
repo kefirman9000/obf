@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.0
+**Market context: the bots watch the market around them**
+
+- **Watched tickers** (left panel, "Market context"): tickers the bots watch but never trade. Default: SPY, VIXY,
+  TLT and MSFT. The free data feed has no VIX index, so VIXY (an ETF that follows VIX futures) stands in for it. Edit
+  the list from the card or Settings > Learning (up to 8).
+- **Context studies**: each bot can evolve up to 3 rules on the watched tickers, either a move rule ("VIXY up 1.5% over
+  10 decisions votes against buying") or a full strategy run on that ticker's chart ("TLT trend-follower saying buy votes
+  for buying"). Each rule also learns its direction: whether that ticker rising is good or bad for its trades. When the
+  market around a stock looks bullish, the bot won't open a new put on it.
+- **Graded in hindsight**: every trade a context study held back is checked afterwards, per watched ticker. Rules that
+  saved money spread to children; rules that blocked winners fade out.
+- **"What they learned"** screen (Tools, or the card): per watched ticker, how many bots study it, how many trades it
+  judged, what it saved or cost, and the best rule so far.
+- The context tickers also feed the Slow farm, Training camp, Free roam and backtests, so the farm can learn these
+  reactions from months of history (lined up bar by bar with each traded ticker).
+
 ## 1.0.0
 **OBF: the bot farm, for options**
 

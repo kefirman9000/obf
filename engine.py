@@ -805,6 +805,8 @@ DEFAULT_SETTINGS = {
     "classics": True,            # mix famous strategies (golden cross, turtle, RSI-2...) into the eggs
     "classic_rate": 25,          # % of new eggs that are a famous strategy (when one isn't on the farm yet)
     "layers": True,              # bots can evolve extra rule layers: a confirming strategy, an exit strategy, a sizing rule
+    "ctx_tickers": ["SPY", "VIXY", "TLT", "MSFT"],  # market context: watched (never traded); VIXY stands in for the VIX
+    "ctx_studies": True,         # bots can evolve studies on the context tickers (VIX up = careful with calls...)
     "htf_studies": True,         # bots can evolve a slower-timeframe study (the bigger trend) that must agree before buying
     "lead_study": True,          # bots can evolve a "Bitcoin leads" study: BTC's recent move votes on other coins
     "post_review": True,         # after losing trades the farm notes which never-rule would have helped, and tries those more
@@ -1193,6 +1195,17 @@ def make_sim(cash, fee, pct, max_coin=None, slip=0.0, genes=None):
     return OptionSim(cash, fee, pct, max_coin, slip, genes) if OPTIONS else Sim(cash, fee, pct, max_coin, slip)
 
 
+def align_ctx(times, ctx_times, ctx_closes):
+    """A context ticker's prices lined up with another ticker's bar times (each bar gets the latest known price)."""
+    out, j, last = [], 0, None
+    for t in times:
+        while j < len(ctx_times) and ctx_times[j] <= t:
+            last = ctx_closes[j]
+            j += 1
+        out.append(last if last is not None else (ctx_closes[0] if ctx_closes else 0.0))
+    return out
+
+
 def data_now(extra, coins):
     """Time of the newest bar in this data (bar times travel with the highs/lows/volumes as 't')."""
     for c in coins:
@@ -1223,6 +1236,7 @@ def tournament_opts(settings):
                 twin_test=bool(settings.get("twin_test", True)), elders=bool(settings.get("elders", True)),
                 seasons=bool(settings.get("seasons", True)),
                 htf_studies=bool(settings.get("htf_studies", True)), lead_study=bool(settings.get("lead_study", True)),
+                ctx=[c for c in (settings.get("ctx_tickers") or []) if valid_coin(c)] if settings.get("ctx_studies", True) else [],
                 post_review=bool(settings.get("post_review", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)))
 
@@ -1385,7 +1399,8 @@ def _grade_vetoes(v, closes, n):
         if k == "coin":  # a skipped coin: if it would have won, its bad record fades
             cp = v.coin_pl.setdefault(c, [0, 0.0])
             cp[1] = cp[1] * 0.9 + max(0.0, -saved)  # bad records also fade slowly, so it re-tries the coin one day
-        st = (v.layer_stats if k in ("plus", "minus", "confirm", "coin", "htf", "lead") else v.veto_stats).setdefault(k, [0.0, 0.0])
+        st = (v.layer_stats if (k in ("plus", "minus", "confirm", "coin", "htf", "lead") or k.startswith("ctx:"))
+              else v.veto_stats).setdefault(k, [0.0, 0.0])
         st[0] += 1
         st[1] += saved
     v.veto_wait = keep
@@ -1393,6 +1408,40 @@ def _grade_vetoes(v, closes, n):
 
 # ---- rule layers: several positive studies, several negative studies, several exit studies, and a sizing rule ----
 MAX_PLUS, MAX_MINUS, MAX_EXITS = 4, 3, 3
+MAX_CTX = 3          # context studies per bot (on tickers it watches but never trades)
+CTX_KEY = "__ctx__"  # where the context tickers' prices travel inside the extra data
+
+
+def ctx_text(e):
+    up = "for" if e["sign"] > 0 else "against"
+    down = "against" if e["sign"] > 0 else "for"
+    if e.get("kind") == "study":
+        return f"{e['sym']} {e['name']} buy votes {up} buying, sell votes {down}"
+    return f"{e['sym']} up {e['th']:g}%+ over {e['lb']} decisions votes {up} buying, down that much votes {down}"
+
+
+def _ctx_votes(v, L, extra, n):
+    """[(sym, vote)] from the bot's context studies: +1 for buying, -1 against, 0 no opinion (or no data)."""
+    out = []
+    ctx = (extra or {}).get(CTX_KEY) or {}
+    for i, e in enumerate(L.get("ctx", [])):
+        q = ctx.get(e["sym"])
+        vote = 0
+        if q is not None and len(q) > 5:
+            if e.get("kind") == "study":
+                sig = strat_signal(e["name"], q, n, e["params"], v.tf)
+                k = f"ctx{i}"
+                if sig:
+                    v.conf_last[k] = sig
+                st = v.conf_last.get(k)
+                vote = (1 if st == "buy" else -1 if st == "sell" else 0) * e["sign"]
+            else:
+                lb = e["lb"] * v.tf
+                if len(q) > lb and q[-1 - lb]:
+                    mv = (q[-1] / q[-1 - lb] - 1) * 100
+                    vote = (1 if mv >= e["th"] else -1 if mv <= -e["th"] else 0) * e["sign"]
+        out.append((e["sym"], vote))
+    return out
 HTF_MULTS = (3, 4, 6, 8, 12)  # a slower-timeframe study looks at candles this many times longer than the bot's own
 
 
@@ -1440,6 +1489,23 @@ def clean_layers(d):
             except (TypeError, ValueError):
                 sub["mult"] = 6
             out["htf"] = sub
+    cx = []
+    for e in (d.get("ctx") or [])[:MAX_CTX]:
+        if not isinstance(e, dict) or not valid_coin(e.get("sym", "")):
+            continue
+        sign = -1 if int(e.get("sign", 1) or 1) < 0 else 1
+        if e.get("kind") == "study":
+            sub = _clean_sub(e)
+            if sub:
+                cx.append(dict(sub, sym=e["sym"], kind="study", sign=sign))
+        else:
+            try:
+                cx.append(dict(sym=e["sym"], kind="move", sign=sign, lb=int(min(max(int(e.get("lb", 10)), 2), 60)),
+                               th=round(min(max(float(e.get("th", 1.0)), 0.1), 10.0), 2)))
+            except (TypeError, ValueError):
+                pass
+    if cx:
+        out["ctx"] = cx
     ld = d.get("lead")
     if isinstance(ld, dict):
         try:
@@ -1482,6 +1548,9 @@ def layers_text(L, stats=None):
     if L.get("htf"):
         parts.append(f"only buys when the bigger trend agrees: {_sub_txt(L['htf'])} on {L['htf']['mult']}x longer candles"
                      + _stat_txt(stats.get("htf"), "buys blocked by the bigger trend"))
+    if L.get("ctx"):
+        parts.append("watches the market: " + "; ".join(ctx_text(e) + _stat_txt(stats.get(f"ctx:{e['sym']}"), "trades it held back")
+                                                        for e in L["ctx"]))
     if L.get("lead"):
         parts.append(f"Bitcoin leads: BTC up {L['lead']['th']:g}%+ over {L['lead']['lb']} decisions votes for buying other "
                      f"coins, down that much votes against" + _stat_txt(stats.get("lead"), "buys blocked by Bitcoin"))
@@ -1500,6 +1569,8 @@ def rule_stack(v_or_entry):
     if L.get("htf"):
         market.append(f"bigger trend must agree ({_sub_txt(L['htf'])} on {L['htf']['mult']}x candles)"
                       + _stat_txt(ls.get("htf"), "blocked buys"))
+    if L.get("ctx"):
+        market.append("watches " + "; ".join(ctx_text(e) for e in L["ctx"]))
     if L.get("lead"):
         market.append(f"Bitcoin leads (BTC {L['lead']['th']:g}% over {L['lead']['lb']} decisions)")
     pos = [f"{g('name')} (main)"] + [_sub_txt(s) for s in L.get("plus", [])]
@@ -1607,15 +1678,23 @@ def bot_step(v, closes, n, coins, extra=None):
                     if len(q_) > lb:
                         mv = (q_[-1] / q_[-1 - lb] - 1) * 100
                         lead_v = 1 if mv >= L["lead"]["th"] else -1 if mv <= -L["lead"]["th"] else 0
-                if L.get("plus") or L.get("minus") or L.get("lead"):
+                ctx_v = _ctx_votes(v, L, extra, n) if L.get("ctx") else []
+                cpos = sum(1 for _, x in ctx_v if x > 0)
+                cneg = sum(1 for _, x in ctx_v if x < 0)
+                if opt and s == "sell" and sim.pos.get(c, 0) <= 0 and cpos > cneg:  # the market says up: no new put
+                    sym_ = next(sy for sy, x in ctx_v if x > 0)
+                    if not any(w[0] == f"ctx:{sym_}" and w[1] == c for w in v.veto_wait):
+                        v.veto_wait.append((f"ctx:{sym_}", c, "sell", last[c], n + 10 * v.tf))
+                    s = None
+                if L.get("plus") or L.get("minus") or L.get("lead") or L.get("ctx"):
                     if s:
                         v.conf_last[f"main:{c}"] = s
                     plus = _study_states(v, L, "plus", closes, c, n, xc)
                     minus = _study_states(v, L, "minus", closes, c, n, xc)
                     trigger = s == "buy" or any(fresh == "buy" for fresh, _ in plus)
                     if trigger and sim.pos.get(c, 0) <= 0 or s == "buy":
-                        votes = (v.conf_last.get(f"main:{c}") == "buy") + sum(1 for _, st_ in plus if st_ == "buy") + (lead_v > 0)
-                        against = sum(1 for _, st_ in minus if st_ == "sell") + (lead_v < 0)
+                        votes = (v.conf_last.get(f"main:{c}") == "buy") + sum(1 for _, st_ in plus if st_ == "buy") + (lead_v > 0) + cpos
+                        against = sum(1 for _, st_ in minus if st_ == "sell") + (lead_v < 0) + cneg
                         if votes - against >= L.get("need", 1):
                             if s != "sell":
                                 s = "buy"
@@ -1626,6 +1705,7 @@ def bot_step(v, closes, n, coins, extra=None):
                                     conf = min(1.6, 0.8 + 0.25 * margin) if (L.get("plus") or L.get("minus")) else 1.0
                         else:
                             why = ("lead" if lead_v < 0 and votes - against + 1 >= L.get("need", 1) else
+                                   f"ctx:{next(sy for sy, x in ctx_v if x < 0)}" if cneg and votes - against + cneg >= L.get("need", 1) else
                                    "minus" if votes >= L.get("need", 1) else "plus")
                             if not any(w[0] == why and w[1] == c for w in v.veto_wait):
                                 v.veto_wait.append((why, c, "buy", last[c], n + 10 * v.tf))
@@ -1820,6 +1900,7 @@ class Tournament:
                  retire_steps=0, risk_caps=None):
         self.coins, self.start_cash, self.fee, self.pct = list(coins), start_cash, fee, pct
         self.risk_caps = dict(risk_caps or (opts or {}).get("risk_caps") or FAST_RISK)
+        self.ctx_syms = [c for c in ((opts or {}).get("ctx") or []) if c not in coins]
         window = int((opts or {}).get("window", window))  # the slow farm judges over a different window
         self.evolve_every, self.W, self.min_trades = max(1, evolve_every), window, min_trades
         self.max_active, self.cap, self.retire_after = max_active, cap, retire_after
@@ -1931,6 +2012,13 @@ class Tournament:
         w = [(self.review.get(k, [0, 0])[0] + 1) / (self.review.get(k, [0, 0])[1] + 1) for k in pool]
         return self.rng.choices(pool, weights=w)[0]
 
+    def rand_ctx(self):
+        sym = self.rng.choice(self.ctx_syms)
+        if self.rng.random() < 0.4:
+            return dict(self._rand_sub(), sym=sym, kind="study", sign=self.rng.choice((1, -1)))
+        return dict(sym=sym, kind="move", sign=self.rng.choice((1, -1)), lb=self.rng.randint(2, 30),
+                    th=round(self.rng.uniform(0.2, 3.0), 2))
+
     def rand_layers(self, chance=0.35):
         """Extra rule layers for a new bot: a few positive studies, a few negative studies, exit studies, sizing."""
         if not self.o.get("layers", True):
@@ -1938,6 +2026,8 @@ class Tournament:
         out = {}
         if self.o.get("htf_studies", True) and self.rng.random() < chance * 0.6:
             out["htf"] = dict(self._rand_sub(), mult=self.rng.choice(HTF_MULTS))
+        if self.ctx_syms and self.rng.random() < chance * 0.7:
+            out["ctx"] = [self.rand_ctx() for _ in range(self.rng.randint(1, 2))]
         if self.o.get("lead_study", True) and self.rng.random() < chance * 0.4:
             out["lead"] = dict(lb=self.rng.randint(4, 30), th=round(self.rng.uniform(0.3, 2.5), 2))
         if self.rng.random() < chance:
@@ -1994,6 +2084,37 @@ class Tournament:
             if self.rng.random() < 0.25:
                 need += self.rng.choice((-1, 1))
             out["need"] = need
+        if self.ctx_syms or any(p.layers.get("ctx") for p in parents):  # context studies, judged by their own evidence
+            pool, seen = [], set()
+            for p in parents:
+                for e in p.layers.get("ctx", []):
+                    k_ = json.dumps(e, sort_keys=True)
+                    if k_ not in seen:
+                        seen.add(k_)
+                        pool.append(json.loads(k_))
+            kept = []
+            for e in pool:
+                st = max((p.layer_stats.get(f"ctx:{e['sym']}") for p in parents if p.layer_stats.get(f"ctx:{e['sym']}")),
+                         key=lambda x: x[0], default=None)
+                bad, good = bool(st and st[0] >= 5 and st[1] < 0), bool(st and st[0] >= 5 and st[1] > 0)
+                if self.rng.random() > (0.55 if bad else 0.92 if good else 0.8):
+                    continue
+                roll = self.rng.random()
+                if roll < 0.06:
+                    e["sign"] = -e["sign"]
+                elif roll < 0.35:
+                    if e.get("kind") == "study":
+                        e["params"] = self.mutate(e["name"], e["params"], 0.2)
+                    else:
+                        e["lb"] = int(e["lb"] * self.rng.uniform(0.7, 1.4))
+                        e["th"] = e["th"] * self.rng.uniform(0.75, 1.3)
+                kept.append(e)
+                if st and not bad:
+                    stats[f"ctx:{e['sym']}"] = [st[0] / 2, st[1] / 2]
+            if self.ctx_syms and len(kept) < MAX_CTX and self.rng.random() < 0.1 * self.mut_bias("studies"):
+                kept.append(self.rand_ctx())
+            if kept:
+                out["ctx"] = kept[:MAX_CTX]
         for key, on in (("htf", self.o.get("htf_studies", True)), ("lead", self.o.get("lead_study", True))):
             if not on:
                 continue
@@ -3216,6 +3337,8 @@ def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes
         raise ValueError("not enough history: pick a longer stretch or smaller candles")
     train = {c: closes[c][:cut] for c in coins}
     tx = {c: {k: x[:cut] for k, x in extra[c].items()} for c in coins} if extra else None
+    if extra and extra.get(CTX_KEY):
+        tx[CTX_KEY] = {k: x[:cut] for k, x in extra[CTX_KEY].items()}
     t = Tournament(coins, start_cash, fee, pct, evolve, params=params, opts=opts, cap=cap, retire_steps=retire_steps,
                    rng=random.Random(seed))
     for g in seed_genes or []:

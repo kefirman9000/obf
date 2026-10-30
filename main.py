@@ -154,7 +154,9 @@ SETTING_GROUPS = [
         (None, "Rules a bot can grow", "head"),
         ("layers", "Studies: several reasons to buy, several reasons not to, exit studies and sizing", bool),
         ("htf_studies", "Bigger-trend study: a slower timeframe must agree before buying", bool),
-        ("lead_study", "Bitcoin leads: BTC's recent move votes on other coins", bool),
+        ("ctx_studies", "Market context: bots can grow studies on the tickers below (e.g. VIX jumping = no new calls)", bool),
+        ("ctx_tickers", "Tickers the bots WATCH but never trade, separated by commas (VIXY stands in for the VIX index, "
+                        "which isn't in the free data feed)", "tickers"),
         ("vetoes", "Never-rules: things a bot refuses to do, each graded in hindsight", bool),
         ("adapt_exits", "Adaptive stops: wider in wild markets, tighter in calm ones", bool),
         ("confidence_sizing", "Confidence sizing: bigger when its studies clearly agree", bool),
@@ -741,6 +743,7 @@ class App:
         self.opt = {}             # ticker -> the option contract the account holds: {type, K, exp, symbol}
         self.opt_quotes = {}      # option symbol -> (bid, ask, time) from Alpaca
         self.market = None        # Alpaca market clock (is_open, next_open, next_close)
+        self.ctx_hist = {}        # context ticker -> prices lined up with the session's bars (watched, never traded)
         self.tick_px = {}         # coin -> deque of (time, price) for the tick chart
         self.brake_note = 0.0
 
@@ -991,7 +994,22 @@ class App:
                              command=self.toggle_auto_coins)
         ab.pack(side="left", padx=(8, 0))
         Tip(ab, "Wildcard only: when you press Start, the bot scouts the market and trades the busiest tickers that are "
-                "actually moving (no stablecoins). How many: Settings > Wildcard.")
+                "actually moving. How many: Settings > Wildcard.")
+
+        # --- market context card: tickers the bots watch but never trade
+        f, c = self.card(left, "MARKET CONTEXT (WATCHED)")
+        f.pack(fill="x", pady=(0, 8))
+        self.ctx_box = tk.Frame(c, bg=CARD)
+        self.ctx_box.pack(fill="x")
+        crow2 = tk.Frame(c, bg=CARD)
+        crow2.pack(fill="x", pady=(4, 0))
+        ttk.Button(crow2, text="What they learned...", style="Plain.TButton", command=self.open_context).pack(side="left")
+        ttk.Button(crow2, text="Edit", style="Plain.TButton", command=self.edit_context).pack(side="left", padx=(4, 0))
+        Tip(self.ctx_box, "The bots watch these tickers without trading them, and can evolve studies on them: for example "
+                          "'when VIXY (the VIX stand-in) jumps, don't buy calls' or 'when TLT trends up, favour calls'. "
+                          "Every such study is graded by what the trades it held back would have done.")
+        self.ctx_labels = {}
+        self.root.after(200, self.ctx_card_build)
 
         # --- strategy card
         f, c = self.card(left, "STRATEGY")
@@ -1245,6 +1263,7 @@ class App:
         m.add_command(label="Bot family tree...", command=self.open_family)
         m.add_command(label="Weekly report now...", command=self.show_report)
         m.add_command(label="Training camp (a whole farm through history)...", command=self.open_training)
+        m.add_command(label="Market context: what the bots learned...", command=self.open_context)
         m.add_command(label="Free roam (the farm learns from the past by itself)...", command=self.open_roam)
         m.add_command(label="Backtest a bot...", command=lambda: self.open_backtest(None))
         m.add_command(label="Backtest the Hall of Fame...", command=self.backtest_hof)
@@ -2660,6 +2679,38 @@ class App:
         vol = E.IV_HINT.get(coin) or E.realized_vol(self.hist.get(coin) or [S], (self.hx.get(coin) or {}).get("t"))
         return E.bs_price(S, o["K"], T, vol, o["type"]) * E.CONTRACT
 
+    def ctx_list(self, coins=None):
+        """The market-context tickers the bots watch (minus any they trade)."""
+        coins = coins if coins is not None else self.session_coins
+        return [c for c in (self.settings.get("ctx_tickers") or []) if E.valid_coin(c) and c not in coins]
+
+    def extra_now(self):
+        """The extra data for a farm step: highs/lows/volumes/times per traded ticker, plus the context tickers."""
+        x = {c: self.hx[c] for c in self.session_coins}
+        if self.ctx_hist:
+            x[E.CTX_KEY] = self.ctx_hist
+        return x
+
+    def add_ctx(self, extra, gran, count, quote="USD"):
+        """Fetches the context tickers for a stretch of history and lines them up with its bar times."""
+        coins = [c for c in extra if c != E.CTX_KEY]
+        if not coins:
+            return extra
+        times = list(extra[coins[0]].get("t") or [])
+        if not times:
+            return extra
+        out = {}
+        for sym in self.ctx_list(coins):
+            try:
+                d = E.fetch_ohlcv(sym, gran, count, quote)
+                if d.get("t"):
+                    out[sym] = E.align_ctx(times, d["t"], d["c"])
+            except Exception:
+                continue
+        if out:
+            extra[E.CTX_KEY] = out
+        return extra
+
     def contract_label(self, c):
         o = self.opt.get(c)
         return E.contract_text(dict(o, under=c)) if o else c
@@ -2736,6 +2787,7 @@ class App:
             self.activity_lbl.config(text="")
         if self.moving():
             return self.later(self.refresh_view, 300)
+        self.ctx_card_refresh()
         self.refresh_prices()
         self.draw_chart()
         self.headline_lbl.config(text=self.headline())
@@ -3013,6 +3065,16 @@ class App:
         hx = {c: {k: v[-L:] if L else [] for k, v in d.items()} for c, d in hx.items()}
         if bar_min < 1:  # scale 1-minute volume to the shorter bar so volume strategies compare like with like
             hx = {c: dict(d, v=[x * bar_min for x in d["v"]]) for c, d in hx.items()}
+        ctx = {}
+        if L and self.settings.get("ctx_studies", True):
+            try:
+                ctx = self.add_ctx({coins[0]: hx[coins[0]]}, gran, 2000, self.quote).get(E.CTX_KEY) or {}
+            except Exception:
+                ctx = {}
+        self.ctx_pending = {k: list(v_) for k, v_ in ctx.items()}
+        hx_all = dict(hx)
+        if ctx:
+            hx_all[E.CTX_KEY] = ctx
         tourn = None
         restored = getattr(self, "_restored_farm", None)
         self._restored_farm = None
@@ -3029,14 +3091,14 @@ class App:
             if self.settings.get("multicore", True) and L > E.WARM and opts.get("islands", 1) > 1:
                 self.q.put(("log", f"Warming up {opts['islands']} islands on several processor cores..."))
                 tourn = E.warm_islands(coins, self.start_cash, fee, pct, evolve, self.settings["params"], opts,
-                                       int(self.settings["max_bots"]), self.retire_steps(bar_min), hist, hx,
+                                       int(self.settings["max_bots"]), self.retire_steps(bar_min), hist, hx_all,
                                        log=lambda m: self.q.put(("log", m)))
             if tourn is None:
                 tourn = E.Tournament(coins, self.start_cash, fee, pct, evolve, params=self.settings["params"],
                                      opts=opts, cap=int(self.settings["max_bots"]),
                                      retire_steps=self.retire_steps(bar_min))
                 if L > E.WARM:
-                    tourn.warmup(hist, extra=hx)
+                    tourn.warmup(hist, extra=hx_all)
             roster = self.roster("live" if self.live else "paper")
             squad = (E.team() if roster == "team" else self.hof()[:max(14, int(self.settings["max_bots"]))]
                      if roster == "hof" else [])
@@ -3117,7 +3179,7 @@ class App:
                 t_req = time.time()
                 if batch_ok:  # one request for every coin
                     try:
-                        prices = E.spot_many(coins, self.quote)
+                        prices = E.spot_many(coins + [x for x in self.ctx_list(coins) if x not in coins], self.quote)
                     except Exception:
                         prices = {}
                     if not prices:
@@ -3135,7 +3197,7 @@ class App:
                         if fails >= 2:  # the connection is down, don't wait on every remaining coin
                             break
                 now = time.time()
-                self.q.put(("net", (len(prices), len(coins), now - t_req)))
+                self.q.put(("net", (sum(1 for c in coins if c in prices), len(coins), now - t_req)))
                 if prices and now - last_vol >= max(60.0, bar_min * 60):  # real trading volume for volume strategies
                     last_vol = now
                     vols = {}
@@ -3150,7 +3212,7 @@ class App:
                             pass
                     if vols:
                         self.q.put(("vols", vols))
-                if len(prices) == len(coins):
+                if all(c in prices for c in coins):
                     if down_since is not None:
                         mins = (now - down_since) / 60
                         self.q.put(("log", (f"Prices are back after {mins:.0f} min." if mins >= 1
@@ -3304,6 +3366,7 @@ class App:
             self.write(*data) if isinstance(data, tuple) else self.write(data)
         elif kind == "seed":
             self.hist, self.tourn = data[0], data[1]
+            self.ctx_hist = dict(getattr(self, "ctx_pending", {}) or {})
             self.hx = data[2] if len(data) > 2 else {c: dict(h=[], l=[], v=[]) for c in self.hist}
             if self.tourn:
                 self.tourn.recording = True  # history is loaded; from now on bot trades are listed
@@ -3415,12 +3478,19 @@ class App:
             del h[:-keep]
             for k in ("h", "l", "v", "t"):
                 del x[k][:-keep]
+        for sym in list(self.ctx_hist):  # the watched tickers move along with every bar
+            q = self.ctx_hist[sym]
+            px = prices.get(sym) or self.last.get(sym) or (q[-1] if q else None)
+            if px:
+                q.append(px)
+                L = len(self.hist[self.session_coins[0]]) if self.session_coins else len(q)
+                del q[:-L]
         if self.wild and self.tourn and set(self.tourn.coins) != set(self.session_coins):
             fixed = self.tourn.align_coins(self.session_coins, {c: self.hist[c][-1] for c in self.session_coins if self.hist.get(c)})
             self.write(f"The farm's coins were out of step with the session; it now trades {', '.join(fixed)}.", "warn")
         if self.wild and self.tourn:
             self.save_farm()
-            self.tourn.step({c: self.hist[c] for c in self.session_coins}, {c: self.hx[c] for c in self.session_coins})
+            self.tourn.step({c: self.hist[c] for c in self.session_coins}, self.extra_now())
             self.collect_shadow()
             for fn in (self.shadow_live_step, self.record_farm, self.maybe_retest):
                 try:
@@ -3775,6 +3845,7 @@ class App:
                     L = min(len(d["c"]) for d in data.values())
                     closes = {c: d["c"][-L:] for c, d in data.items()}
                     extra = {c: {k: d[k][-L:] for k in ("h", "l", "v", "t")} for c, d in data.items()}
+                    self.add_ctx(extra, gran, count, quote)
                     self.q.put(("call", lambda: status.config(text="Testing...")))
                     r = E.backtest_bot(src[1], closes, extra, cash, fee, pct, slip)
                     self.q.put(("call", lambda: show(src, r, closes, gran)))
@@ -4062,6 +4133,7 @@ class App:
                     L = min(len(d["c"]) for d in data.values())
                     closes = {c_: d["c"][-L:] for c_, d in data.items()}
                     extra = {c_: {k: d[k][-L:] for k in ("h", "l", "v", "t")} for c_, d in data.items()}
+                    self.add_ctx(extra, gran, count, quote)
                     res = E.train_farm(closes, extra, opts, cap=cap, passes=n_pass, exam_frac=ex, seed_genes=seeds,
                                        start_cash=cash, fee=fee, pct=pct, evolve=evolve, params=params,
                                        retire_steps=retire, progress=prog, stop=lambda: st["stop"])
@@ -4233,6 +4305,7 @@ class App:
         a = best
         closes = {c: d["c"][a:a + span] for c, d in data.items()}
         extra = {c: {x: d[x][a:a + span] for x in ("h", "l", "v", "t")} for c, d in data.items()}
+        self.add_ctx(extra, gran, 3000, self.quote)
         start, end = now - (L - a) * gran, now - (L - a - span) * gran
         hold = sum(closes[c][-1] / closes[c][0] for c in coins) / len(coins) - 1
         moods = [E.market_mood(closes[c])[0] for c in coins]
@@ -4874,6 +4947,11 @@ class App:
                 L = min(len(v) for v in hist.values())
                 hist = {c: v[-L:] for c, v in hist.items()}
                 hx = {c: {x: y[-L:] for x, y in d.items()} for c, d in hx.items()}
+                if self.settings.get("ctx_studies", True):
+                    try:
+                        self.add_ctx(hx, self.SLOW_GRAN, self.SLOW_HISTORY, quote)
+                    except Exception:
+                        pass
                 last_ts = min(ts[c][-1] for c in coins) if L else 0
                 t = sl["t"]
                 if t is None and saved.get("farm"):
@@ -4965,7 +5043,14 @@ class App:
                 for x in ("h", "l", "v", "t"):
                     del sl["hx"][c][x][:-6000]
             sl["last_ts"] = new[sl["coins"][0]][i][0]
-            t.step({c: sl["hist"][c] for c in sl["coins"]}, {c: sl["hx"][c] for c in sl["coins"]})
+            cx = sl["hx"].get(E.CTX_KEY)
+            if cx:  # the watched tickers move on too (latest known price)
+                for sym, q in cx.items():
+                    px_ = self.last.get(sym) or (q[-1] if q else None)
+                    if px_:
+                        q.append(px_)
+                        del q[:-6000]
+            t.step({c: sl["hist"][c] for c in sl["coins"]}, dict(sl["hx"]))
             px = {c: sl["hist"][c][-1] for c in sl["coins"]}
             for c in sl["coins"]:
                 sig, mult = t.vote(c)
@@ -5499,6 +5584,97 @@ class App:
         if reply:
             s_ = dict(self.settings, alert_discord="")
             threading.Thread(target=lambda: E.send_alert(s_, reply), daemon=True).start()
+
+    # ---------------- market context ----------------
+    def ctx_card_build(self):
+        for w in self.ctx_box.winfo_children():
+            w.destroy()
+        self.ctx_labels = {}
+        syms = [x for x in (self.settings.get("ctx_tickers") or []) if E.valid_coin(x)]
+        if not syms:
+            tk.Label(self.ctx_box, text="None. Click Edit to add some (VIXY, SPY, TLT...).", bg=CARD, fg=MUTED,
+                     font=("", 8), wraplength=220, justify="left").pack(anchor="w")
+        for sym in syms:
+            row = tk.Frame(self.ctx_box, bg=CARD)
+            row.pack(fill="x")
+            tk.Label(row, text=sym + (" (VIX)" if sym in ("VIXY", "UVXY", "VXX") else ""), bg=CARD, fg=TEXT,
+                     font=("", 9, "bold"), width=11, anchor="w").pack(side="left")
+            l = tk.Label(row, text="-", bg=CARD, fg=MUTED, font=("", 9), anchor="w")
+            l.pack(side="left")
+            self.ctx_labels[sym] = l
+
+    def ctx_card_refresh(self):
+        for sym, l in getattr(self, "ctx_labels", {}).items():
+            q = self.ctx_hist.get(sym) or self.hist.get(sym)
+            px = self.last.get(sym) or (q[-1] if q else None)
+            if not px:
+                l.config(text="-", fg=MUTED)
+                continue
+            base = self.start_px.get(sym) or (q[0] if q else None)
+            ch = (px / base - 1) * 100 if base else 0
+            l.config(text=f"{fmt_px(px)}  {ch:+.2f}%", fg=GREEN if ch > 0 else RED if ch < 0 else MUTED)
+
+    def edit_context(self):
+        cur = ", ".join(self.settings.get("ctx_tickers") or [])
+        ans = simpledialog.askstring("Market context", "Tickers the bots WATCH but never trade, separated by commas.\n"
+                                                       "VIXY stands in for the VIX (fear gauge); TLT is long-term bonds; SPY "
+                                                       "the whole market. Up to 8:", initialvalue=cur)
+        if ans is None:
+            return
+        syms = [x.strip().upper() for x in ans.replace(";", ",").split(",") if E.valid_coin(x.strip().upper())][:8]
+        self.settings["ctx_tickers"] = syms
+        self.cfg["settings"] = self.settings
+        E.save_json(CONFIG_PATH, self.cfg)
+        if self.tourn:
+            self.tourn.ctx_syms = [c for c in syms if c not in self.tourn.coins]
+            self.tourn.o["ctx"] = syms
+        self.ctx_card_build()
+        self.write("Market context: " + (", ".join(syms) or "none") + ". New tickers join the live data when you start "
+                   "a new session; studies on them start appearing in new eggs.")
+
+    def ctx_report(self):
+        """Per watched ticker: how many bots study it, and what those studies did for them (from the farm and the slow farm)."""
+        out = {}
+        for t in (self.tourn, (getattr(self, "slow", {}) or {}).get("t")):
+            if not t:
+                continue
+            for v in t.vars:
+                for e in v.layers.get("ctx", []):
+                    d = out.setdefault(e["sym"], dict(bots=0, n=0.0, saved=0.0, rules=[]))
+                    d["bots"] += 1
+                    st = v.layer_stats.get(f"ctx:{e['sym']}")
+                    if st:
+                        d["n"] += st[0]
+                        d["saved"] += st[1]
+                        d["rules"].append((st[1] / st[0] if st[0] else 0, E.ctx_text(e), E.bot_nickname(v.key())))
+        return out
+
+    def open_context(self):
+        w = tk.Toplevel(self.root)
+        w.title("Market context: what the bots learned")
+        w.geometry("940x520")
+        w.configure(bg=BG)
+        tk.Label(w, bg=BG, fg=MUTED, justify="left", anchor="w", wraplength=900, padx=12, pady=8, text=(
+            "The bots watch these tickers without trading them. A context study votes for or against a trade depending on "
+            "what the watched ticker is doing, and every trade it held back is checked afterwards: 'saved' means skipping "
+            "those trades avoided losses, 'cost' means it blocked winners. Good studies spread to children, costly ones die "
+            "out. VIXY stands in for the VIX.")).pack(fill="x")
+        t = self.make_tree(w, ("sym", "now", "bots", "n", "saved", "best"), (90, 110, 70, 90, 110, 440),
+                           ("Ticker", "Now", "Bots using", "Trades judged", "Saved / cost", "Best rule so far (and who)"))
+        rep_ = self.ctx_report()
+        for sym in list(dict.fromkeys(list(self.settings.get("ctx_tickers") or []) + list(rep_))):
+            d = rep_.get(sym, dict(bots=0, n=0, saved=0, rules=[]))
+            q = self.ctx_hist.get(sym) or []
+            px = self.last.get(sym) or (q[-1] if q else None)
+            best = max(d["rules"]) if d["rules"] else None
+            t.insert("", "end", values=(sym, fmt_px(px) if px else "-", d["bots"], int(d["n"]),
+                                        f"{'saved' if d['saved'] >= 0 else 'cost'} {abs(d['saved']):.1f}%" if d["n"] else "-",
+                                        f"{best[1]}  ({best[2]})" if best else
+                                        "traded this session, so its own chart is already studied" if sym in self.session_coins
+                                        else "no evidence yet"))
+        tk.Label(w, bg=BG, fg=MUTED, anchor="w", padx=12, pady=6,
+                 text="Tip: Free roam and the Training camp let the farm learn these reactions from months of history.").pack(fill="x")
+
 
     # ---------------- compact top bar ----------------
     def apply_compact(self):
@@ -9452,6 +9628,9 @@ class App:
                     var = tk.StringVar(value=ORDER_LABELS.get(cur, ORDER_LABELS["market"]))
                     ttk.Combobox(f, textvariable=var, values=list(ORDER_LABELS.values()), state="readonly", width=34).grid(
                         row=r, column=1, padx=(10, 0), sticky="w")
+                elif typ == "tickers":
+                    var = tk.StringVar(value=", ".join(cur or []))
+                    ttk.Entry(f, textvariable=var, width=30).grid(row=r, column=1, padx=(10, 0), sticky="w")
                 else:
                     var = tk.StringVar(value="" if cur is None else str(cur))
                     ttk.Entry(f, textvariable=var, width=44 if typ is str else 8,
@@ -9545,6 +9724,8 @@ class App:
                         new[k] = next(b for b, l in BAR_LABELS.items() if l == v)
                     elif typ == "order":
                         new[k] = next(o for o, l in ORDER_LABELS.items() if l == v)
+                    elif typ == "tickers":
+                        new[k] = [x.strip().upper() for x in v.replace(";", ",").split(",") if E.valid_coin(x.strip().upper())][:8]
                     elif typ is str or typ in ("anim", "chars", "eggs"):
                         new[k] = v.strip()
                     else:
