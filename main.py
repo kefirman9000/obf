@@ -38,6 +38,8 @@ import json
 import math
 import os
 import queue
+import re
+import webbrowser
 import shutil
 import subprocess
 import threading
@@ -692,6 +694,8 @@ class App:
         root.after(400, self.auto_login)
         root.after(700, self.maybe_welcome)
         root.after(4000, self.start_tg_remote)
+        if self.cfg.get("fred_key") and time.time() - E.events_fetched() > 7 * 86400:
+            root.after(6000, lambda: self.fetch_calendar(quiet=True))
         if self.cfg.get("broker") == "ibkr" and self.cfg.get("ib_auto", True) and E.ib_lib() is not None:
             root.after(3000, lambda: self.ib_connect(quiet=True))
         root.after(20000, self.start_free_roam)
@@ -1013,6 +1017,18 @@ class App:
         self.ctx_labels = {}
         self.root.after(200, self.ctx_card_build)
 
+        # --- upcoming news card: the economic calendar
+        f, c = self.card(left, "UPCOMING NEWS")
+        f.pack(fill="x", pady=(0, 8))
+        self.news_box = tk.Frame(c, bg=CARD)
+        self.news_box.pack(fill="x")
+        nrow = tk.Frame(c, bg=CARD)
+        nrow.pack(fill="x", pady=(4, 0))
+        ttk.Button(nrow, text="Calendar...", style="Plain.TButton", command=self.open_calendar).pack(side="left")
+        Tip(self.news_box, "Big scheduled news: CPI, the jobs report, Fed decisions and more. Bots can grow never-rules "
+                           "around them ('stay out the day before CPI'), graded by what the trades they skipped would have done.")
+        self.root.after(300, self.news_card_refresh)
+
         # --- strategy card
         f, c = self.card(left, "STRATEGY")
         f.pack(fill="x", pady=(0, 8))
@@ -1269,6 +1285,7 @@ class App:
         m.add_command(label="Weekly report now...", command=self.show_report)
         m.add_command(label="Training camp (a whole farm through history)...", command=self.open_training)
         m.add_command(label="Market context: what the bots learned...", command=self.open_context)
+        m.add_command(label="Economic calendar...", command=self.open_calendar)
         m.add_command(label="Free roam (the farm learns from the past by itself)...", command=self.open_roam)
         m.add_command(label="Backtest a bot...", command=lambda: self.open_backtest(None))
         m.add_command(label="Backtest the Hall of Fame...", command=self.backtest_hof)
@@ -5677,6 +5694,130 @@ class App:
                         d["saved"] += st[1]
                         d["rules"].append((st[1] / st[0] if st[0] else 0, E.ctx_text(e), E.bot_nickname(v.key())))
         return out
+
+    # ---------------- economic calendar ----------------
+    def news_card_refresh(self):
+        try:
+            for w in self.news_box.winfo_children():
+                w.destroy()
+            up = E.upcoming_events(days=21)[:4]
+            if not E.events():
+                tk.Label(self.news_box, text="No calendar yet. Click Calendar... to download it (free).", bg=CARD, fg=MUTED,
+                         font=("", 8), wraplength=220, justify="left").pack(anchor="w")
+            elif not up:
+                tk.Label(self.news_box, text="Nothing big in the next 3 weeks.", bg=CARD, fg=MUTED, font=("", 8)).pack(anchor="w")
+            for t, k in up:
+                row = tk.Frame(self.news_box, bg=CARD)
+                row.pack(fill="x")
+                soon = t - time.time() < 36 * 3600
+                tk.Label(row, text=datetime.fromtimestamp(t).strftime("%a %b %d %H:%M"), bg=CARD, fg=TEXT if soon else MUTED,
+                         font=("", 8, "bold" if soon else ""), anchor="w").pack(side="left", padx=(0, 8))
+                tk.Label(row, text=E.EVENT_KINDS[k][1], bg=CARD, fg="#f59e0b" if soon and k in E.BIG_EVENTS else TEXT,
+                         font=("", 8), anchor="w").pack(side="left")
+        except tk.TclError:
+            return
+        self.root.after(15 * 60 * 1000, self.news_card_refresh)
+
+    def fetch_calendar(self, key=None, done=None, quiet=False):
+        key = (key or self.cfg.get("fred_key") or "").strip()
+        if not key:
+            if done:
+                done(False, "Enter your FRED key first.")
+            return
+
+        def work():
+            try:
+                ev, errs = E.fetch_events(key)
+                n = sum(len(x) for x in ev.values())
+                msg = f"Economic calendar downloaded: {n} releases since 2015, plus the scheduled ones." + (
+                    f" (Skipped: {'; '.join(errs)})" if errs else "")
+                ok = True
+            except Exception as e:
+                msg, ok = f"Couldn't download the economic calendar: {e}", False
+
+            def fin():
+                if not quiet or not ok:
+                    self.write(msg, "good" if ok else "warn")
+                self.news_card_refresh()
+                if done:
+                    done(ok, msg)
+            self.q.put(("call", fin))
+        threading.Thread(target=work, daemon=True).start()
+
+    def event_report(self):
+        """Per event never-rule: bots using it and its graded record."""
+        out = {k: dict(bots=0, n=0, saved=0.0) for k in E.EVENT_VETOES}
+        pools = [self.tourn.vars] if self.tourn else []
+        if self.slow.get("t"):
+            pools.append(self.slow["t"].vars)
+        for vs in pools:
+            for v in vs:
+                for k in E.EVENT_VETOES:
+                    if k in (v.vetoes or {}):
+                        out[k]["bots"] += 1
+                    st = (v.veto_stats or {}).get(k)
+                    if st:
+                        out[k]["n"] += st[0]
+                        out[k]["saved"] += st[1]
+        return out
+
+    def open_calendar(self):
+        w = tk.Toplevel(self.root)
+        w.title("Economic calendar")
+        w.geometry("760x620")
+        w.configure(bg=BG)
+        tk.Label(w, bg=BG, fg=MUTED, justify="left", anchor="w", wraplength=730, padx=12, pady=8, text=(
+            "Scheduled news moves options more than almost anything: prices swell before CPI, jobs reports and Fed "
+            "decisions, then often collapse right after. With the calendar downloaded, bots can grow three never-rules "
+            "around these days (quiet before big news, quiet before the Fed, let the news settle), and every trade those "
+            "rules skip is graded afterwards, in live trading, the farms, backtests, Training camp and Free roam, all the "
+            "way back to 2016. Release dates come from FRED, the St. Louis Fed's free data service.")
+                 ).pack(fill="x")
+        top = tk.Frame(w, bg=BG, padx=12)
+        top.pack(fill="x")
+        tk.Label(top, text="FRED API key:", bg=BG, fg=TEXT).pack(side="left")
+        key = tk.StringVar(value=self.cfg.get("fred_key", ""))
+        ttk.Entry(top, textvariable=key, width=36, show="*").pack(side="left", padx=6)
+        res = tk.Label(w, text="", bg=BG, fg=MUTED, anchor="w", padx=12, wraplength=730, justify="left")
+
+        def go():
+            k = key.get().strip()
+            if not re.fullmatch(r"[0-9a-zA-Z]{32}", k):
+                return messagebox.showerror("Economic calendar", "A FRED key is 32 letters and numbers.", parent=w)
+            self.cfg["fred_key"] = k
+            E.save_json(CONFIG_PATH, self.cfg)
+            res.config(text="Downloading...", fg=MUTED)
+            self.fetch_calendar(k, lambda ok, msg: (res.config(text=msg, fg=GREEN if ok else RED), fill())
+                                if w.winfo_exists() else None)
+        ttk.Button(top, text="Download", style="Accent.TButton", command=go).pack(side="left")
+        ttk.Button(top, text="Get a free key", style="Plain.TButton",
+                   command=lambda: webbrowser.open("https://fred.stlouisfed.org/docs/api/api_key.html")).pack(side="left", padx=6)
+        res.pack(fill="x", pady=(4, 0))
+        fe = E.events_fetched()
+        if fe:
+            res.config(text=f"Last downloaded {datetime.fromtimestamp(fe).strftime('%b %d %Y')}. It refreshes itself weekly.")
+        tk.Label(w, text="Next 45 days", bg=BG, fg=TEXT, font=("", 10, "bold"), anchor="w", padx=12).pack(fill="x", pady=(8, 0))
+        f1 = tk.Frame(w, bg=BG, padx=12)
+        f1.pack(fill="both", expand=True)
+        up = self.make_tree(f1, ("time", "who", "in"), (210, 260, 200), ("When (your time)", "Release", "In"))
+        tk.Label(w, text="What the bots learned about news days", bg=BG, fg=TEXT, font=("", 10, "bold"), anchor="w",
+                 padx=12).pack(fill="x", pady=(8, 0))
+        f2 = tk.Frame(w, bg=BG, padx=12, pady=(0))
+        f2.pack(fill="x", pady=(0, 12))
+        lr = self.make_tree(f2, ("who", "bots", "n", "saved"), (330, 100, 130, 160), ("Never-rule", "Bots using", "Trades skipped", "Saved / cost"))
+        lr.configure(height=3)
+
+        def fill():
+            for t_ in (up, lr):
+                t_.delete(*t_.get_children())
+            for t, k in E.upcoming_events(days=45):
+                d = (t - time.time()) / 86400
+                up.insert("", "end", values=(datetime.fromtimestamp(t).strftime("%a %b %d  %H:%M"), E.EVENT_KINDS[k][1],
+                                             "now" if d < 0 else f"{d * 24:.0f} hours" if d < 2 else f"{d:.0f} days"))
+            for k, d in self.event_report().items():
+                lr.insert("", "end", values=(E.VETOES[k]["name"], d["bots"], int(d["n"]),
+                                             f"{'saved' if d['saved'] >= 0 else 'cost'} {abs(d['saved']):.1f}%" if d["n"] else "-"))
+        fill()
 
     def open_context(self):
         w = tk.Toplevel(self.root)
