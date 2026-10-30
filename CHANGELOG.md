@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0
+**Interactive Brokers**
+
+- **Account > Connect Interactive Brokers**: LIVE mode can now place its option orders through your IBKR account, via
+  IB Gateway or Trader Workstation running on your computer. The window walks through the one-time setup (enable the
+  API, pick the port), installs the small IBKR add-on with one click, and connects. Paper (DU...) accounts get a simple
+  yes/no before trading; a real-money account still needs you to type LIVE.
+- **Prices**: the farm keeps learning from Alpaca's free history and option chains. Order prices, and the value of
+  contracts you hold or watch, come from IBKR when you have real-time US options data there (OPRA); with delayed IBKR
+  data, Alpaca's quotes are used for valuations instead. The status bar shows which you have.
+- IBKR funds are shown in the status bar, refresh while trading, and set how much the bots can use.
+- Optional: connect automatically when OBF starts. Account > Disconnect switches LIVE back to Alpaca.
+- **Kill switch** now cancels waiting orders at Alpaca and IBKR (it used an old call that did nothing).
+
 ## 1.1.0
 **Market context: the bots watch the market around them**
 

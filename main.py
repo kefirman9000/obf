@@ -692,6 +692,8 @@ class App:
         root.after(400, self.auto_login)
         root.after(700, self.maybe_welcome)
         root.after(4000, self.start_tg_remote)
+        if self.cfg.get("broker") == "ibkr" and self.cfg.get("ib_auto", True) and E.ib_lib() is not None:
+            root.after(3000, lambda: self.ib_connect(quiet=True))
         root.after(20000, self.start_free_roam)
         root.after(1500, self.maybe_setup)
         root.after(4000, self.auto_check_update)
@@ -1254,6 +1256,9 @@ class App:
         bar.add_cascade(label="File", menu=m)
         m = tk.Menu(bar, tearoff=0)
         m.add_command(label="Log in to Alpaca...", command=self.open_login)
+        m.add_separator()
+        m.add_command(label="Connect Interactive Brokers...", command=self.open_ib)
+        m.add_command(label="Disconnect Interactive Brokers", command=self.ib_disconnect)
         m.add_command(label="Log out", command=self.logout)
         bar.add_cascade(label="Account", menu=m)
         m = tk.Menu(bar, tearoff=0)
@@ -1927,6 +1932,12 @@ class App:
             self.new_btn.pack_forget()
         if self.logging_in:
             self.conn_lbl.config(text="Logging in...", fg=MUTED)
+        elif self.broker() == "ibkr" and E.IB.connected():
+            rt = getattr(E.IB, "realtime", None)
+            qtxt = "" if rt is None else ("  |  IBKR quotes: real-time" if rt else "  |  IBKR quotes: delayed")
+            self.conn_lbl.config(text=f"IBKR {'PAPER' if E.IB.paper else 'LIVE'} {E.IB.account}  |  funds ${self.avail():,.2f}" + qtxt
+                                      + ("  |  prices: Alpaca" if self.client else "  |  log in to Alpaca for prices"),
+                                 fg=GREEN if self.client else "#f59e0b")
         elif self.client:
             self.conn_lbl.config(text=f"Alpaca {'PAPER' if E.ALPACA.get('paper', True) else 'LIVE'} connected  |  buying power ${self.avail():,.2f}", fg=GREEN)
         else:
@@ -3230,7 +3241,10 @@ class App:
                 if self.live and self.client and time.time() - self.last_bal > 30:
                     self.last_bal = time.time()
                     try:
-                        self.q.put(("balances", self.read_balances(E.alp_account())))
+                        if self.broker() == "ibkr" and E.IB.connected():
+                            self.q.put(("balances", {"USD": E.IB.funds()}))
+                        else:
+                            self.q.put(("balances", self.read_balances(E.alp_account())))
                     except Exception:
                         pass
             except Exception:  # never let the feed die
@@ -3593,10 +3607,14 @@ class App:
         if self.running:
             self.toggle()
         oids = list(getattr(self, "open_oids", set()))
-        if self.client and oids:
+        if self.live and (oids or self.broker() == "ibkr"):
             def cancel():
                 try:
-                    self.client.cancel_orders(order_ids=oids)
+                    if self.broker() == "ibkr":
+                        E.IB.cancel_all()
+                    for oid in oids:
+                        if not str(oid).startswith("ib:"):
+                            E.alp_cancel(oid)
                 except Exception as e:
                     self.q.put(("log", (f"Kill switch: could not cancel orders: {e}", "bad")))
             self.executor.submit(cancel)
@@ -4824,10 +4842,21 @@ class App:
         try:
             syms = list((self.cfg.get("opt_watch") or {})) + [o.get("symbol") for c, o in self.opt.items() if self.pos.get(c, 0) > 0]
             syms = [x for x in dict.fromkeys(syms) if x]
-            if syms and E.ALPACA.get("key") and not self.in_bg():
+            # IBKR quotes when they're real-time; delayed IBKR quotes are only used when there's no Alpaca key
+            use_ib = (E.IB.connected() and self.cfg.get("ib_quotes", True)
+                      and (getattr(E.IB, "realtime", None) is not False or not E.ALPACA.get("key")))
+            if syms and (E.ALPACA.get("key") or use_ib) and not self.in_bg():
                 def work():
                     try:
-                        qs = E.option_quotes(syms)
+                        qs = {}
+                        if use_ib:  # IBKR's quotes for watched and held contracts (real OPRA quotes with a subscription)
+                            try:
+                                qs = E.IB.quotes([o for o in (E.parse_occ(x) for x in syms) if o])
+                            except Exception:
+                                qs = {}
+                        rest = [x for x in syms if x not in qs]
+                        if rest and E.ALPACA.get("key"):
+                            qs.update(E.option_quotes(rest))
                         self.q.put(("call", lambda: (self.opt_quotes.update(qs), self.opt_watch_fill())))
                     except Exception:
                         pass
@@ -6403,8 +6432,19 @@ class App:
 
     def confirm_live(self, resume):
         if not self.client:
-            messagebox.showerror("Live mode", "Log in to Alpaca first (Account > Log in).")
+            messagebox.showerror("Live mode", "Log in to Alpaca first (Account > Log in): prices and option chains come "
+                                              "from Alpaca even when Interactive Brokers places the orders.")
             return False
+        if self.broker() == "ibkr":
+            if not E.IB.connected():
+                messagebox.showerror("Live mode", "LIVE is set to trade through Interactive Brokers, but it isn't connected. "
+                                                  "Open Account > Connect Interactive Brokers first (IB Gateway or TWS must be running).")
+                return False
+            try:
+                self.balances = {"USD": E.IB.funds()}
+                self.usd_avail = self.balances["USD"]
+            except Exception:
+                pass
         min_budget = MIN_LIVE_ORDER / (self.settings["trade_pct"] / 100)
         if self.cash > self.usd_avail or (not resume and self.cash < min_budget):
             messagebox.showerror(
@@ -6441,6 +6481,16 @@ class App:
                 "team": f"only YOUR TEAM ({len(E.team())} bots)",
                 "hof": f"only YOUR HALL OF FAME ({len(self.hof())} bots you picked)"}[roster]
                if self.wild_var.get() else "the strategies you ticked")
+        if self.broker() == "ibkr":
+            if E.IB.paper:
+                return messagebox.askyesno(
+                    "Trade your IBKR PAPER account", f"This places option orders on your Interactive Brokers PAPER account "
+                    f"({E.IB.account}, pretend money), using up to ${self.cash:,.2f}.\nBots allowed to trade: {who}.\n\nGo ahead?")
+            ans = simpledialog.askstring(
+                "Confirm LIVE trading", f"This will place REAL option orders on your Interactive Brokers account {E.IB.account} "
+                f"using up to ${self.cash:,.2f}.\nBots allowed to trade: {who}.\n"
+                f"Options can lose their whole value, and automated strategies can lose money.{warn}\nType LIVE to continue:")
+            return (ans or "").strip() == "LIVE"
         if E.ALPACA.get("paper", True):
             return messagebox.askyesno(
                 "Trade your Alpaca PAPER account", f"This places option orders on your Alpaca PAPER account (pretend money "
@@ -6473,6 +6523,8 @@ class App:
 
     def live_open(self, c, typ, S, spend, dte, otm, reason):
         """Buys the listed contract closest to what the bots want, with a limit order at the ask."""
+        if self.broker() == "ibkr":
+            return self.ib_open(c, typ, S, spend, dte, otm, reason)
         try:
             now = time.time()
             d0 = datetime.fromtimestamp(now + max(1, dte - 10) * 86400).strftime("%Y-%m-%d")
@@ -6498,6 +6550,8 @@ class App:
 
     def live_close(self, c, qty, reason):
         """Sells the account's contract: a limit at the bid for normal exits, a market order for stops and expiry."""
+        if (self.opt.get(c) or {}).get("broker") == "ibkr" or (self.broker() == "ibkr" and not (self.opt.get(c) or {}).get("broker")):
+            return self.ib_close(c, qty, reason)
         try:
             o = self.opt.get(c) or {}
             sym = o.get("symbol")
@@ -6519,6 +6573,175 @@ class App:
             self.q.put(("ofill", ("sell", c, got, avg, 0, reason, dict(o))))
         except Exception as e:
             self.q.put(("fail", ("sell", c, 0, str(e))))
+
+    # ---------------- Interactive Brokers ----------------
+    def broker(self):
+        """Which broker LIVE mode trades through: 'alpaca' or 'ibkr'."""
+        return self.cfg.get("broker", "alpaca")
+
+    def ib_open(self, c, typ, S, spend, dte, otm, reason):
+        try:
+            pick = None
+            try:  # choose from Alpaca's chain (quick, with prices); IBKR lists the same contracts
+                now = time.time()
+                d0 = datetime.fromtimestamp(now + max(1, dte - 10) * 86400).strftime("%Y-%m-%d")
+                d1 = datetime.fromtimestamp(now + (dte + 21) * 86400).strftime("%Y-%m-%d")
+                pick = E.pick_contract(E.option_chain(c, d0, d1, typ, S * 0.75, S * 1.25), S, typ, dte, otm, now)
+            except Exception:
+                pick = None
+            if pick:
+                exp, K = pick["exp"], pick["K"]
+            else:
+                exp, K = E.IB.pick(c, S, typ, dte, otm)
+            bid, ask, _ = E.IB.quote(c, exp, typ, K)
+            if not ask and pick:
+                ask = pick["ask"]
+            if not ask:
+                raise RuntimeError("IBKR has no price for that contract right now")
+            qty = int(spend // (ask * E.CONTRACT))
+            if qty < 1 and ask * E.CONTRACT <= spend * 2.5:
+                qty = 1
+            if qty < 1:
+                raise RuntimeError(f"one contract costs ${ask * E.CONTRACT:,.0f}, more than this trade's size")
+            got, avg = E.IB.order(c, exp, typ, K, qty, "buy", limit=round(ask, 2),
+                                  wait=max(5, int(self.settings.get("limit_wait", 20))))
+            if got <= 0:
+                return self.q.put(("unfilled", ("buy", c, spend)))
+            o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(c, exp, typ, K), broker="ibkr")
+            self.q.put(("ofill", ("buy", c, got, avg, spend, reason, o)))
+        except Exception as e:
+            self.q.put(("fail", ("buy", c, spend, f"Interactive Brokers: {e}")))
+
+    def ib_close(self, c, qty, reason):
+        try:
+            o = self.opt.get(c) or {}
+            if not o:
+                raise RuntimeError("no contract on record for this ticker")
+            urgent = reason in ("stop-loss", "expiry", "manual", "trailing-stop")
+            limit = None
+            if not urgent:
+                bid, ask, _ = E.IB.quote(c, o["exp"], o["type"], o["K"])
+                limit = round(bid, 2) if bid else None
+            wait = 30 if urgent else max(5, int(self.settings.get("limit_wait", 20)))
+            got, avg = E.IB.order(c, o["exp"], o["type"], o["K"], int(qty), "sell", limit=limit, wait=wait)
+            if got <= 0 and limit:
+                got, avg = E.IB.order(c, o["exp"], o["type"], o["K"], int(qty), "sell", wait=30)
+            if got <= 0:
+                return self.q.put(("unfilled", ("sell", c, 0)))
+            self.q.put(("ofill", ("sell", c, got, avg, 0, reason, dict(o))))
+        except Exception as e:
+            self.q.put(("fail", ("sell", c, 0, f"Interactive Brokers: {e}")))
+
+    def open_ib(self):
+        """Connect Interactive Brokers: setup steps, the add-on, and the connection to IB Gateway / TWS."""
+        w = tk.Toplevel(self.root)
+        w.title("Connect Interactive Brokers")
+        w.resizable(False, False)
+        f = ttk.Frame(w, padding=16)
+        f.pack()
+        ttk.Label(f, text="Connect Interactive Brokers", font=("", 12, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(f, wraplength=560, justify="left", foreground=MUTED, text=(
+            "OBF talks to IBKR through IBKR's own program on this computer. One-time setup:\n"
+            "1. Install IB Gateway (simplest) or Trader Workstation from interactivebrokers.com, and log in. Use your PAPER "
+            "login first (in IBKR's Client Portal: Settings > Paper Trading Account).\n"
+            "2. In it, open the API settings (Gateway: Configure > Settings > API > Settings; TWS: File > Global "
+            "Configuration > API > Settings) and tick 'Enable ActiveX and Socket Clients'. Untick 'Read-Only API' so orders "
+            "can be placed. Leave 'Allow connections from localhost only' ticked.\n"
+            "3. Pick the matching port below and press Connect. Keep IB Gateway / TWS running while OBF trades.\n\n"
+            "Price history and option chains for the farm still come from your free Alpaca key (IBKR limits how much history "
+            "you can download). Order prices, and the value of contracts you hold or watch, come from IBKR: real-time if "
+            "you subscribe to US options data (OPRA, a few dollars a month in IBKR's Client Portal), 15-minute delayed if not.")
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 10))
+        lib_ok = E.ib_lib() is not None
+        st = ttk.Label(f, text="Add-on: installed" if lib_ok else "Add-on: not installed yet", foreground=GREEN if lib_ok else MUTED)
+        st.grid(row=2, column=0, sticky="w")
+        log = tk.Text(f, width=70, height=4, bg=CARD, fg=MUTED, relief="flat")
+
+        def install():
+            log.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+            spec = E.ib_pip_spec()
+            st.config(text=f"Installing {spec}...")
+
+            def work():
+                ok, msg = E.install_packages([spec], log=lambda ln: self.q.put(("call", lambda ln=ln: (log.insert("end", ln + "\n"),
+                                                                                                        log.see("end")))))
+                self.q.put(("call", lambda: st.config(text=("Add-on: installed" if ok else "Add-on: " + msg),
+                                                      foreground=GREEN if ok else RED)))
+            threading.Thread(target=work, daemon=True).start()
+        ib_ = ttk.Button(f, text="Install the IBKR add-on", command=install)
+        ib_.grid(row=2, column=1, sticky="w", padx=8)
+        if lib_ok:
+            ib_.config(state="disabled")
+        ttk.Label(f, text="Program and port").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        port = tk.StringVar(value=self.cfg.get("ib_port_label", "IB Gateway, paper (4002)"))
+        ttk.Combobox(f, textvariable=port, values=list(E.IB_PORTS), state="readonly", width=32).grid(row=4, column=1, sticky="w", pady=(10, 0))
+        ttk.Label(f, text="Host").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        host = tk.StringVar(value=self.cfg.get("ib_host", "127.0.0.1"))
+        ttk.Entry(f, textvariable=host, width=18).grid(row=5, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(f, text="Client ID").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        cid = tk.StringVar(value=str(self.cfg.get("ib_client", 17)))
+        ttk.Entry(f, textvariable=cid, width=8).grid(row=6, column=1, sticky="w", pady=(6, 0))
+        use = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="LIVE mode trades through Interactive Brokers (untick to keep using Alpaca)",
+                        variable=use).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ibq = tk.BooleanVar(value=bool(self.cfg.get("ib_quotes", True)))
+        ttk.Checkbutton(f, text="Use IBKR's quotes for contracts I hold or watch (best with an OPRA data subscription)",
+                        variable=ibq).grid(row=9, column=0, columnspan=3, sticky="w")
+        auto = tk.BooleanVar(value=bool(self.cfg.get("ib_auto", True)))
+        ttk.Checkbutton(f, text="Connect automatically when OBF starts", variable=auto).grid(row=8, column=0, columnspan=3, sticky="w")
+        res = ttk.Label(f, text="", wraplength=560, justify="left")
+        res.grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        def go():
+            try:
+                cid_ = int(cid.get())
+            except ValueError:
+                return messagebox.showerror("IBKR", "The client ID must be a number (any number not used by another app).", parent=w)
+            self.cfg.update(ib_port_label=port.get(), ib_host=host.get().strip() or "127.0.0.1", ib_client=cid_,
+                            ib_auto=bool(auto.get()), ib_quotes=bool(ibq.get()), broker="ibkr" if use.get() else "alpaca")
+            E.save_json(CONFIG_PATH, self.cfg)
+            res.config(text="Connecting...", foreground=MUTED)
+            self.ib_connect(lambda ok, msg: res.config(text=msg, foreground=GREEN if ok else RED) if w.winfo_exists() else None)
+        b = ttk.Frame(f)
+        b.grid(row=12, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(b, text="Close", command=w.destroy).pack(side="left", padx=4)
+        ttk.Button(b, text="Connect", style="Accent.TButton", command=go).pack(side="left")
+
+    def ib_connect(self, done=None, quiet=False):
+        host = self.cfg.get("ib_host", "127.0.0.1")
+        port = E.IB_PORTS.get(self.cfg.get("ib_port_label", ""), 4002)
+        cid = int(self.cfg.get("ib_client", 17))
+
+        def work():
+            try:
+                acct = E.IB.connect(host, port, cid)
+                funds = E.IB.funds()
+
+                def ok():
+                    self.balances = {"USD": funds}
+                    self.usd_avail = funds
+                    self.update_status()
+                    msg = (f"Connected to Interactive Brokers {'PAPER' if E.IB.paper else 'LIVE'} account {acct}: "
+                           f"${funds:,.2f} available." + (" LIVE mode now trades through IBKR." if self.broker() == "ibkr" else ""))
+                    self.write(msg, "good")
+                    if done:
+                        done(True, msg)
+                self.q.put(("call", ok))
+            except Exception as e:
+                hint = ("\nIs IB Gateway / TWS running and logged in, with the API enabled and the same port?"
+                        if "refused" in str(e).lower() or "timeout" in str(e).lower() or "connect" in str(e).lower() else "")
+                msg = f"Couldn't connect to Interactive Brokers: {e}{hint}"
+                self.q.put(("call", lambda: ((self.write(msg, "warn") if not quiet else None), done(False, msg) if done else None)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def ib_disconnect(self):
+        if self.running and self.live and self.broker() == "ibkr":
+            return messagebox.showinfo("IBKR", "Stop trading first.")
+        E.IB.disconnect()
+        self.cfg["broker"] = "alpaca"
+        E.save_json(CONFIG_PATH, self.cfg)
+        self.update_status()
+        self.write("Disconnected from Interactive Brokers. LIVE mode trades through Alpaca again.")
 
     def on_ofill(self, side, c, qty, avg, reserved, reason, o):
         """An Alpaca option order filled (avg is per share; one contract is 100 shares)."""

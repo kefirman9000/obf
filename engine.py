@@ -369,6 +369,214 @@ def pick_contract(chain, S, typ, dte, otm_pct, now=None):
     return min(cands, key=lambda r: (abs(r["exp"] - want_exp) / 86400 / max(3, dte)) + abs(r["K"] - want_K) / S * 10)
 
 
+# ---------------- Interactive Brokers (through IB Gateway / Trader Workstation on your computer) ----------------
+IB_PORTS = {"IB Gateway, paper (4002)": 4002, "IB Gateway, live (4001)": 4001,
+            "Trader Workstation, paper (7497)": 7497, "Trader Workstation, live (7496)": 7496}
+
+
+def ib_lib():
+    """The IBKR library: ib_async (Python 3.10+) or the older ib_insync (same interface). None if neither is installed."""
+    for name in ("ib_async", "ib_insync"):
+        try:
+            return importlib.import_module(name)
+        except Exception:
+            continue
+    return None
+
+
+def ib_pip_spec():
+    return "ib_async" if sys.version_info >= (3, 10) else "ib_insync"
+
+
+class IBBridge:
+    """Talks to IB Gateway / TWS. The IBKR library is asyncio-based, so all of it lives on one background thread
+    (with its own event loop); the app hands it jobs with call(fn) and waits for the answer."""
+
+    def __init__(self):
+        import queue as _q
+        self._q = _q.Queue()
+        self.thread = None
+        self.ib = None
+        self.lib = None
+        self.account = ""
+        self.port = None
+        self.error = ""
+
+    def _run(self):
+        import asyncio
+        import queue as _q
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        try:
+            self.lib = ib_lib()
+            self.ib = self.lib.IB() if self.lib else None
+        except Exception as e:
+            self.error = str(e)
+        while True:
+            try:
+                fn, box = self._q.get(timeout=0.25)
+            except _q.Empty:
+                try:
+                    if self.ib is not None and self.ib.isConnected():
+                        self.ib.sleep(0.05)  # keep the connection's messages flowing
+                except Exception:
+                    pass
+                continue
+            try:
+                box.put((True, fn(self.ib)))
+            except Exception as e:
+                box.put((False, e))
+
+    def call(self, fn, timeout=90):
+        import queue as _q
+        if self.thread is None or not self.thread.is_alive():
+            import threading
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        box = _q.Queue()
+        self._q.put((fn, box))
+        ok, res = box.get(timeout=timeout)
+        if not ok:
+            raise res
+        return res
+
+    def connected(self):
+        try:
+            return self.ib is not None and self.ib.isConnected()
+        except Exception:
+            return False
+
+    @property
+    def paper(self):
+        return self.account.startswith("DU") or self.port in (4002, 7497)
+
+    def connect(self, host, port, client_id):
+        def job(ib):
+            if self.lib is None:
+                raise RuntimeError("The Interactive Brokers add-on isn't installed yet (click 'Install the IBKR add-on').")
+            if ib.isConnected():
+                ib.disconnect()
+            ib.connect(host, int(port), clientId=int(client_id), timeout=10)
+            ib.reqMarketDataType(4)  # live quotes if you subscribe to them, otherwise delayed ones (free)
+            self.realtime = None  # learned from the first quotes: True = live data subscription, False = delayed
+            accts = ib.managedAccounts()
+            self.account, self.port = (accts[0] if accts else ""), int(port)
+            return self.account
+        return self.call(job, 30)
+
+    def disconnect(self):
+        try:
+            self.call(lambda ib: ib.disconnect() if ib and ib.isConnected() else None, 10)
+        except Exception:
+            pass
+
+    def funds(self):
+        """Money available to trade (AvailableFunds, in USD)."""
+        def job(ib):
+            vals = {v.tag: v.value for v in ib.accountSummary() if v.currency in ("USD", "BASE", "")}
+            for tag in ("AvailableFunds", "BuyingPower", "TotalCashValue", "NetLiquidation"):
+                try:
+                    if vals.get(tag) is not None:
+                        return float(vals[tag])
+                except (TypeError, ValueError):
+                    continue
+            return 0.0
+        return self.call(job, 30)
+
+    def _option(self, under, exp_ts, typ, K):
+        d = datetime.fromtimestamp(exp_ts, timezone.utc).strftime("%Y%m%d")
+        return self.lib.Option(under, d, float(K), "C" if typ == "call" else "P", "SMART", currency="USD")
+
+    @staticmethod
+    def _num(x):
+        try:
+            x = float(x)
+            return x if x == x and x > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def quote(self, under, exp_ts, typ, K):
+        """(bid, ask, IB contract) for one option (delayed quotes without a market-data subscription)."""
+        def job(ib):
+            c = self._option(under, exp_ts, typ, K)
+            if not ib.qualifyContracts(c):
+                raise RuntimeError(f"IBKR doesn't list {contract_text(dict(under=under, exp=exp_ts, type=typ, K=K))}")
+            t = ib.reqTickers(c)[0]
+            return self._num(t.bid), self._num(t.ask), c
+        return self.call(job, 30)
+
+    def quotes(self, contracts):
+        """{option symbol: (bid, ask, time)} for [(under, exp_ts, typ, K), ...]. Also notes whether IBKR sent
+        real-time quotes (you have an options data subscription) or delayed ones."""
+        def job(ib):
+            cs, keys = [], []
+            for under, exp, typ, K in contracts:
+                c = self._option(under, exp, typ, K)
+                cs.append(c)
+                keys.append(occ_symbol(under, exp, typ, K))
+            ok = ib.qualifyContracts(*cs) or []
+            okset = {id(c) for c in ok}
+            pairs = [(k, c) for k, c in zip(keys, cs) if id(c) in okset or getattr(c, "conId", 0)]
+            out = {}
+            if pairs:
+                for (k, _), t in zip(pairs, ib.reqTickers(*[c for _, c in pairs])):
+                    b, a_ = self._num(t.bid), self._num(t.ask)
+                    if b or a_:
+                        out[k] = (b, a_, time.time())
+                    mdt = getattr(t, "marketDataType", None)
+                    if mdt in (1, 2):
+                        self.realtime = True
+                    elif mdt in (3, 4):
+                        self.realtime = False
+            return out
+        return self.call(job, 60)
+
+    def pick(self, under, S, typ, dte, otm_pct):
+        """The listed IBKR contract closest to what the bots want (used when there's no Alpaca chain to choose from)."""
+        def job(ib):
+            stk = self.lib.Stock(under, "SMART", "USD")
+            ib.qualifyContracts(stk)
+            chains = ib.reqSecDefOptParams(stk.symbol, "", stk.secType, stk.conId)
+            ch = next((x for x in chains if x.exchange == "SMART"), chains[0] if chains else None)
+            if not ch:
+                raise RuntimeError(f"no option chain for {under} at IBKR")
+            now = time.time()
+            exps = sorted(datetime.strptime(e, "%Y%m%d").replace(hour=20, tzinfo=timezone.utc).timestamp() for e in ch.expirations)
+            exps = [e for e in exps if e > now + 86400] or exps
+            exp = min(exps, key=lambda e: abs(e - (now + dte * 86400)))
+            want = S * (1 + otm_pct / 100) if typ == "call" else S * (1 - otm_pct / 100)
+            K = min(ch.strikes, key=lambda k: abs(k - want))
+            return exp, float(K)
+        return self.call(job, 60)
+
+    def order(self, under, exp_ts, typ, K, qty, side, limit=None, wait=20):
+        """Places a limit (or market) order and waits for the fill. -> (filled contracts, avg price per share)."""
+        def job(ib):
+            c = self._option(under, exp_ts, typ, K)
+            if not ib.qualifyContracts(c):
+                raise RuntimeError("IBKR doesn't list that contract")
+            o = (self.lib.LimitOrder(side.upper(), int(qty), round(float(limit), 2)) if limit
+                 else self.lib.MarketOrder(side.upper(), int(qty)))
+            tr = ib.placeOrder(c, o)
+            until = time.time() + wait
+            while not tr.isDone() and time.time() < until:
+                ib.sleep(0.5)
+            if not tr.isDone():
+                ib.cancelOrder(tr.order)
+                ib.sleep(1.5)
+            st = tr.orderStatus
+            return float(st.filled or 0), float(st.avgFillPrice or 0)
+        return self.call(job, wait + 30)
+
+    def cancel_all(self):
+        try:
+            self.call(lambda ib: ib.reqGlobalCancel(), 15)
+        except Exception:
+            pass
+
+
+IB = IBBridge()
+
+
 def alp_account(creds=None):
     return alp("GET", f"{trade_url() if not creds else ('https://paper-api.alpaca.markets' if creds.get('paper', True) else 'https://api.alpaca.markets')}/v2/account",
                creds=creds)
