@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.0
+**Backtesting back to 2016, and a Free roam you can watch**
+
+- **Any stretch since 2016**: Backtest and Training camp have a new period picker: 1 day up to 5 years (or "Since 2016"),
+  1 min to 1 day candles, and either the most recent stretch or one starting on a date you choose (try 2020-02-18 for the
+  Covid crash, or 2022-01-03 for the 2022 bear market). History downloads once and is stored by year on your computer.
+- **Regular hours only**: pre- and after-market candles (when options don't trade) are left out everywhere.
+- **Backtest screen, cleaned up**: result tiles, a one-line verdict, a fixed-size chart with dates, walk-forward parts
+  shaded and labelled, big news days marked, and a hover readout drawn inside the chart (nothing around it jumps any
+  more). The details (stress tests, parts, per ticker, per mood, every rule) sit in their own scrolling box.
+- **Free roam, fixed**: it showed impossible dates (it counted nights and weekends as trading time) and only ever
+  studied the last few weeks. It now roams anywhere back to 2016, with real dates.
+- **Free roam, visible**: an animated IN SESSION banner (what it's studying, which bot, progress), a LIVE TRADES list
+  that fills as the bots trade the past, and problems shown on screen instead of failing silently. The stretch chart
+  stays up until the next one is ready.
+- **Free roam results, organised**: "Bots it tested: best to worst" (green = beats holding across tests, orange = mixed,
+  red = usually loses, and whether each is still in your farm), a filterable study log (good finds, bad results...),
+  and a "What the results do" tab explaining exactly what each kind of study changes.
+- Training camp: a crypto leftover ("Coins", BTC defaults) fixed; up to 12,000 candles per ticker.
+
 ## 1.3.0
 **Better history and the economic calendar**
 

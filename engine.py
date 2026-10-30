@@ -311,6 +311,8 @@ def fetch_ohlcv(coin, gran_seconds, count, quote="USD", cache=True):
         live = {t: (r[0], r[1], r[2], r[3] * VOL_RATIO[coin]) for t, r in live.items()}
     rows.update(sip)
     rows.update(live)
+    if gran_seconds < 86400:
+        rows = {t: r for t, r in rows.items() if regular_hours(t, gran_seconds)}
     every = sorted(rows)
     keys = every[-count:]
     seq = [rows[t] for t in keys]
@@ -327,6 +329,182 @@ def fetch_ohlcv(coin, gran_seconds, count, quote="USD", cache=True):
 
 
 VOL_RATIO = {}  # ticker -> full-market volume / free-feed volume, learned from bars both feeds have
+HIST_START = datetime(2016, 1, 4, tzinfo=timezone.utc).timestamp()  # the oldest stock history Alpaca serves
+_SIP_OK = {"ok": True}
+
+
+def regular_hours(t, gran):
+    """True for a bar inside the regular session (9:30 to 4 pm New York, weekdays). Options only trade then, so the
+    pre- and after-market bars Alpaca also sends are left out. Daily bars always count."""
+    if gran >= 86400:
+        return True
+    d = datetime.fromtimestamp(t, timezone.utc)
+    ny = d - timedelta(hours=_ny_offset(d))
+    if ny.weekday() >= 5:
+        return False
+    m = ny.hour * 60 + ny.minute
+    first = 9 * 60 if gran >= 3600 else 9 * 60 + 30  # the 9:00 hourly bar holds the 9:30 open
+    return first <= m < 16 * 60
+
+
+def _hist_path(coin, gran, year):
+    return os.path.join(HOME_DIR, "history", f"{coin}-{int(gran)}", f"{year}.json")
+
+
+def _load_shard(coin, gran, year):
+    try:
+        with open(_hist_path(coin, gran, year)) as f:
+            d = json.load(f)
+        return dict(spans=[tuple(x) for x in d.get("spans") or []],
+                    rows={int(t): tuple(r) for t, r in zip(d["t"], zip(d["c"], d["h"], d["l"], d["v"]))})
+    except (OSError, ValueError, KeyError, TypeError):
+        return dict(spans=[], rows={})
+
+
+def _save_shard(coin, gran, year, sh):
+    p = _hist_path(coin, gran, year)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    ts = sorted(sh["rows"])
+    rows = [sh["rows"][t] for t in ts]
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(dict(spans=sh["spans"], t=ts, c=[r[0] for r in rows], h=[r[1] for r in rows], l=[r[2] for r in rows],
+                       v=[r[3] for r in rows]), f, separators=(",", ":"))
+    os.replace(tmp, p)
+
+
+def _merge_spans(spans):
+    out = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _missing(spans, a, b):
+    out, cur = [], a
+    for s0, e0 in _merge_spans(spans):
+        if e0 <= cur:
+            continue
+        if s0 >= b:
+            break
+        if s0 > cur:
+            out.append((cur, s0))
+        cur = max(cur, e0)
+    if cur < b:
+        out.append((cur, b))
+    return [(x, y) for x, y in out if y - x > 60]
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _fetch_bars(coin, gran, a, b, feed):
+    rows, token, pages = {}, None, 0
+    url0 = (f"{DATA_URL}/v2/stocks/{urllib.parse.quote(coin)}/bars?timeframe={_tf(gran)}&limit=10000&adjustment=split"
+            f"&feed={feed}&start={_iso(a)}&end={_iso(b)}")
+    while pages < 400:
+        data = alp("GET", url0 + (f"&page_token={token}" if token else ""), timeout=30, retries=2)
+        for x in data.get("bars") or []:
+            t = int(_iso_ts(x["t"]))
+            if regular_hours(t, gran):
+                rows[t] = (float(x["c"]), float(x["h"]), float(x["l"]), float(x["v"]))
+        token = data.get("next_page_token")
+        pages += 1
+        if not token:
+            break
+    return rows
+
+
+def history_size():
+    """(files, bytes) of the stored deep history."""
+    n = b = 0
+    for root_, _, files in os.walk(os.path.join(HOME_DIR, "history")):
+        for f in files:
+            n += 1
+            try:
+                b += os.path.getsize(os.path.join(root_, f))
+            except OSError:
+                pass
+    return n, b
+
+
+def fetch_range(coin, gran, start, end, quote="USD", note=None):
+    """Bars between two dates, any time back to 2016: {'c','h','l','v','t'}, regular trading hours only. History is
+    stored on disk by year, so each stretch is downloaded once; the newest 15 minutes come live from the free feed."""
+    start, end = max(float(start), HIST_START), min(float(end), time.time())
+    rows = {}
+    cut = time.time() - 16 * 60
+    y0, y1 = datetime.fromtimestamp(start, timezone.utc).year, datetime.fromtimestamp(end, timezone.utc).year
+    for y in range(y0, y1 + 1):
+        ya = datetime(y, 1, 1, tzinfo=timezone.utc).timestamp()
+        yb = datetime(y + 1, 1, 1, tzinfo=timezone.utc).timestamp()
+        a, b = max(start, ya), min(end, yb, cut)
+        if a >= b:
+            continue
+        sh = _load_shard(coin, gran, y)
+        miss = _missing(sh["spans"], a, b)
+        for ma, mb in miss:
+            if note:
+                note(f"Downloading {coin} {datetime.fromtimestamp(ma).strftime('%b %Y')}"
+                     + (f" to {datetime.fromtimestamp(mb).strftime('%b %Y')}" if mb - ma > 40 * 86400 else ""))
+            got = None
+            if HIST_SIP and _SIP_OK["ok"] and FEED != "sip":
+                try:
+                    got = _fetch_bars(coin, gran, ma, mb, "sip")
+                except RuntimeError as e:
+                    if "403" in str(e) or "subscription" in str(e).lower():
+                        _SIP_OK["ok"] = False
+                    else:
+                        raise
+            if got is None:
+                got = _fetch_bars(coin, gran, ma, mb, FEED)
+            sh["rows"].update(got)
+            sh["spans"] = _merge_spans(sh["spans"] + [(int(ma), int(mb))])
+        if miss:
+            try:
+                _save_shard(coin, gran, y, sh)
+            except OSError:
+                pass
+        rows.update({t: r for t, r in sh["rows"].items() if start <= t <= end})
+    if end > cut:  # the newest minutes, live
+        try:
+            live = _fetch_bars(coin, gran, max(start, cut - 3600), end, FEED)
+            k = VOL_RATIO.get(coin) or 1
+            rows.update({t: (r[0], r[1], r[2], r[3] * k) for t, r in live.items() if t not in rows})
+        except Exception:
+            pass
+    ts = sorted(rows)
+    seq = [rows[t] for t in ts]
+    return dict(c=[r[0] for r in seq], h=[r[1] for r in seq], l=[r[2] for r in seq], v=[r[3] for r in seq], t=ts)
+
+
+def bars_per_day(gran):
+    """Regular-session candles in one trading day."""
+    return 1 if gran >= 86400 else max(1, int(round(6.5 * 3600 / gran)))
+
+
+def common_stretch(data):
+    """Lines several tickers up on the bar times they all have. -> (closes, extra)"""
+    keys = [c for c, d in data.items() if d.get("t")]
+    if not keys:
+        return {}, {}
+    shared = set(data[keys[0]]["t"])
+    for c in keys[1:]:
+        shared &= set(data[c]["t"])
+    ts = sorted(shared)
+    closes, extra = {}, {}
+    for c in keys:
+        d = data[c]
+        idx = {t: i for i, t in enumerate(d["t"])}
+        ii = [idx[t] for t in ts]
+        closes[c] = [d["c"][i] for i in ii]
+        extra[c] = {k: [d[k][i] for i in ii] for k in ("h", "l", "v")}
+        extra[c]["t"] = list(ts)
+    return closes, extra
 
 
 def fetch_candles(coin, gran_seconds, count, quote="USD"):
@@ -2309,6 +2487,7 @@ class Tournament:
         self.rng = rng or random.Random()
         self.n = 0
         self.events = []
+        self.on_trade = None  # optional hook: fn(bot, ticker, trade, bar time), e.g. Free roam's live trade feed
         self.recording = False  # the app switches this on once live; history replays are never recorded
         self.shadow = []        # every bot's own pretend trades since the last pop_shadow()
         self.hold_ret = None    # what just holding the coins returned over the scoring window
@@ -2681,6 +2860,11 @@ class Tournament:
                         self.review.setdefault(k, [0, 0])[0 if t["pl"] <= 0 else 1] += 1
             if self.recording:
                 self.shadow.append(dict(t, name=v.name, params=dict(v.params), tf=v.tf, uid=v.uid))
+            if self.on_trade:
+                try:
+                    self.on_trade(v, c, t, data_now(x, [c]) if x else None)
+                except Exception:
+                    pass
         e = v.sim.equity(last)
         if not self.replaying:
             if v.live_eq0 is None:
@@ -3551,7 +3735,8 @@ def _bt_bot(g, coins, start_cash, fee, pct, slip, picky=True):
     return b
 
 
-def backtest_bot(g, closes, extra=None, start_cash=1000.0, fee=0.006, pct=0.1, slip=0.0005, segments=4, progress=None):
+def backtest_bot(g, closes, extra=None, start_cash=1000.0, fee=0.006, pct=0.1, slip=0.0005, segments=4, progress=None,
+                 on_trade=None):
     """Full backtest of one bot (its exact genes) on past prices. Returns a dict with:
     ret, hold, edge, maxdd, trades, winrate, sortino, eq (equity curve), hold_eq, marks [(bar, coin, side, price)],
     by_coin {coin: [trades, P/L $]}, by_mood {mood: [decisions, summed gain]}, layer_stats, veto_stats, coin_pl,
@@ -3574,6 +3759,9 @@ def backtest_bot(g, closes, extra=None, start_cash=1000.0, fee=0.006, pct=0.1, s
             mood = max(set(known), key=known.count) if known else "unknown"
         for c, t in bot_step(b, pre, i, coins, slice_extra(extra, i + 1) if extra else None):
             marks.append((i, c, t["side"], closes[c][i]))
+            if on_trade:
+                tt = ((extra or {}).get(c) or {}).get("t")
+                on_trade(c, t, tt[i] if tt and i < len(tt) else None)
             bc = by_coin.setdefault(c, [0, 0.0])
             bc[0] += 1
             if t["side"] == "sell" and t.get("pl") is not None:
@@ -3717,7 +3905,7 @@ def _fresh_money(t):
 
 
 def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes=None, start_cash=1000.0, fee=0.006,
-               pct=0.1, evolve=24, params=None, retire_steps=0, progress=None, stop=None, seed=None):
+               pct=0.1, evolve=24, params=None, retire_steps=0, progress=None, stop=None, seed=None, on_trade=None):
     """Training camp: a whole farm lives through a stretch of history, `passes` times over, breeding and learning as it
     goes (bots keep their genes and lessons between passes, with fresh money each time). The last exam_frac of the
     history is held back: afterwards the best bots are frozen and sent through it as a final exam on prices they never
@@ -3734,6 +3922,7 @@ def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes
         tx[CTX_KEY] = {k: x[:cut] for k, x in extra[CTX_KEY].items()}
     t = Tournament(coins, start_cash, fee, pct, evolve, params=params, opts=opts, cap=cap, retire_steps=retire_steps,
                    rng=random.Random(seed))
+    t.on_trade = on_trade
     for g in seed_genes or []:
         if g.get("name") in STRATS:
             t.add_variant(g["name"], g.get("params") or {}, None, g.get("size", 1.0), note="Training seed:", tf=g.get("tf", 1),
