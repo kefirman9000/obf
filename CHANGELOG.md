@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.7.1
+- Free roam always starts OFF when OBF opens, even if it was on when you closed it. It only studies after you switch
+  it on.
+
 ## 1.7.0
 **Streamlined: fewer windows, tabs, menus and settings**
 
