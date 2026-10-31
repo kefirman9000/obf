@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6.0
+**Expiry guard, day-trade guard, real fees, liquidity filter**
+
+- **Expiry guard**: every contract is sold a set number of trading days before it expires (default 2: Wednesday for a
+  Friday expiry), so nothing you bought is ever auto-exercised into 100 shares. It runs every minute whenever OBF is
+  open, even with the bot stopped, and keeps retrying until the contract sells. On expiry day, as a last resort: IBKR is
+  told NOT to exercise anything still held (3:40 pm); with Alpaca, a call still held at 1 pm brings up a warning to
+  email Alpaca for a Do Not Exercise before 3 pm (Alpaca handles puts itself). Closing OBF while holding a contract near
+  expiry asks whether to sell it first. Bots never buy a contract inside the guard's window.
+- **Day-trade guard** (accounts under $25,000): once 3 day trades are used in 5 business days, OBF opens no new contracts
+  and holds today's contracts overnight instead of selling them for a 4th, so the broker doesn't flag the account.
+  It uses the broker's own count (Alpaca, IBKR) when it can. Safety exits (stops, expiry, kill switch, your own sells)
+  still go through.
+- **Real fees**: practice, backtests and every farm now charge your broker's per-contract fee each way (Alpaca about
+  $0.04 of regulatory fees; IBKR about $0.65 + $0.04), on top of the spread. Override it in Settings > Basics.
+- **Liquidity filter** (LIVE): skips contracts with a wide bid/ask gap (default over 15% of the price) or few open
+  contracts (default under 50), where real fills go badly.
+
 ## 1.5.0
 **Buy-only safety lock, contract price range, and nothing running behind your back**
 
