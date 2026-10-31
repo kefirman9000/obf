@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5.0
+**Buy-only safety lock, contract price range, and nothing running behind your back**
+
+- **Safety lock**: OBF only ever buys a call or put to open, and sells to close contracts it holds. Every sell is
+  checked against the broker's own count first (Alpaca positions, or IBKR positions); an order that would sell more
+  than you hold, which would open a short (naked/uncovered) position, is refused before it's sent. So no trade can lose
+  more than what was paid for it. The kill switch and hand trades go through the same lock.
+- **Options level check**: going LIVE with Alpaca checks your approved options level. Buying calls/puts is Alpaca's
+  Level 2 (still defined risk); you get a clear message if the account isn't approved for it yet.
+- **Contract price range** (Settings > Basics): the cheapest and most expensive contract the bots may buy, per share
+  (e.g. $0.50 to $3.00 = $50 to $300 a contract). Bots move their strike to land inside the range, or skip the trade.
+  Applies to practice, backtests, Training camp, Free roam, the Slow farm and LIVE.
+- **No background learning**: Free roam now only studies while its switch is ON (no more idle studies), and switching
+  it OFF stops the study in progress at once. The nightly Hall of Fame retest is off too (it can be turned back on in
+  Settings > Library & Hall of Fame).
+- **Disk use** (Tools): what OBF stores and how much it has written since it started, with buttons to delete the
+  downloaded history or price cache. Routine saves are now spaced out (account at most every 30 s, farm at most every
+  5 minutes); trades still save immediately.
+- Leftover crypto wording ("coin", BTC examples) removed from the Basics settings.
+
 ## 1.4.0
 **Backtesting back to 2016, and a Free roam you can watch**
 
