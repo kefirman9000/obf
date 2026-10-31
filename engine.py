@@ -425,19 +425,6 @@ def _fetch_bars(coin, gran, a, b, feed):
     return rows
 
 
-def history_size():
-    """(files, bytes) of the stored deep history."""
-    n = b = 0
-    for root_, _, files in os.walk(os.path.join(HOME_DIR, "history")):
-        for f in files:
-            n += 1
-            try:
-                b += os.path.getsize(os.path.join(root_, f))
-            except OSError:
-                pass
-    return n, b
-
-
 def fetch_range(coin, gran, start, end, quote="USD", note=None):
     """Bars between two dates, any time back to 2016: {'c','h','l','v','t'}, regular trading hours only. History is
     stored on disk by year, so each stretch is downloaded once; the newest 15 minutes come live from the free feed."""
@@ -511,10 +498,6 @@ def common_stretch(data):
         extra[c] = {k: [d[k][i] for i in ii] for k in ("h", "l", "v")}
         extra[c]["t"] = list(ts)
     return closes, extra
-
-
-def fetch_candles(coin, gran_seconds, count, quote="USD"):
-    return fetch_ohlcv(coin, gran_seconds, count, quote)["c"]
 
 
 def latest_volume(coin, gran_seconds, quote="USD"):
@@ -1478,7 +1461,7 @@ DEFAULT_SETTINGS = {
     "ctx_tickers": ["SPY", "VIXY", "TLT", "MSFT"],  # market context: watched (never traded); VIXY stands in for the VIX
     "ctx_studies": True,         # bots can evolve studies on the context tickers (VIX up = careful with calls...)
     "htf_studies": True,         # bots can evolve a slower-timeframe study (the bigger trend) that must agree before buying
-    "lead_study": True,          # bots can evolve a "Bitcoin leads" study: BTC's recent move votes on other coins
+    "lead_study": True,          # bots can evolve a "market leads" study: SPY's recent move votes on other tickers
     "post_review": True,         # after losing trades the farm notes which never-rule would have helped, and tries those more
     "islands": 3,                # separate sub-farms that only swap a champion now and then (1 = one big farm)
     "adapt_exits": True,         # bots can evolve stops and targets that widen in wild markets and tighten in calm ones
@@ -1521,7 +1504,7 @@ DEFAULT_SETTINGS = {
     "prem_min": 0.0,             # contract price range the bots may buy, $ per share (0 = no limit)
     "prem_max": 0.0,
     "slippage": 2.0,             # % of the premium lost to the bid/ask spread on each option fill (Practice)
-    "order_type": "market",      # "market" or "limit" (post-only maker orders, lower fees)
+    "order_type": "market",      # (options always use limit orders at the bid / ask; kept for old settings files)
     "maker_fee_pct": 0.4,        # fee for limit orders that rest on the book (Practice)
     "limit_wait": 20,            # seconds a limit order may wait for a fill
     "limit_fallback": True,      # if a limit order does not fill in time, use a market order instead
@@ -1962,6 +1945,14 @@ def align_ctx(times, ctx_times, ctx_closes):
     return out
 
 
+def lead_ticker(closes):
+    """The market leader the 'follow the leader' study watches: SPY (or QQQ) when the farm trades it."""
+    for t in ("SPY", "QQQ", "BTC"):
+        if t in closes:
+            return t
+    return None
+
+
 def data_now(extra, coins):
     """Time of the newest bar in this data (bar times travel with the highs/lows/volumes as 't')."""
     for c in coins:
@@ -2327,8 +2318,8 @@ def layers_text(L, stats=None):
         parts.append("watches the market: " + "; ".join(ctx_text(e) + _stat_txt(stats.get(f"ctx:{e['sym']}"), "trades it held back")
                                                         for e in L["ctx"]))
     if L.get("lead"):
-        parts.append(f"Bitcoin leads: BTC up {L['lead']['th']:g}%+ over {L['lead']['lb']} decisions votes for buying other "
-                     f"coins, down that much votes against" + _stat_txt(stats.get("lead"), "buys blocked by Bitcoin"))
+        parts.append(f"The market leads: SPY up {L['lead']['th']:g}%+ over {L['lead']['lb']} decisions votes for buying other "
+                     f"tickers, down that much votes against" + _stat_txt(stats.get("lead"), "buys blocked by the market"))
     if L.get("exits"):
         parts.append("sells when any of these says sell: " + ", ".join(_sub_txt(s) for s in L["exits"]))
     if L.get("size"):
@@ -2347,7 +2338,7 @@ def rule_stack(v_or_entry):
     if L.get("ctx"):
         market.append("watches " + "; ".join(ctx_text(e) for e in L["ctx"]))
     if L.get("lead"):
-        market.append(f"Bitcoin leads (BTC {L['lead']['th']:g}% over {L['lead']['lb']} decisions)")
+        market.append(f"The market leads (SPY {L['lead']['th']:g}% over {L['lead']['lb']} decisions)")
     pos = [f"{g('name')} (main)"] + [_sub_txt(s) for s in L.get("plus", [])]
     entry = [f"positive studies: {', '.join(pos)}" + (f"; needs {L.get('need', 1)} of {len(pos)} saying buy" if len(pos) > 1 or L.get("minus") else "")
              + _stat_txt(ls.get("plus"), "held-back buys")]
@@ -2447,8 +2438,9 @@ def bot_step(v, closes, n, coins, extra=None):
                         s = "sell"
                         reason = "an exit study said sell"
                 lead_v = 0
-                if L.get("lead") and c != "BTC" and "BTC" in closes:
-                    q_ = closes["BTC"]
+                ldr = lead_ticker(closes)
+                if L.get("lead") and ldr and c != ldr:
+                    q_ = closes[ldr]
                     lb = L["lead"]["lb"] * v.tf
                     if len(q_) > lb:
                         mv = (q_[-1] / q_[-1 - lb] - 1) * 100
@@ -3907,17 +3899,6 @@ def metrics(eq):
     return eq[-1] / eq[0] - 1, dd
 
 
-def bot_sigfn(name, params, tf, coins):
-    """Signal function for one bot that decides the same way it does inside the tournament."""
-    tf = clamp_tf(tf)
-
-    def sig(i, pre, prex=None):
-        if i % tf:
-            return {}
-        return {c: strat_signal(name, pre[c], i, params, tf, (prex or {}).get(c)) for c in coins}
-    return sig
-
-
 def replay_bot(v, closes, extra, start, start_cash, fee, pct, slip=0.0):
     """A frozen copy of bot v trading on its own from bar `start` to the end, exactly as it would in the
     tournament (strategy, pace, own stops and traits). Returns (equity curve, trade count)."""
@@ -4273,110 +4254,7 @@ def slice_extra(extra, i):
     return {c: {k: View(v, i) for k, v in d.items()} for c, d in extra.items() if d}
 
 
-def run_backtest(closes, names, settings, start_cash=1000.0, seed=1, extra=None):
-    """Returns rows of (name, return, max_drawdown, trades), best first."""
-    fee, slip = cost_model(settings)
-    pct = settings["trade_pct"] / 100
-    stop, take = settings["stop_loss"] / 100, settings["take_profit"] / 100
-    trail = float(settings.get("trail_stop", 0)) / 100
-    mc = settings.get("max_coin_pct", 50) / 100
-    coins = list(closes)
-    L = min(len(v) for v in closes.values())
-    closes = {c: v[-L:] for c, v in closes.items()}
-    extra = {c: {k: v[-L:] for k, v in d.items()} for c, d in extra.items()} if extra else None
-    rows = []
-    for name in names:
-        a = settings["params"][name]
-        eq, tr = simulate(closes, lambda i, pre, prex, a=a, name=name: {
-            c: strat_signal(name, pre[c], i, a, 1, (prex or {}).get(c)) for c in coins},
-            start_cash, fee, pct, stop, take, max_coin=mc, slip=slip, trail=trail, extra=extra)
-        rows.append((name, *metrics(eq), tr))
-    t = Tournament(coins, start_cash, fee, pct, settings["evolve_every"], cap=int(settings.get("max_bots", 30)),
-                   params=settings["params"], rng=random.Random(seed), opts=tournament_opts(settings))
-
-    def wsig(i, pre, prex=None):
-        t.step(pre, prex)
-        return {c: t.vote(c) for c in coins}
-    eq, tr = simulate(closes, wsig, start_cash, fee, pct, stop, take, max_coin=mc, slip=slip, trail=trail, extra=extra)
-    rows.append(("Wildcard", *metrics(eq), tr))
-    units = {c: (start_cash / len(coins)) / closes[c][WARM] for c in coins}
-    bh = [start_cash] + [sum(units[c] * closes[c][i] for c in coins) for i in range(WARM, L)]
-    rows.append(("Buy & hold (equal weight)", *metrics(bh), 0))
-    return sorted(rows, key=lambda r: -r[1])
-
-
 # ---------------- Bot Lab: evolve on old prices, test on newer unseen prices ----------------
-def run_lab(closes, settings, train_frac=0.7, top_n=12, start_cash=1000.0, seed=None, progress=None, extra=None):
-    """Evolves a tournament on the first part of the history, then tests its best bots on the
-    remaining part they never saw. Returns a dict with per-bot rows and summary rows.
-
-    progress(stage, done, total) is called now and then (stage: 'train' or 'test')."""
-    fee, slip = cost_model(settings)
-    pct = settings["trade_pct"] / 100
-    coins = list(closes)
-    L = min(len(v) for v in closes.values())
-    closes = {c: v[-L:] for c, v in closes.items()}
-    extra = {c: {k: v[-L:] for k, v in d.items()} for c, d in extra.items()} if extra else None
-    split = int(L * train_frac)
-    if split < 200 or L - split < 80:
-        raise ValueError("Not enough history for a train/test split (need about 300+ candles).")
-    rng = random.Random(seed)
-    t = Tournament(coins, start_cash, fee, pct, settings["evolve_every"], cap=int(settings.get("max_bots", 30)),
-                   params=settings["params"], rng=rng, opts=tournament_opts(settings),
-                   retire_steps=int(settings.get("evolve_every", 24)) * 8)
-    train = {c: v[:split] for c, v in closes.items()}
-    t.warmup(train, progress=(lambda d, n: progress("train", d, n)) if progress else None,
-             extra=slice_extra(extra, split))
-    cands, seen = [], set()
-    for v in t.vars:
-        lf = t.life(v)
-        if v.key() in seen:
-            continue
-        seen.add(v.key())
-        if v.ntrades >= 3 and v.age >= 50:
-            info = t.info.get(id(v), {})
-            cands.append((v, lf, info))
-    cands.sort(key=lambda x: -((x[1]["edge"] if x[1]["edge"] is not None else x[1]["ret"]) * (0.5 + (x[2].get("cons") or 0))))
-    cands = cands[:top_n]
-    test_hold = sum(closes[c][-1] / closes[c][split] for c in coins) / len(coins) - 1
-    rows = []
-    for k, (v, lf, info) in enumerate(cands):
-        eq, tr = replay_bot(v, closes, extra, split, start_cash, fee, pct, slip)
-        ret, dd = metrics(eq)
-        if ret > 0 and ret > test_hold and tr >= 2:
-            verdict = "Passed"
-        elif ret > test_hold and tr >= 2:
-            verdict = "Lost less than holding"
-        elif tr < 2:
-            verdict = "Too few trades"
-        else:
-            verdict = "Failed"
-        rows.append(dict(name=v.name, params=dict(v.params), tf=v.tf, size=v.size_mult, risk=dict(v.risk),
-                         traits=dict(v.traits), vetoes=dict(v.vetoes), layers=json.loads(json.dumps(v.layers)),
-                         train_ret=lf["ret"], train_edge=lf["edge"], train_status=info.get("status", ""),
-                         test_ret=ret, test_edge=ret - test_hold, test_dd=dd, test_trades=tr, verdict=verdict,
-                         passed=verdict == "Passed",
-                         stats=dict(recent_gain_pct=round(ret * 100, 2), status="lab " + verdict.lower(),
-                                    trades=tr, consistency_pct=None)))
-        if progress:
-            progress("test", k + 1, len(cands) + 1)
-
-    def wsig(i, pre, prex=None):  # the whole Wildcard system keeps evolving through the unseen part
-        if i < split:
-            return {}
-        t.step(pre, prex)
-        return {c: t.vote(c) for c in coins}
-    stop, take = settings["stop_loss"] / 100, settings["take_profit"] / 100
-    eq, tr = simulate(closes, wsig, start_cash, fee, pct, stop, take, warm=split,
-                      max_coin=settings.get("max_coin_pct", 50) / 100, slip=slip,
-                      trail=float(settings.get("trail_stop", 0)) / 100, extra=extra)
-    wret, wdd = metrics(eq)
-    if progress:
-        progress("test", len(cands) + 1, len(cands) + 1)
-    return dict(rows=rows, split=split, total=L, test_hold=test_hold,
-                wildcard=dict(ret=wret, dd=wdd, trades=tr), bots_tried=len(t.vars))
-
-
 # ---------------- popular tickers ----------------
 POPULAR = ["SPY", "QQQ", "IWM", "DIA", "AAPL", "NVDA", "TSLA", "AMD", "MSFT", "AMZN", "META", "GOOGL", "NFLX", "PLTR",
            "COIN", "MSTR", "SMCI", "AVGO", "BA", "JPM", "BAC", "XOM", "INTC", "UBER", "SOFI", "RIVN", "GME", "SNOW",
@@ -4631,7 +4509,7 @@ SCHEMA_NOTE = (
     "2 trending down, 4 choppy, 8 quiet), `vetoes` its never-rules (knife = no buying after that % drop over 10 "
     "decisions, spike = no buying after a one-bar jump of that %, chase = no buying that % above the 20-decision "
     "average, revenge = no re-buying a coin within that many decisions of a loss on it, thin = no buying under that "
-    "x normal volume, mktdown = no buying while BTC is down that % over 10 decisions, panic = no strategy selling "
+    "x normal volume, mktdown = no buying while SPY is down that % over 10 decisions, panic = no strategy selling "
     "after a one-bar drop of that %), `layers` extra rule layers (plus = extra positive studies: each study's most recent "
     "signal is its vote, the main strategy is always one of them, and the bot buys when the number of positive studies "
     "voting buy minus the number of `minus` (negative) studies whose latest signal is sell is at least `need`; a buy "
