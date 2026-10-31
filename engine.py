@@ -252,6 +252,8 @@ def _tf(gran):
 
 
 def _candle_cache_path(coin, quote, gran):
+    if not re.fullmatch(r"[A-Z0-9.\-]{1,12}", str(coin)):
+        raise ValueError(f"not a ticker: {coin!r}")
     return os.path.join(HOME_DIR, "cache", f"{coin}-{int(gran)}.json")
 
 
@@ -348,6 +350,8 @@ def regular_hours(t, gran):
 
 
 def _hist_path(coin, gran, year):
+    if not re.fullmatch(r"[A-Z0-9.\-]{1,12}", str(coin)):
+        raise ValueError(f"not a ticker: {coin!r}")
     return os.path.join(HOME_DIR, "history", f"{coin}-{int(gran)}", f"{year}.json")
 
 
@@ -769,7 +773,12 @@ def ib_lib():
 
 
 def ib_pip_spec():
-    return "ib_async" if sys.version_info >= (3, 10) else "ib_insync"
+    # pinned to known releases, so a future compromised upload can't sneak in
+    return "ib_async==2.0.1" if sys.version_info >= (3, 10) else "ib_insync==0.9.86"
+
+
+def is_local_host(h):
+    return str(h or "").strip().lower() in ("127.0.0.1", "localhost", "::1", "")
 
 
 class IBBridge:
@@ -834,6 +843,10 @@ class IBBridge:
         return self.account.startswith("DU") or self.port in (4002, 7497)
 
     def connect(self, host, port, client_id):
+        if not is_local_host(host):
+            raise RuntimeError(f"OBF only connects to IB Gateway / TWS on this computer (127.0.0.1), not {host}: the "
+                               "connection isn't encrypted, so it should never cross a network.")
+
         def job(ib):
             if self.lib is None:
                 raise RuntimeError("The Interactive Brokers add-on isn't installed yet (click 'Install the IBKR add-on').")
@@ -4430,16 +4443,18 @@ def send_alert(settings, text):
     return problems
 
 
-def tg_updates(token, offset=None):
-    """New Telegram messages to your bot: ([(chat id, text)], next offset). Long-polls for up to 20 seconds."""
-    url = f"https://api.telegram.org/bot{token.strip()}/getUpdates?timeout=20" + (f"&offset={offset}" if offset else "")
-    data = json.loads(http_get(url, 30))
+def tg_updates(token, offset=None, timeout=20):
+    """New Telegram messages to your bot: ([(chat id, text, sent at, private chat?, sender id)], next offset)."""
+    url = f"https://api.telegram.org/bot{token.strip()}/getUpdates?timeout={int(timeout)}" + (f"&offset={offset}" if offset else "")
+    data = json.loads(http_get(url, timeout + 10))
     out, nxt = [], offset
     for u in data.get("result", []):
         nxt = u["update_id"] + 1
         m = u.get("message") or {}
         if m.get("text"):
-            out.append((m["chat"]["id"], m["text"]))
+            ch = m.get("chat") or {}
+            out.append((ch.get("id"), m["text"], float(m.get("date") or 0), ch.get("type") == "private",
+                        (m.get("from") or {}).get("id")))
     return out, nxt
 
 
@@ -4512,6 +4527,8 @@ def note_write(path, nbytes):
 
 
 def save_json(path, obj):
+    if os.path.basename(path) == "config.json":
+        obj = scrub_config(obj)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -5108,6 +5125,104 @@ def keyring_available():
         return True
     except ImportError:
         return False
+
+
+# ---------------- other secrets: kept in the system keychain, never in config.json ----------------
+SECRET_SETTINGS = ("alert_tg_token", "alert_discord")   # inside cfg["settings"]
+SECRET_CFG = ("fred_key",)                              # at the top of cfg
+
+
+def secret_set(name, value):
+    """Stores a secret in the system keychain (Windows Credential Manager / macOS Keychain). False if unavailable."""
+    try:
+        import keyring
+        if value:
+            keyring.set_password(KEYRING_SERVICE, name, str(value))
+        else:
+            try:
+                keyring.delete_password(KEYRING_SERVICE, name)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def secret_get(name):
+    try:
+        import keyring
+        return keyring.get_password(KEYRING_SERVICE, name) or ""
+    except Exception:
+        return ""
+
+
+def keychain_ok():
+    try:
+        import keyring
+        keyring.get_password(KEYRING_SERVICE, "_probe")
+        return True
+    except Exception:
+        return False
+
+
+def scrub_config(cfg):
+    """A copy of the config with its secrets moved to the keychain (if it works) and blanked."""
+    if not isinstance(cfg, dict) or not keychain_ok():
+        return cfg
+    out = dict(cfg)
+    st = dict(out.get("settings") or {})
+    for k in SECRET_SETTINGS:  # an emptied field removes the stored secret too
+        if k in st and secret_set(k, st.get(k) or ""):
+            st[k] = ""
+    for k in SECRET_CFG:
+        if k in out and secret_set(k, out.get(k) or ""):
+            out[k] = ""
+    if "settings" in out:
+        out["settings"] = st
+    return out
+
+
+def fill_secrets(cfg):
+    """Puts the keychain's secrets back into a freshly loaded config (in memory only)."""
+    st = cfg.setdefault("settings", {}) if isinstance(cfg.get("settings"), dict) or "settings" not in cfg else cfg["settings"]
+    for k in SECRET_SETTINGS:
+        if not st.get(k):
+            v = secret_get(k)
+            if v:
+                st[k] = v
+    for k in SECRET_CFG:
+        if not cfg.get(k):
+            v = secret_get(k)
+            if v:
+                cfg[k] = v
+    return cfg
+
+
+_REDACT = [
+    (re.compile(r"(api_key=)[A-Za-z0-9]+"), r"\1[hidden]"),
+    (re.compile(r"(api\.telegram\.org/bot)[^/\s]+"), r"\1[hidden]"),
+    (re.compile(r"(discord(?:app)?\.com/api/webhooks/)\S+"), r"\1[hidden]"),
+    (re.compile(r"\b(?:PK|AK)[A-Z0-9]{14,}\b"), "[hidden key]"),
+    (re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b"), "[hidden token]"),
+]
+
+
+def redact(text):
+    """Removes anything that looks like a key, token or webhook from text going into logs."""
+    text = str(text)
+    for rx, sub in _REDACT:
+        text = rx.sub(sub, text)
+    return text
+
+
+def private_dir(path):
+    """Makes the data folder readable by you only (Mac / Linux; Windows user folders already are)."""
+    try:
+        if os.name == "posix":
+            os.makedirs(path, exist_ok=True)
+            os.chmod(path, 0o700)
+    except OSError:
+        pass
 
 
 def save_login(key, secret, paper=True):

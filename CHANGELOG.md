@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.6.1
+**Security review**
+
+- **Fixed: hand buys went to the wrong broker.** With LIVE set to Interactive Brokers, a buy from the Options tab was
+  still sent to Alpaca, and OBF then tried to sell it through IBKR (where the safety lock refused, so the expiry guard
+  couldn't sell it either). Hand buys now go to the broker LIVE trades through, every contract remembers where it was
+  bought, and it's always sold there.
+- **Hand buys follow the guards**: no contracts inside the expiry guard's window, none while the day-trade guard is
+  blocking, and a warning for contracts outside your price range or with a wide bid/ask gap.
+- **LIVE contracts are watched from Practice too**: if your saved LIVE session holds a contract close to expiry while
+  OBF is in Practice, you get a warning to switch to LIVE so the guard can sell it.
+- **Backups never contain keys**, even on computers without a system keychain.
+- **Restoring a backup only restores OBF's own data files** (never programs, never anything outside the data folder).
+- Ticker names are checked before they're used in file names.
+- Security check (Tools) lists the expiry and day-trade guards.
+
 ## 1.6.0
 **Expiry guard, day-trade guard, real fees, liquidity filter**
 
