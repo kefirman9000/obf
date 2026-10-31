@@ -145,7 +145,6 @@ SETTING_GROUPS = [
     ]),
     ("Wildcard", "How the bot treats strategies that are winning, shaky or failing.", [
         ("winner_boost", "Biggest trade size a top winner can earn (1 = normal, 2.5 = 2.5 times)", float),
-        ("add_every", "While a winner is holding a coin, add more every N decisions", int),
         ("slow_every", "Shaky strategies may only trade every N decisions", int),
         ("fail_drop", "Stop a strategy at once if it falls this % from its peak (0 = off)", float),
         ("evolve_every", "Review and replace strategies every N decisions", int),
@@ -202,9 +201,7 @@ SETTING_GROUPS = [
         ("grad_hours", "...hours a bot must have spent Winning to graduate", float),
     ]),
     ("Orders", "How orders are placed, and the extra costs Practice mode pretends to pay.", [
-        ("order_type", "Order type", "order"),
         ("limit_wait", "Limit orders: seconds to wait for a fill", int),
-        ("limit_fallback", "Limit orders: if nothing fills in time, use a market order instead", bool),
         ("max_trades_hour", "Brake: at most this many strategy trades per hour (0 = no limit). Safety stops always run", int),
         ("trade_hours", "Trading hours: the account only makes strategy trades in these hours, like 9-17 or 22-6 "
                         "(empty = any time). The bots keep learning and safety stops always run", str),
@@ -410,34 +407,9 @@ def resort(t):
 
 
 
-COIN_COLORS = {"BTC": "#f7931a", "ETH": "#627eea", "SOL": "#9945ff", "XRP": "#4b5563", "DOGE": "#c2a633",
-               "ADA": "#0033ad", "AVAX": "#e84142", "LINK": "#2a5ada", "LTC": "#345d9d", "DOT": "#e6007a",
-               "ATOM": "#2e3148", "XTZ": "#2c7df7", "NEAR": "#00c08b", "ALGO": "#6b7280", "SUI": "#4da2ff",
-               "SHIB": "#f00500", "PEPE": "#3d8c40", "USDC": "#2775ca", "BCH": "#8dc351", "ETC": "#328332"}
-STAKING = {  # whether the coin itself can be staked (how its network works); reward rates are up to you
-    "BTC": ("No", "Bitcoin runs on proof of work (mining), so there is no native staking."),
-    "ETH": ("Yes", "Ethereum runs on proof of stake. Many exchanges offer ETH staking; unstaking can take a while."),
-    "SOL": ("Yes", "Solana runs on proof of stake. Staked SOL earns rewards each epoch (about every 2 days)."),
-    "XRP": ("No", "The XRP Ledger has no staking. Some platforms offer lending products instead, which carry other risks."),
-    "DOGE": ("No", "Dogecoin runs on proof of work (mining), so there is no native staking."),
-    "ADA": ("Yes", "Cardano runs on proof of stake. Delegated ADA stays in your wallet."),
-    "AVAX": ("Yes", "Avalanche runs on proof of stake. Native staking locks coins for a set period."),
-    "LINK": ("Limited", "Chainlink has staking pools with limited capacity; availability depends on the platform."),
-    "LTC": ("No", "Litecoin runs on proof of work (mining), so there is no native staking."),
-    "DOT": ("Yes", "Polkadot runs on proof of stake. Unstaking has a waiting (unbonding) period."),
-    "ATOM": ("Yes", "Cosmos runs on proof of stake. Unstaking has a waiting (unbonding) period."),
-    "XTZ": ("Yes", "Tezos runs on proof of stake (baking/delegation)."),
-    "NEAR": ("Yes", "NEAR runs on proof of stake."),
-    "ALGO": ("Yes", "Algorand runs on pure proof of stake."),
-    "SUI": ("Yes", "Sui runs on proof of stake."),
-    "APT": ("Yes", "Aptos runs on proof of stake."),
-    "POL": ("Yes", "Polygon (POL) can be staked to validators."),
-    "BCH": ("No", "Bitcoin Cash runs on proof of work (mining)."),
-    "ETC": ("No", "Ethereum Classic runs on proof of work (mining)."),
-    "SHIB": ("No", "SHIB is a token with no native staking of its own."),
-    "PEPE": ("No", "PEPE is a token with no staking of its own."),
-    "USDC": ("No", "A stablecoin. It isn't staked, though some platforms pay rewards for holding it."),
-}
+COIN_COLORS = {"SPY": "#2563eb", "QQQ": "#7c3aed", "IWM": "#0891b2", "AAPL": "#6b7280", "MSFT": "#16a34a",
+               "NVDA": "#65a30d", "TSLA": "#dc2626", "AMZN": "#f59e0b", "META": "#1d4ed8", "AMD": "#be123c",
+               "VIXY": "#f97316", "TLT": "#0f766e"}
 
 
 def coin_color(c):
@@ -688,6 +660,9 @@ class App:
         E.fill_secrets(self.cfg)
         self.settings = E.merge_settings(self.cfg.get("settings"))
         self.settings["_broker"] = self.cfg.get("broker", "alpaca")
+        wl = self.cfg.get("watchlist")
+        if isinstance(wl, list) and wl and all(x in ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA") for x in wl):
+            self.cfg["watchlist"] = ["SPY", "QQQ", "NVDA"]  # a crypto-era default list
         if not self.cfg.get("bg_learning_off"):  # 1.5: no learning runs by itself any more (Free roam only when ON)
             self.settings["retest_nightly"] = False
             self.cfg["bg_learning_off"] = True
@@ -1008,13 +983,7 @@ class App:
         cb.pack(fill="x")
         cb.bind("<<ComboboxSelected>>", self.on_style)
         Tip(cb, "Sets trade size and safety limits in one go. Cautious = small and steady, Adventurous = big and bold.")
-        tk.Label(c, text="Account currency", bg=CARD, fg=MUTED).pack(anchor="w", pady=(8, 0))
-        self.quote_var = tk.StringVar(value=self.cfg.get("quote", "USD"))
-        qb = ttk.Combobox(c, textvariable=self.quote_var, values=["USD"], state="readonly")
-        qb.pack(fill="x")
-        qb.bind("<<ComboboxSelected>>", self.on_quote)
-        Tip(qb, "US dollars. "
-                "is used. Takes effect on a new session.")
+        self.quote_var = tk.StringVar(value="USD")  # stocks and options are always in US dollars
         self.login_btn = ttk.Button(c, text="Log in to Alpaca", style="Plain.TButton", command=self.account_action)
         self.login_btn.pack(fill="x", pady=(8, 0))
         tk.Label(c, text="Practice prices come from Alpaca (a free paper key).", bg=CARD, fg=MUTED, font=("", 8)).pack(anchor="w")
@@ -1025,7 +994,7 @@ class App:
         self.coin_grid = tk.Frame(c, bg=CARD)
         self.coin_grid.pack(anchor="w", fill="x")
         self.coin_vars = {}
-        ticked = self.cfg.get("ticked_coins") or ["BTC", "ETH"]
+        ticked = self.cfg.get("ticked_coins") or ["SPY", "QQQ"]
         for coin in self.all_coins():
             self.coin_vars[coin] = tk.BooleanVar(value=coin in ticked)
         self.build_coin_grid()
@@ -1129,7 +1098,7 @@ class App:
         Tip(self.new_btn, "Start a fresh session instead of continuing the saved one. Your trade history stays in the "
                           "Trades tab and trades.csv.")
         self.reset_btn = ttk.Button(left, text="Reset \u25be", style="Plain.TButton")
-        self.reset_btn.configure(command=lambda: self.reset_menu(self.reset_btn))
+        self.reset_btn.configure(command=self.open_reset)
         self.reset_btn.pack(fill="x", pady=(0, 4))
         Tip(self.reset_btn, "Start over: reset the practice account (cash and trades), the farm (fresh eggs), or both. "
                             "Your Library and Hall of Fame are always kept.")
@@ -1190,16 +1159,29 @@ class App:
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
-        t0, t1, t2, t3, t4, t5, t6, t7, t8 = (ttk.Frame(nb) for _ in range(9))
+        t0, t1, t7, t8, tm, tt = (ttk.Frame(nb) for _ in range(6))
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t7, text="  \u25c7 Slow farm  ")
         nb.add(t8, text="  Options  ")
         nb.add(t1, text="  Portfolio  ")
-        nb.add(t6, text="  Watchlist  ")
-        nb.add(t4, text="  Live prices  ")
-        nb.add(t5, text="  Trades  ")
-        nb.add(t2, text="  Strategy scoreboard  ")
-        nb.add(t3, text="  What the bot did  ")
+        nb.add(tm, text="  Markets  ")
+        nb.add(tt, text="  Trades  ")
+        # Markets = watchlist + live prices; Trades = trades + what the bot did + the strategy scoreboard
+        self.subnb = {}
+        for outer, names in ((tm, ("Watchlist", "Live prices")), (tt, ("Trades", "What the bot did", "Strategy scoreboard"))):
+            sn = ttk.Notebook(outer)
+            sn.pack(fill="both", expand=True, pady=(4, 0))
+            sn.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
+            self.subnb[nb.tab(outer, "text").strip()] = sn
+            fr = []
+            for nm in names:
+                f_ = ttk.Frame(sn)
+                sn.add(f_, text=f"  {nm}  ")
+                fr.append(f_)
+            if outer is tm:
+                t6, t4 = fr
+            else:
+                t5, t3, t2 = fr
         self.build_grid_tab(t0)
         self.build_slow_tab(t7)
         self.build_options_tab(t8)
@@ -1230,10 +1212,7 @@ class App:
                 ("Catch!", self.catch_selected, "Catch the selected bots for your Bot Collection. They get a name, a rarity "
                  "and a level, and you can trade with your favourite team later."),
                 ("Library...", self.open_collection, "Your saved bots (the Bot Library): rarities, levels, your team, and who is in the Hall of Fame. (Ctrl+B)"),
-                ("Family tree...", self.open_family, "Which bot was bred or tweaked from which, including ones that died out."),
-                ("Bot Lab...", self.open_lab,
-                 "Evolve bots on months of past prices, then test them on prices they never saw. Only the ones that "
-                 "pass are worth keeping. (Ctrl+L)"))):
+                ("Family...", self.open_family, "Which bot was bred or tweaked from which, as a list and as drawn bloodlines."))):
             sb = ttk.Button(bar2 if i < 6 else bar3, text=txt, style="Accent.TButton" if txt == "Catch!" else "Plain.TButton",
                             command=cmd)
             sb.pack(side="left", padx=(0, 4))
@@ -1259,7 +1238,7 @@ class App:
         self.log.pack(fill="both", expand=True)
         self.prices_tree = self.make_tree(
             t4, ("coin", "price", "since", "hr", "day", "mood", "age"), (70, 120, 120, 90, 100, 170, 80),
-            ("Coin", "Price now", "Since this run began", "Last hour", "Last 24 hours", "Market mood", "Updated"))
+            ("Ticker", "Price now", "Since this run began", "Last hour", "Last 24 hours", "Market mood", "Updated"))
         trade_bar = ttk.Frame(t5)
         trade_bar.pack(fill="x", padx=4, pady=4)
         self.trade_count_lbl = ttk.Label(trade_bar, text="All paper + live trades")
@@ -1273,7 +1252,7 @@ class App:
         self.trade_tree = self.make_tree(
             t5, ("time", "mode", "side", "coin", "qty", "usd", "price", "pl", "who", "why"),
             (125, 55, 55, 55, 105, 80, 90, 80, 200, 170),
-            ("Time", "Mode", "Action", "Coin", "Coins moved", "Value ($)", "Price", "Profit / loss", "Strategy behind it", "Why"))
+            ("Time", "Mode", "Action", "Contract", "Contracts", "Value ($)", "Price", "Profit / loss", "Strategy behind it", "Why"))
         self.trade_tree.tag_configure("buy", foreground=GREEN)
         self.trade_tree.tag_configure("sell", foreground=RED)
         self.trade_tree.tag_configure("bot", foreground=MUTED)
@@ -1285,7 +1264,7 @@ class App:
         self.refresh_trades()
         self.update_status()
         self.refresh_view()
-        for seq, fn in (("<Control-Return>", self.toggle), ("<Control-l>", self.open_lab), ("<Control-h>", self.open_hof),
+        for seq, fn in (("<Control-Return>", self.toggle), ("<Control-l>", self.open_learning), ("<Control-h>", self.open_hof),
                         ("<Control-k>", self.open_coin_browser), ("<Control-b>", self.open_collection), ("<Control-e>", self.open_designer), ("<Control-comma>", self.open_settings),
                         ("<F5>", self.refresh_trades)):
             root.bind_all(seq, lambda e, f=fn: (f(), "break")[1])
@@ -1297,61 +1276,47 @@ class App:
         m.add_command(label="Export trades CSV...", command=self.export_csv)
         m.add_command(label="Export bots...", command=self.export_bots)
         m.add_command(label="Import bots...", command=self.import_bots)
-        m.add_command(label="Open data folder", command=self.open_data_folder)
         m.add_command(label="Back up everything...", command=self.backup_all)
         m.add_command(label="Restore from a backup...", command=self.restore_all)
-        pm = tk.Menu(m, tearoff=0, postcommand=lambda: self.fill_profiles(pm))
-        m.add_cascade(label="Settings profiles", menu=pm)
-        m.add_command(label="Reset session", command=self.reset)
+        m.add_command(label="Open data folder", command=self.open_data_folder)
         m.add_separator()
-        m.add_checkbutton(label="Dark mode", variable=self.dark_var, command=lambda: self.set_dark(self.dark_var.get()))
-        self.compact_var = tk.BooleanVar(value=bool(self.cfg.get("compact", False)))
-        m.add_checkbutton(label="Compact top bar", variable=self.compact_var, command=self.toggle_compact)
+        m.add_command(label="Reset...", command=self.open_reset)
         m.add_command(label="Quit", command=self.on_close)
         bar.add_cascade(label="File", menu=m)
         m = tk.Menu(bar, tearoff=0)
         m.add_command(label="Log in to Alpaca...", command=self.open_login)
-        m.add_separator()
         m.add_command(label="Connect Interactive Brokers...", command=self.open_ib)
         m.add_command(label="Disconnect Interactive Brokers", command=self.ib_disconnect)
         m.add_command(label="Log out", command=self.logout)
-        bar.add_cascade(label="Account", menu=m)
-        m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="Backtest...", command=self.backtest)
-        m.add_command(label="Bot Lab...", command=self.open_lab, accelerator="Ctrl+L")
-        m.add_command(label="Hall of Fame...", command=self.open_hof, accelerator="Ctrl+H")
-        m.add_command(label="Bot family tree...", command=self.open_family)
-        m.add_command(label="Weekly report now...", command=self.show_report)
-        m.add_command(label="Training camp (a whole farm through history)...", command=self.open_training)
-        m.add_command(label="Market context: what the bots learned...", command=self.open_context)
-        m.add_command(label="Economic calendar...", command=self.open_calendar)
-        m.add_command(label="Disk use...", command=self.open_disk)
-        m.add_command(label="Security check...", command=self.open_security)
-        m.add_command(label="Free roam (the farm learns from the past by itself)...", command=self.open_roam)
-        m.add_command(label="Backtest a bot...", command=lambda: self.open_backtest(None))
-        m.add_command(label="Backtest the Hall of Fame...", command=self.backtest_hof)
-        m.add_command(label="Compare two bots...", command=lambda: self.compare_bots())
-        m.add_command(label="Bloodlines (drawn family tree)...", command=self.open_bloodlines)
-        m.add_command(label="Farm replay...", command=self.open_replay)
-        m.add_command(label="Design an egg...", command=self.open_designer, accelerator="Ctrl+E")
-        m.add_command(label="Bot Library...", command=self.open_collection, accelerator="Ctrl+B")
-        m.add_command(label="Browse tickers...", command=self.open_coin_browser, accelerator="Ctrl+K")
-        m.add_command(label="Settings...", command=self.open_settings, accelerator="Ctrl+,")
-        m.add_command(label="Install add-ons (setup)...", command=self.open_setup)
+        m.add_separator()
         m.add_command(label="Sell everything now", command=self.sell_all)
         m.add_command(label="KILL SWITCH (stop, cancel, sell all, lock Live)", command=self.kill_switch)
+        bar.add_cascade(label="Account", menu=m)
+        m = tk.Menu(bar, tearoff=0)
+        m.add_command(label="Learning: backtests, Training camp, Free roam...", command=self.open_learning, accelerator="Ctrl+L")
+        m.add_command(label="Insights: market context, calendar, report, replay...", command=self.open_insights)
+        m.add_separator()
+        m.add_command(label="Bot Library...", command=self.open_collection, accelerator="Ctrl+B")
+        m.add_command(label="Hall of Fame...", command=self.open_hof, accelerator="Ctrl+H")
+        m.add_command(label="Family (tree and bloodlines)...", command=self.open_family)
+        m.add_command(label="Compare two bots...", command=lambda: self.compare_bots())
+        m.add_command(label="Design an egg...", command=self.open_designer, accelerator="Ctrl+E")
+        m.add_command(label="Browse tickers...", command=self.open_coin_browser, accelerator="Ctrl+K")
+        m.add_separator()
+        m.add_command(label="Settings...", command=self.open_settings, accelerator="Ctrl+,")
+        pm = tk.Menu(m, tearoff=0, postcommand=lambda: self.fill_profiles(pm))
+        m.add_cascade(label="Settings profiles", menu=pm)
+        m.add_checkbutton(label="Dark mode", variable=self.dark_var, command=lambda: self.set_dark(self.dark_var.get()))
+        self.compact_var = tk.BooleanVar(value=bool(self.cfg.get("compact", False)))
+        m.add_checkbutton(label="Compact top bar", variable=self.compact_var, command=self.toggle_compact)
+        m.add_command(label="System: security, disk use, diagnostics...", command=self.open_system)
+        m.add_command(label="Install add-ons (setup)...", command=self.open_setup)
         m.add_separator()
         m.add_command(label="Check for updates", command=self.check_update)
         m.add_command(label="Undo last update", command=self.undo_update)
         bar.add_cascade(label="Tools", menu=m)
         m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="Welcome screen", command=self.show_welcome)
-        m.add_command(label="Take the tour", command=self.start_tour)
-        m.add_command(label="How this works", command=self.show_guide)
-        m.add_command(label="What do these words mean?", command=self.show_glossary)
-        m.add_command(label="Keyboard shortcuts", command=self.show_shortcuts)
-        m.add_separator()
-        m.add_command(label="Diagnostics (copy for support)...", command=self.show_diagnostics)
+        m.add_command(label="Help...", command=self.open_help)
         bar.add_cascade(label="Help", menu=m)
         self.root.config(menu=bar)
 
@@ -1477,16 +1442,6 @@ class App:
 
     def avail(self):
         return self.balances.get(self.cur_quote(), 0.0)
-
-    def on_quote(self, _=None):
-        self.cfg["quote"] = self.quote_var.get()
-        E.save_json(CONFIG_PATH, self.cfg)
-        if self.session:
-            messagebox.showinfo("Cash currency", f"{self.quote_var.get()} will be used after you reset the session "
-                                                 f"(File > Reset session).")
-        else:
-            self.usd_avail = self.avail()
-        self.update_status()
 
     @staticmethod
     def read_balances(acct):
@@ -1852,7 +1807,7 @@ class App:
         mid = ttk.Frame(w, padding=(10, 0))
         mid.pack(fill="both", expand=True)
         t = self.make_tree(mid, ("coin", "price", "chg", "vol", "have"), (80, 120, 100, 150, 120),
-                           ("Coin", "Price", "24h change", "24h volume ($)", "In your list"))
+                           ("Ticker", "Price", "Today", "Volume today ($)", "In your list"))
         t.configure(selectmode="extended")
         data = {"all": []}
 
@@ -2170,64 +2125,63 @@ class App:
         self.write("Notifications muted." if self.cfg["muted"] else "Notifications on.")
 
     # ---------------- help / welcome ----------------
-    def info_window(self, title, text):
-        w = tk.Toplevel(self.root)
-        w.title(title)
-        t = tk.Text(w, width=78, height=24, wrap="word", padx=12, pady=10, relief="flat")
+    def info_window(self, title, text, parent=None):
+        if parent is None:
+            w = tk.Toplevel(self.root)
+            w.title(title)
+        else:
+            w = parent
+        t = tk.Text(w, width=78, height=24, wrap="word", padx=14, pady=12, relief="flat", bg=CARD, fg=TEXT, font=("", 10))
         t.insert("1.0", text)
         t.config(state="disabled")
-        t.pack(padx=6, pady=6)
-        ttk.Button(w, text="Close", command=w.destroy).pack(pady=(0, 8))
+        t.pack(fill="both", expand=True, padx=6, pady=6)
 
-    def show_guide(self):
+    def show_guide(self, parent=None):
+        if parent is None:
+            return self.open_hub("help", 'How this works')
         self.info_window("How this works", (
             "THE SHORT VERSION\n"
-            "The bot watches crypto prices and buys or sells automatically using strategies. "
-            "You start in Practice mode, which uses pretend money, so you can't lose anything while you learn.\n\n"
+            "A farm of bots watches stock prices and buys call or put options when its best bots agree. Each bot is a "
+            "mix of genes (strategies, rules, how far out of the money, how many days to expiry). Winners breed, losers "
+            "retire, and your account follows the strongest. You start in Practice, with pretend money.\n\n"
             "GETTING STARTED\n"
-            "1. Tick the coins you want to watch (Bitcoin and Ethereum are ticked by default).\n"
-            "2. Leave 'Let the bot choose (Wildcard)' ticked, or pick strategies yourself.\n"
-            "3. Pick a Risk style. Cautious = small trades, Adventurous = big trades.\n"
-            "4. Press Start. The blue line on the chart is your bot, the gray line is what you'd have if you "
-            "just bought and held.\n\n"
-            "WHAT TO EXPECT\n"
-            "Long quiet stretches are normal. Check the blue banner at the top, it always says in plain "
-            "English what the bot is doing, and the line under the numbers tells you if you're ahead of just "
-            "holding.\n\n"
-            "WINNERS TRADE MORE\n"
-            "In Wildcard mode, strategies that keep winning get bigger trades and keep adding while they hold "
-            "a coin. Shaky ones are slowed down and failing ones are stopped. That can help in steady "
-            "markets, but every trade costs a fee, so untick 'Winners trade more' if you want calmer trading.\n\n"
-            "GOING LIVE (REAL MONEY)\n"
-            "Only after practicing for a while. Choose Live, log in with an Alpaca API key (paper first, "
-            "permissions only), and type LIVE to confirm. Start with a small amount.\n\n"
+            "1. Log in with a free Alpaca paper key (Account > Log in to Alpaca): that's where prices come from.\n"
+            "2. Tick the tickers to trade (or leave 'Bot picks' on), keep 'Let the bot choose (Wildcard)' ticked.\n"
+            "3. Pick a Risk style, then press Start. Blue line = your account, grey = just holding the stock.\n\n"
+            "LEARNING FROM THE PAST\n"
+            "Tools > Learning: backtest any bot on any stretch since 2016, send a whole farm through Training camp, or "
+            "switch on Free roam and let the farm study by itself (it only runs while it's switched ON).\n\n"
+            "SAFETY BUILT IN\n"
+            "OBF only buys calls and puts (the most a trade can lose is what it paid) and only sells contracts it holds. "
+            "Every contract is sold before expiry, so nothing is exercised into shares. Under $25,000 it won't break the "
+            "day-trade rule. Live mode needs you to type LIVE, and the KILL SWITCH (Account menu) stops everything.\n\n"
+            "GOING LIVE\n"
+            "Practice for a good while first, then try your Alpaca or IBKR paper account, then small real amounts.\n\n"
             "HONEST WARNING\n"
-            "No strategy wins reliably, and fees eat into frequent trading. If the blue line stays below the "
-            "gray line, the bot isn't beating simply holding. Use Tools > Backtest to check on real history."))
+            "Options can lose their whole value quickly, and no strategy wins reliably. If the blue line stays below "
+            "the grey one, the bots aren't beating simply holding."), parent=parent)
 
-    def show_glossary(self):
+    def show_glossary(self, parent=None):
+        if parent is None:
+            return self.open_hub("help", 'Words')
         self.info_window("What do these words mean?", (
-            "Practice mode: pretend money, nothing real happens.\n"
-            "Live mode: your Alpaca account (paper or real money).\n"
-            "Wildcard: the bot tests every strategy in the background and mostly follows the winners.\n"
-            "Winning: the strategy made money AND did it steadily. The bot copies it with bigger trades, and "
-            "with 'Winners trade more' on it keeps adding to the coin while that strategy is still holding it.\n"
-            "Shaky: the strategy made money but not steadily. The bot copies it with small trades, and only "
-            "every so often.\n"
-            "Stopped: the strategy is losing, or dropped fast. The bot ignores it. If it stays stopped it is "
-            "retired and replaced by a tweaked copy of a winner.\n"
-            "On standby: a good strategy that just didn't make the top group this round.\n"
-            "Trade size (e.g. 1.8x): how big the bot's trades are when following that strategy. Steadier "
-            "winners get bigger trades, up to 2.5x by default.\n"
-            "Consistent: how many recent stretches the strategy made money in. 75% means 3 of the last 4.\n"
-            "Safety stop (stop-loss): automatically sells a coin if it drops by a set percent.\n"
-            "Lock in profit (take-profit): automatically sells a coin if it rises by a set percent.\n"
-            "Daily loss limit: pauses the bot if you lose a set percent in one day.\n"
-            "Decision / bar: how often strategies look at prices and decide (default every minute).\n"
-            "Buy & hold: the gray line. What you'd have if you bought once and did nothing.\n"
-            "Backtest: replays a strategy on past prices to see how it would have done. Past results don't "
-            "predict the future.\n"
-            "Drawdown: the biggest drop from a peak, a measure of how bumpy the ride was."))
+            "Call: a contract that gains value when the stock rises. Put: one that gains when it falls.\n"
+            "Premium: an option's price, quoted per share. One contract covers 100 shares, so $1.20 = $120.\n"
+            "Strike: the price the option is about. Out of the money: a call above the stock price (a put below).\n"
+            "Expiry: the day the contract ends. OBF sells before then, so you never end up with shares.\n"
+            "Exercise: turning an option into 100 shares. Happens automatically at expiry if it ends in the money.\n"
+            "Bid / ask: what buyers pay / sellers want. A wide gap between them means a thin, costly contract.\n"
+            "Open interest: how many of a contract are open. More = easier to trade.\n"
+            "Day trade: buying and selling the same contract on the same day. Under $25,000, 4 in 5 business days "
+            "gets an account flagged, so OBF stops at 3.\n"
+            "Practice / Live: pretend money / your broker account (paper or real).\n"
+            "Wildcard: the farm tests many bots at once and the account follows the winners.\n"
+            "Egg, Rising, BEAST: a bot's stage, from newborn to dominant. Hall of Fame: the champions you pick.\n"
+            "Never-rule: something a bot refuses to do (like 'no new contracts before the Fed'), graded in hindsight.\n"
+            "Backtest: replaying past prices to see how a bot would have done. Past results don't predict the future.\n"
+            "vs holding: how much better (or worse) a bot did than simply holding the stock.\n"
+            "Drawdown: the biggest drop from a peak, a measure of how bumpy the ride was.\n"
+            "Implied volatility (IV): how big a move the market is pricing in. High IV = expensive options."), parent=parent)
 
     def maybe_welcome(self):
         if not self.cfg.get("welcomed"):
@@ -2242,9 +2196,9 @@ class App:
         f.pack()
         ttk.Label(f, text="Welcome to OBF, the Options Bot Farm", font=("", 14, "bold")).pack(anchor="w")
         ttk.Label(f, wraplength=440, text=(
-            "This app watches crypto prices and trades for you using strategies. You'll start in Practice mode "
-            "with pretend money, so nothing real is at risk. Real trading only happens if you switch to Live "
-            "and log in.")).pack(anchor="w", pady=(6, 12))
+            "A farm of bots watches stock prices and buys call and put options when its best bots agree. They "
+            "breed, compete and learn as they go. You'll start in Practice mode with pretend money, so nothing real "
+            "is at risk. Real trading only happens if you switch to Live and log in.")).pack(anchor="w", pady=(6, 12))
         ttk.Label(f, text="How much pretend money do you want to practice with?").pack(anchor="w")
         cash = tk.StringVar(value="10000")
         ttk.Entry(f, textvariable=cash, width=14).pack(anchor="w", pady=(2, 10))
@@ -2345,7 +2299,7 @@ class App:
         self.paint_range_btns()
 
     def default_panels(self):
-        coins = list(self.session_coins or [c for c, v in self.coin_vars.items() if v.get()]) or ["BTC"]
+        coins = list(self.session_coins or [c for c, v in self.coin_vars.items() if v.get()]) or ["SPY"]
         views = ["Account value", coins[0], "Profit / loss %", coins[1] if len(coins) > 1 else "Drawdown",
                  "Cash vs invested", "Selected bot"]
         return [dict(view=v, type="Line") for v in views]
@@ -2867,7 +2821,7 @@ class App:
             self._bg_dirty = True
             return
         try:
-            on_board = self.nb.tab(self.nb.select(), "text").strip() == "Strategy scoreboard"
+            on_board = self.cur_tab() == "Strategy scoreboard"
         except Exception:
             on_board = True
         if self.tourn and not on_board:
@@ -2981,7 +2935,7 @@ class App:
             pass
         self.ui_running(True)
         self.write(f"Started ({'LIVE' if self.live else 'paper'}, {'wildcard' if self.wild else ', '.join(self.active)}, "
-                   f"{E.fmt_bar(self.session_bar)} bars, {self.settings.get('order_type', 'market')} orders).")
+                   f"{E.fmt_bar(self.session_bar)} bars, limit orders).")
         self.worker_args = (list(coins), self.session_bar, self.wild, self.settings["fee_pct"] / 100,
                             self.settings["trade_pct"] / 100, self.settings["evolve_every"])
         self.launch_worker()
@@ -3028,35 +2982,149 @@ class App:
         self.refresh_view()
         return True
 
-    def reset_menu(self, widget):
-        m = self._menu()
-        acct = "LIVE session tracking" if self.live else "practice account"
-        m.add_command(label=f"Reset the {acct} (cash, positions, trades)...", command=lambda: self.reset_account())
-        m.add_command(label="Reset the farm (fresh eggs; Library and Hall of Fame kept)...", command=lambda: self.reset_farm())
-        m.add_command(label="Reset both...", command=lambda: self.reset_account(both=True))
-        try:
-            m.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
-        finally:
-            m.grab_release()
 
-    def reset_account(self, both=False):
-        what = "the farm AND the " + ("LIVE session tracking" if self.live else "practice account") if both else \
-            ("the LIVE session tracking" if self.live else "the practice account")
-        msg = f"Reset {what}?"
-        if not self.live:
-            try:
-                msg += f"\n\nYou start again with ${float(self.cash_var.get()):,.2f} of pretend money (change it under ACCOUNT)."
-            except ValueError:
-                pass
-        if self.live and any(q > 0 for q in self.pos.values()):
-            msg += "\n\nLive contracts the app bought stay in your Alpaca account but won't be tracked."
-        msg += "\nYour Library and Hall of Fame are kept."
-        if not messagebox.askyesno("Reset", msg):
-            return
-        if both:
-            self.reset_farm(ask=False)
-        self.reset(ask=False)
-        self.write(f"Reset {what}. Press Start to begin again.", "good")
+    # ---------------- combined windows (hubs): related tools as tabs of one window ----------------
+    HUB_SPEC = {
+        "learning": ("Learning", ("Backtest a bot", "Hall of Fame test", "Training camp", "Free roam"), (1180, 900)),
+        "insights": ("Insights", ("Market context", "Economic calendar", "Weekly report", "Farm replay"), (1000, 720)),
+        "system": ("System", ("Security", "Disk use", "Diagnostics"), (820, 700)),
+        "family": ("Family", ("Family tree", "Bloodlines"), (1120, 680)),
+        "help": ("Help", ("How this works", "Words", "Shortcuts"), (820, 640)),
+    }
+    HUB_REBUILD = {"Market context", "Weekly report", "Security", "Diagnostics", "Hall of Fame test", "Family tree",
+                   "Bloodlines", "Farm replay"}  # light tabs that show fresh data each time they're opened
+
+    def _hub_builders(self):
+        return {"Backtest a bot": lambda f, v=None: self.open_backtest(v, parent=f),
+                "Hall of Fame test": lambda f: self.backtest_hof(parent=f),
+                "Training camp": lambda f: self.open_training(parent=f),
+                "Free roam": lambda f: self.open_roam(parent=f),
+                "Market context": lambda f: self.open_context(parent=f),
+                "Economic calendar": lambda f: self.open_calendar(parent=f),
+                "Weekly report": lambda f: self.show_report(parent=f),
+                "Farm replay": lambda f: self.open_replay(parent=f),
+                "Security": lambda f: self.open_security(parent=f),
+                "Disk use": lambda f: self.open_disk(parent=f),
+                "Diagnostics": lambda f: self.show_diagnostics(parent=f),
+                "Family tree": lambda f: self.open_family(parent=f),
+                "Bloodlines": lambda f: self.open_bloodlines(parent=f),
+                "How this works": lambda f: self.show_guide(parent=f),
+                "Words": lambda f: self.show_glossary(parent=f),
+                "Shortcuts": lambda f: self.show_shortcuts(parent=f)}
+
+    def open_hub(self, key, tab=None, **kw):
+        """Opens (or brings forward) one of the combined windows, on the given tab."""
+        hubs = self.__dict__.setdefault("_hubs", {})
+        h = hubs.get(key)
+        if h is None or not h["w"].winfo_exists():
+            title, tabs, (W, H) = self.HUB_SPEC[key]
+            w = tk.Toplevel(self.root)
+            w.title(title)
+            w.geometry(f"{min(W, self.root.winfo_screenwidth() - 40)}x{min(H, self.root.winfo_screenheight() - 80)}")
+            w.minsize(760, 520)
+            w.configure(bg=BG)
+            if key == "help":
+                hb = tk.Frame(w, bg=BG, padx=10, pady=6)
+                hb.pack(fill="x")
+                ttk.Button(hb, text="Take the tour", style="Plain.TButton", command=self.start_tour).pack(side="left")
+                ttk.Button(hb, text="Welcome screen", style="Plain.TButton", command=self.show_welcome).pack(side="left", padx=6)
+            nb = ttk.Notebook(w)
+            nb.pack(fill="both", expand=True, padx=8, pady=8)
+            frames, built = {}, {}
+            for t in tabs:
+                f = tk.Frame(nb, bg=BG)
+                nb.add(f, text=f"  {t}  ")
+                frames[t] = f
+            h = hubs[key] = dict(w=w, nb=nb, frames=frames, built=built, kw={})
+
+            def on_tab(_=None, h=h):
+                try:
+                    t = nb.tab(nb.select(), "text").strip()
+                except tk.TclError:
+                    return
+                if not built.get(t) or (t in self.HUB_REBUILD and built.get(t) != "fresh"):
+                    self._hub_build(h, t)
+                for o in built:
+                    if o != t and built[o] == "fresh":
+                        built[o] = True  # rebuild light tabs next time they're opened
+            nb.bind("<<NotebookTabChanged>>", on_tab)
+        if tab:
+            if kw:
+                h["kw"][tab] = kw
+                if h["built"].get(tab):
+                    self._hub_build(h, tab)
+            h["nb"].select(h["frames"][tab])
+        try:
+            h["w"].deiconify()
+            h["w"].lift()
+            h["w"].focus_force()
+        except tk.TclError:
+            pass
+        return h["w"]
+
+    def _hub_build(self, h, t):
+        f = h["frames"][t]
+        for c in f.winfo_children():
+            c.destroy()
+        h["built"][t] = "fresh"
+        try:
+            self._hub_builders()[t](f, **h["kw"].pop(t, {}))
+        except Exception:
+            note = self._record_error(f"opening {t}")
+            tk.Label(f, text=f"Couldn't open {t}. " + (note or ""), bg=BG, fg=RED, wraplength=700, justify="left").pack(padx=20, pady=20)
+
+    def _nothing(self, parent, title, msg):
+        """'Nothing to show yet', as a note in the tab (or a message box when opened on its own)."""
+        if parent is None:
+            return messagebox.showinfo(title, msg)
+        tk.Label(parent, text=msg, bg=BG, fg=MUTED, wraplength=700, justify="left", font=("", 11)).pack(padx=30, pady=40, anchor="w")
+
+    def open_learning(self, tab="Backtest a bot"):
+        return self.open_hub("learning", tab)
+
+    def open_insights(self, tab="Market context"):
+        return self.open_hub("insights", tab)
+
+    def open_system(self, tab="Security"):
+        return self.open_hub("system", tab)
+
+    def open_help(self, tab="How this works"):
+        return self.open_hub("help", tab)
+
+    def open_reset(self):
+        """One Reset window: tick what to clear."""
+        w = tk.Toplevel(self.root)
+        w.title("Reset")
+        w.resizable(False, False)
+        f = ttk.Frame(w, padding=16)
+        f.pack()
+        ttk.Label(f, text="What should be reset?", font=("", 12, "bold")).pack(anchor="w")
+        acct = tk.BooleanVar(value=True)
+        farm = tk.BooleanVar(value=False)
+        what = "LIVE session tracking" if self.live else "practice account"
+        ttk.Checkbutton(f, text=f"The {what}: cash, contracts and trades"
+                                + ("" if self.live else " (you start again with the practice money on the left)"),
+                        variable=acct).pack(anchor="w", pady=(10, 0))
+        ttk.Checkbutton(f, text="The farm: every bot goes, fresh eggs hatch at the next Start", variable=farm).pack(anchor="w", pady=(4, 0))
+        ttk.Label(f, foreground=MUTED, wraplength=460, justify="left", text=(
+            "Your Library, Hall of Fame, settings and downloaded history are always kept."
+            + ("\nLIVE contracts stay in your broker account but won't be tracked by OBF any more."
+               if self.live and any(q > 0 for q in self.pos.values()) else ""))).pack(anchor="w", pady=(10, 0))
+
+        def go():
+            if not acct.get() and not farm.get():
+                return w.destroy()
+            w.destroy()
+            if farm.get():
+                self.reset_farm(ask=False)
+            if acct.get():
+                self.reset(ask=False)
+            self.write("Reset " + " and ".join(x for x, on in ((what, acct.get()), ("the farm", farm.get())) if on)
+                       + ". Press Start to begin again.", "good")
+        b = ttk.Frame(f)
+        b.pack(fill="x", pady=(14, 0))
+        ttk.Button(b, text="Cancel", command=w.destroy).pack(side="right")
+        ttk.Button(b, text="Reset", style="Accent.TButton", command=go).pack(side="right", padx=6)
 
     def reset_farm(self, ask=True):
         if ask and not messagebox.askyesno("Reset the farm", "Clear every bot on the farm and hatch a fresh one next time you "
@@ -3394,10 +3462,11 @@ class App:
             info.append("(not found)")
         return "\n".join(info)
 
-    def show_diagnostics(self):
+    def show_diagnostics(self, parent=None):
+        if parent is None:  # it lives as a tab in the system window
+            return self.open_hub('system', 'Diagnostics')
         text = self.diagnostics_text()
-        w = tk.Toplevel(self.root)
-        w.title("Diagnostics")
+        w = parent
         t = tk.Text(w, width=100, height=32, wrap="none", padx=8, pady=6)
         t.insert("1.0", text)
         t.pack(fill="both", expand=True, padx=6, pady=6)
@@ -3476,8 +3545,6 @@ class App:
             self.update_status()
         elif kind == "fail":
             self.on_fail(*data)
-        elif kind == "bt":
-            self.show_backtest(*data)
         elif kind == "call":  # run a small UI update that a background thread asked for
             data()
         elif kind == "watch":
@@ -3488,8 +3555,6 @@ class App:
             self.cur_vol.update(data)
         elif kind == "unfilled":
             self.on_unfilled(*data)
-        elif kind == "lab":
-            self.on_lab_msg(*data)
         elif kind == "scouted":
             self.on_scouted(*data)
         elif kind == "update":
@@ -3940,14 +4005,13 @@ class App:
                 out.append((f"Library: {b.get('nickname') or E.bot_nickname(k)} ({STRAT_LABELS.get(b['name'], b['name'])})", b, None, k))
         return out
 
-    def open_backtest(self, v=None):
+    def open_backtest(self, v=None, parent=None):
+        if parent is None:  # it lives as a tab in the learning window
+            return self.open_hub('learning', 'Backtest a bot', v=v)
         srcs = self._bt_sources()
         if not srcs:
-            return messagebox.showinfo("Backtest", "No bots yet: start the farm or save some bots to your Library first.")
-        w = tk.Toplevel(self.root)
-        w.title("Backtest a bot")
-        w.geometry(f"1000x{min(860, self.root.winfo_screenheight() - 80)}")
-        w.minsize(820, 640)
+            return self._nothing(parent, "Backtest", "No bots yet: start the farm or save some bots to your Library first.")
+        w = parent
         w.configure(bg=BG)
         coins = list(self.session_coins or [c for c, x in self.coin_vars.items() if x.get()] or ["SPY"])
 
@@ -4017,7 +4081,7 @@ class App:
                       "tickers it struggles with, how it does in each market mood, and the test result. Its children inherit it.")
         Tip(teach_btn, "Also teaches the whole farm: losing buys go into the post-trade review, and if it beat holding "
                        "it becomes an elder that nudges future eggs.")
-        ttk.Button(btns, text="Close", command=w.destroy).pack(side="right")
+        ttk.Button(btns, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
         df = tk.Frame(w, bg=BG)
         df.pack(fill="both", expand=True, padx=12, pady=(8, 0))
         details = tk.Text(df, bg=CARD, fg=TEXT, relief="flat", wrap="word", height=8, padx=10, pady=8,
@@ -4237,14 +4301,14 @@ class App:
         if v is not None:
             run()
 
-    def backtest_hof(self):
+    def backtest_hof(self, parent=None):
         """Backtests every Hall of Fame bot on the current prices and ranks them."""
+        if parent is None:  # it lives as a tab in the learning window
+            return self.open_hub('learning', 'Hall of Fame test')
         hof = list(self.hof())
         if not hof or not self.session_coins:
-            return messagebox.showinfo("Backtest the Hall of Fame", "You need Hall of Fame bots and a running session (for prices).")
-        w = tk.Toplevel(self.root)
-        w.title("Hall of Fame backtest")
-        w.geometry("900x480")
+            return self._nothing(parent, "Backtest the Hall of Fame", "You need Hall of Fame bots and a running session (for prices).")
+        w = parent
         bb = ttk.Frame(w, padding=8)
         bb.pack(side="bottom", fill="x")
         lbl = ttk.Label(w, text="Testing...", padding=8)
@@ -4289,18 +4353,16 @@ class App:
             self.__dict__.pop("_file_cache", None)
             self.write(f"Saved {len(res)} Hall of Fame backtests to their memories.", "good")
         ttk.Button(bb, text="Save all to their memories", style="Accent.TButton", command=save_all).pack(side="left")
-        ttk.Button(bb, text="Close", command=w.destroy).pack(side="right")
+        ttk.Button(bb, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
         threading.Thread(target=work, daemon=True).start()
 
     # ---------------- training camp ----------------
     TC_MAX = 12000
 
-    def open_training(self):
-        if getattr(self, "tc_win", None) is not None and self.tc_win.winfo_exists():
-            return self.tc_win.lift()
-        w = self.tc_win = tk.Toplevel(self.root)
-        w.title("Training camp")
-        w.geometry(f"1000x{min(780, self.root.winfo_screenheight() - 80)}")
+    def open_training(self, parent=None):
+        if parent is None:  # it lives as a tab in the learning window
+            return self.open_hub('learning', 'Training camp')
+        w = self.tc_win = parent
         w.configure(bg=BG)
         f = ttk.Frame(w, padding=12)
         f.pack(fill="x")
@@ -4373,7 +4435,7 @@ class App:
         Tip(b_teach, "Gives your farm the camp's memory: its elders (nudge future eggs), its post-trade review, its mutation "
                      "memory and its season champions (woken up when their market mood comes back).")
         Tip(b_lib, "Saves the passed bots to your Library, with their exam result in their memory.")
-        ttk.Button(bb, text="Close", command=w.destroy).pack(side="right")
+        ttk.Button(bb, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
         st = dict(stop=False, res=None)
 
         def run():
@@ -4473,10 +4535,10 @@ class App:
 
         def bring():
             if not self.tourn or not self.seeded:
-                return messagebox.showinfo("Training camp", "Start your farm first (Wildcard), then bring the bots over.", parent=w)
+                return self._nothing(parent, "Training camp", "Start your farm first (Wildcard), then bring the bots over.", parent=w)
             picks = chosen()
             if not picks:
-                return messagebox.showinfo("Training camp", "No bots passed. Select rows to bring some anyway.", parent=w)
+                return self._nothing(parent, "Training camp", "No bots passed. Select rows to bring some anyway.", parent=w)
             closes = {c_: self.hist[c_] for c_ in self.session_coins}
             n = 0
             for r in picks:
@@ -4501,7 +4563,7 @@ class App:
 
         def teach():
             if not self.tourn:
-                return messagebox.showinfo("Training camp", "Start your farm first (Wildcard).", parent=w)
+                return self._nothing(parent, "Training camp", "Start your farm first (Wildcard).", parent=w)
             E.teach_from(self.tourn, st["res"]["tourn"])
             self.save_farm(force=True)
             self.write("Your farm learned from the training camp: elders, post-trade review, mutation memory and season champions.", "good")
@@ -4509,7 +4571,7 @@ class App:
         def save_lib():
             picks = chosen()
             if not picks:
-                return messagebox.showinfo("Training camp", "No bots passed. Select rows to save some anyway.", parent=w)
+                return self._nothing(parent, "Training camp", "No bots passed. Select rows to save some anyway.", parent=w)
             t = st["res"]["tourn"]
             ids = {id(r["v"]) for r in picks}
             rows = [dict(r, bar_minutes=st["res"]["gran"] / 60) for r in t.board() if id(r["v"]) in ids]
@@ -4806,16 +4868,13 @@ class App:
             out.append(a)
         return sorted(out, key=lambda a: (-(a["avg"] > 0 and a["wins"] * 2 >= a["n"]), -a["avg"]))
 
-    def open_roam(self):
+    def open_roam(self, parent=None):
         """The Free roam screen: an in-session banner, where in the past it's learning, the trades as they happen,
         and its findings sorted best to worst."""
-        if getattr(self, "roam_win", None) is not None and self.roam_win.winfo_exists():
-            return self.roam_win.lift()
+        if parent is None:  # it lives as a tab in the learning window
+            return self.open_hub('learning', 'Free roam')
         self.start_free_roam()
-        w = self.roam_win = tk.Toplevel(self.root)
-        w.title("Free roam")
-        w.geometry(f"1180x{min(900, self.root.winfo_screenheight() - 60)}")
-        w.minsize(900, 640)
+        w = self.roam_win = parent
         w.configure(bg=BG)
         top = tk.Frame(w, bg=BG, padx=12, pady=10)
         top.pack(fill="x")
@@ -4921,7 +4980,7 @@ class App:
             if not w.winfo_exists():
                 return
             try:
-                if w.state() != "iconic":
+                if w.winfo_toplevel().state() != "iconic":
                     self._roam_seen = time.time()
             except tk.TclError:
                 pass
@@ -5427,7 +5486,7 @@ class App:
                         pass
                 threading.Thread(target=work, daemon=True).start()
             try:
-                if self.nb.tab(self.nb.select(), "text").strip() == "Options":
+                if self.cur_tab() == "Options":
                     self.opt_load(quiet=True)
             except Exception:
                 pass
@@ -5499,7 +5558,7 @@ class App:
             self.slow_start()
 
     def slow_coins(self):
-        return list(self.session_coins or [c for c, v in self.coin_vars.items() if v.get()] or ["BTC", "ETH"])
+        return list(self.session_coins or [c for c, v in self.coin_vars.items() if v.get()] or ["SPY", "QQQ"])
 
     def slow_start(self, quiet=False):
         """Loads (or hatches and warms up) the slow farm, then follows each new hourly candle."""
@@ -5769,7 +5828,7 @@ class App:
         on = bool(self.cfg.get("slow_on"))
         self.slow_btn.config(text="⏸ Pause the slow farm" if on and t else "▶ Start the slow farm")
         try:
-            if "Slow farm" not in self.nb.tab(self.nb.select(), "text"):
+            if "Slow farm" not in self.cur_tab():
                 return  # redrawn when you open the tab
         except Exception:
             pass
@@ -5883,12 +5942,12 @@ class App:
         tk.Label(f, text="Highlighted rows are where they differ.", bg=BG, fg=MUTED).grid(row=len(rows), column=0, columnspan=3, sticky="w", pady=(8, 0))
 
     # ---------------- bloodlines (drawn tree) ----------------
-    def open_bloodlines(self):
+    def open_bloodlines(self, parent=None):
+        if parent is None:  # it lives as a tab in the family window
+            return self.open_hub('family', 'Bloodlines')
         if not self.tourn:
-            return messagebox.showinfo("Bloodlines", "Start the farm first.")
-        w = tk.Toplevel(self.root)
-        w.title("Bloodlines")
-        w.geometry("1100x640")
+            return self._nothing(parent, "Bloodlines", "Start the farm first.")
+        w = parent
         w.configure(bg=BG)
         tk.Label(w, text="Each row is a generation. Lines run from parent to child; bright = alive, gold = strong line "
                          "(a living descendant beating holding). Click a living dragon to open it.", bg=BG, fg=MUTED,
@@ -5962,13 +6021,13 @@ class App:
         ev = [e for e in self.tourn.events if any(w in e for w in ("Bred", "Retired", "Season", "Migration", "Classic", "Twin"))][-3:]
         self.farm_hist.append((time.time(), tiers.count("egg"), tiers.count("rising"), tiers.count("beast"), ev))
 
-    def open_replay(self):
+    def open_replay(self, parent=None):
+        if parent is None:  # it lives as a tab in the insights window
+            return self.open_hub('insights', 'Farm replay')
         data = list(self.farm_hist)
         if len(data) < 5:
-            return messagebox.showinfo("Farm replay", "Not enough farm history yet. Let the farm run for a while.")
-        w = tk.Toplevel(self.root)
-        w.title("Farm replay")
-        w.geometry("900x520")
+            return self._nothing(parent, "Farm replay", "Not enough farm history yet. Let the farm run for a while.")
+        w = parent
         w.configure(bg=BG)
         cv = tk.Canvas(w, bg=CARD, highlightthickness=0, height=300)
         cv.pack(fill="both", expand=True, padx=10, pady=(10, 4))
@@ -6480,10 +6539,10 @@ class App:
                     "until you're ready. OBF never needs your broker password, only API keys you can revoke any time."))
         return out
 
-    def open_security(self):
-        w = tk.Toplevel(self.root)
-        w.title("Security check")
-        w.geometry("760x640")
+    def open_security(self, parent=None):
+        if parent is None:  # it lives as a tab in the system window
+            return self.open_hub('system', 'Security')
+        w = parent
         w.configure(bg=BG)
         tk.Label(w, text="Security check", bg=BG, fg=TEXT, font=("", 14, "bold"), anchor="w", padx=14, pady=10).pack(fill="x")
         t = tk.Text(w, bg=BG, fg=TEXT, relief="flat", wrap="word", padx=14, font=("", 10), highlightthickness=0)
@@ -6497,14 +6556,14 @@ class App:
             t.insert("end", mark + title + "\n", tag)
             t.insert("end", detail + "\n", "d")
         t.config(state="disabled")
-        ttk.Button(w, text="Close", command=w.destroy).pack(side="bottom", anchor="e", padx=14, pady=10)
+        ttk.Button(w, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="bottom", anchor="e", padx=14, pady=10)
 
     # ---------------- disk use ----------------
-    def open_disk(self):
+    def open_disk(self, parent=None):
         """What OBF keeps on disk and how much it has written since it started."""
-        w = tk.Toplevel(self.root)
-        w.title("Disk use")
-        w.geometry("720x560")
+        if parent is None:  # it lives as a tab in the system window
+            return self.open_hub('system', 'Disk use')
+        w = parent
         w.configure(bg=BG)
         tk.Label(w, bg=BG, fg=MUTED, justify="left", anchor="w", wraplength=690, padx=12, pady=8, text=(
             "Everything OBF keeps is in one folder (File > Open data folder). It only writes when something changes: your "
@@ -6582,7 +6641,7 @@ class App:
             self.write(f"Deleted the {what}.")
         ttk.Button(bb, text="Delete downloaded history", command=lambda: clear("history", "downloaded price history")).pack(side="left")
         ttk.Button(bb, text="Delete price cache", command=lambda: clear("cache", "recent price cache")).pack(side="left", padx=6)
-        ttk.Button(bb, text="Close", command=w.destroy).pack(side="right")
+        ttk.Button(bb, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
         fill()
 
     # ---------------- economic calendar ----------------
@@ -6651,10 +6710,10 @@ class App:
                         out[k]["saved"] += st[1]
         return out
 
-    def open_calendar(self):
-        w = tk.Toplevel(self.root)
-        w.title("Economic calendar")
-        w.geometry("760x620")
+    def open_calendar(self, parent=None):
+        if parent is None:  # it lives as a tab in the insights window
+            return self.open_hub('insights', 'Economic calendar')
+        w = parent
         w.configure(bg=BG)
         tk.Label(w, bg=BG, fg=MUTED, justify="left", anchor="w", wraplength=730, padx=12, pady=8, text=(
             "Scheduled news moves options more than almost anything: prices swell before CPI, jobs reports and Fed "
@@ -6709,10 +6768,10 @@ class App:
                                              f"{'saved' if d['saved'] >= 0 else 'cost'} {abs(d['saved']):.1f}%" if d["n"] else "-"))
         fill()
 
-    def open_context(self):
-        w = tk.Toplevel(self.root)
-        w.title("Market context: what the bots learned")
-        w.geometry("940x520")
+    def open_context(self, parent=None):
+        if parent is None:  # it lives as a tab in the insights window
+            return self.open_hub('insights', 'Market context')
+        w = parent
         w.configure(bg=BG)
         tk.Label(w, bg=BG, fg=MUTED, justify="left", anchor="w", wraplength=900, padx=12, pady=8, text=(
             "The bots watch these tickers without trading them. A context study votes for or against a trade depending on "
@@ -7062,10 +7121,11 @@ class App:
         E.save_json(CONFIG_PATH, self.cfg)
         return text
 
-    def show_report(self):
+    def show_report(self, parent=None):
+        if parent is None:  # it lives as a tab in the insights window
+            return self.open_hub('insights', 'Weekly report')
         text = self.weekly_report(force=True)
-        w = tk.Toplevel(self.root)
-        w.title("Weekly report")
+        w = parent
         w.configure(bg=BG)
         box = tk.Text(w, width=90, height=28, bg=CARD, fg=TEXT, relief="flat", padx=10, pady=8, font=("", 10))
         box.pack(fill="both", expand=True)
@@ -7113,7 +7173,7 @@ class App:
                     who=friendly_label(t["name"], t["params"], t.get("tf", 1), self.session_bar)))
             del self.shadow_trades[:-4000]
             if new:
-                if self.nb.tab(self.nb.select(), "text").strip() == "Trades":
+                if self.cur_tab() == "Trades":
                     self.refresh_trades()
                 else:
                     self._trades_dirty = True  # redrawn when you open the Trades tab
@@ -7359,7 +7419,7 @@ class App:
         # Each screen update is isolated: one failing widget must not hide the trade or freeze the balances.
         def trades_tab():
             try:
-                visible = self.nb.tab(self.nb.select(), "text").strip() == "Trades"
+                visible = self.cur_tab() == "Trades"
             except Exception:
                 visible = True
             if visible:
@@ -8039,47 +8099,6 @@ class App:
             self.write("Add-ons ready. Click 'Log in to Alpaca' to continue.")
 
     # ---------------- backtest ----------------
-    def backtest(self):
-        coins = [c for c, v in self.coin_vars.items() if v.get()]
-        names = [n for n, v in self.strat_vars.items() if v.get()] or [n for n in E.STRATS]
-        if not coins:
-            return messagebox.showinfo("Backtest", "Check at least one coin.")
-        s = dict(self.settings)
-        s["quote"] = self.cur_quote()
-        self.write(f"Backtesting {', '.join(coins)} on {E.fmt_bar(E.candle_gran(s['bar_minutes']) / 60)} candles (fetching history)...")
-        threading.Thread(target=self._backtest, args=(coins, names, s), daemon=True).start()
-
-    def _backtest(self, coins, names, s):
-        try:
-            gran = E.candle_gran(s["bar_minutes"])
-            data = {c: E.fetch_ohlcv(c, gran, 900, s.get("quote", "USD")) for c in coins}
-            closes = {c: d["c"] for c, d in data.items()}
-            extra = {c: dict(h=d["h"], l=d["l"], v=d["v"], t=list(d.get("t") or [])) for c, d in data.items()}
-            L = min(len(v) for v in closes.values())
-            if L < 150:
-                return self.q.put(("log", "Not enough history for a backtest."))
-            rows = E.run_backtest(closes, names, s, extra=extra)
-            days = L * gran / 86400
-            self.q.put(("bt", (rows, f"{', '.join(coins)} | {L} bars of {E.fmt_bar(gran / 60)} (~{days:.1f} days)")))
-        except Exception as e:
-            self.q.put(("log", f"Backtest failed: {e}"))
-
-    def show_backtest(self, rows, info):
-        w = tk.Toplevel(self.root)
-        w.title("Backtest results")
-        ttk.Label(w, text=info, padding=6).pack(anchor="w")
-        t = ttk.Treeview(w, columns=("s", "r", "d", "t"), show="headings", height=len(rows))
-        for c, h, wd in (("s", "Strategy", 220), ("r", "Return", 90), ("d", "Max drawdown", 110), ("t", "Trades", 70)):
-            t.heading(c, text=h)
-            t.column(c, width=wd, anchor="w" if c == "s" else "e")
-        for name, ret, dd, tr in rows:
-            t.insert("", "end", values=(STRAT_LABELS.get(name, name), f"{ret * 100:+.2f}%", f"{dd * 100:.1f}%", tr))
-        t.pack(padx=6)
-        ttk.Label(w, padding=6, wraplength=470, foreground="gray",
-                  text="Past results do not predict future results. Fees and your stop-loss / take-profit "
-                       "settings are included. The wildcard row only starts ranking after ~100 bars.").pack()
-        self.write("Backtest complete.")
-
     # ---------------- Bot Farm grid (default tab): eggs, rising, BEASTS, Hall of Fame ----------------
     GRID_STATUS = {"active": ("WINNING", "#22c55e"), "slowed": ("SHAKY", "#f59e0b"), "standby": ("STANDBY", "#3b82f6"),
                    "benched": ("RESTING", "#6b7280"), "warming up": ("LEARNING", "#8b5cf6")}
@@ -8509,7 +8528,7 @@ class App:
         f = self.grid_filter.get()
         style = self.farm_style.get()
         try:
-            if "Bot Farm" not in self.nb.tab(self.nb.select(), "text"):
+            if "Bot Farm" not in self.cur_tab():
                 return  # not visible: drawn when you open the tab
         except Exception:
             pass
@@ -8965,7 +8984,7 @@ class App:
         lrow = ttk.Frame(lbox)
         lrow.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
         lead_on = tk.BooleanVar(value=bool(gl.get("lead")))
-        ttk.Checkbutton(lrow, text="Bitcoin leads: BTC moving", variable=lead_on).pack(side="left")
+        ttk.Checkbutton(lrow, text="The market leads: SPY moving", variable=lead_on).pack(side="left")
         lead_th = tk.StringVar(value=str((gl.get("lead") or {}).get("th", 0.8)))
         ttk.Entry(lrow, textvariable=lead_th, width=5).pack(side="left", padx=4)
         ttk.Label(lrow, text="% over").pack(side="left")
@@ -9136,17 +9155,30 @@ class App:
         self._auto_resume = False
 
     # ---------------- only redraw what you can see ----------------
-    def tab_visible(self, widget):
+    def cur_tab(self):
+        """The name of the tab you're looking at (the inner one when Markets or Trades is open)."""
         try:
-            return self.nb.select() == str(self.nb.nametowidget(widget.winfo_parent())) or \
-                self.nb.select() == str(widget)
+            t = self.nb.tab(self.nb.select(), "text").strip()
+            sn = getattr(self, "subnb", {}).get(t)
+            return sn.tab(sn.select(), "text").strip() if sn is not None else t
         except Exception:
-            return True
+            return ""
+
+    def show_tab(self, name):
+        """Brings a tab forward by name, inner tabs included."""
+        for t_ in self.nb.tabs():
+            if name in self.nb.tab(t_, "text"):
+                return self.nb.select(t_)
+        for outer, sn in getattr(self, "subnb", {}).items():
+            for t_ in sn.tabs():
+                if name in sn.tab(t_, "text"):
+                    sn.select(t_)
+                    return self.show_tab(outer)
 
     def refresh_visible(self):
         """Catches up the tab you just opened (hidden tabs skip their redraws to save effort)."""
         try:
-            tab = self.nb.tab(self.nb.select(), "text").strip()
+            tab = self.cur_tab()
         except Exception:
             return
         if tab == "Trades" and getattr(self, "_trades_dirty", False):
@@ -9171,7 +9203,7 @@ class App:
         e.pack(side="left")
         e.bind("<Return>", lambda ev: self.watch_add())
         ttk.Button(bar, text="Add", style="Accent.TButton", command=self.watch_add).pack(side="left", padx=(4, 0))
-        ttk.Button(bar, text="Browse coins...", style="Plain.TButton", command=self.open_coin_browser).pack(side="left", padx=4)
+        ttk.Button(bar, text="Browse tickers...", style="Plain.TButton", command=self.open_coin_browser).pack(side="left", padx=4)
         for txt, cmd, tip in (("Buy...", lambda: self.trade_dialog("buy", self._watch_sel()), "Buy the selected coin by hand."),
                               ("Sell...", lambda: self.trade_dialog("sell", self._watch_sel()), "Sell the selected coin by hand."),
                               ("Price alert...", self.watch_alert, "Get notified when the selected coin goes above or below a price."),
@@ -9184,7 +9216,7 @@ class App:
         self.watch_note.pack(side="right")
         self.watch_tree = self.make_tree(parent, ("coin", "price", "chg", "d24", "vol", "own", "alert", "bots"),
                                          (70, 120, 110, 90, 130, 120, 150, 90),
-                                         ("Coin", "Price", "Since added", "24h", "24h volume ($)", "You own", "Alert", "Bots trade it"))
+                                         ("Ticker", "Price", "Since added", "Today", "Volume today ($)", "You own", "Alert", "Bots trade it"))
         self.watch_tree.configure(selectmode="extended")
         self.watch_tree.bind("<Double-1>", lambda ev: self.show_on_chart(self._watch_sel())
                              if self.on_row(self.watch_tree, ev) and self._watch_sel() else None)
@@ -9198,7 +9230,7 @@ class App:
     def watchlist(self):
         w = self.cfg.get("watchlist")
         if not isinstance(w, list):
-            w = self.cfg["watchlist"] = ["BTC", "ETH", "SOL"]
+            w = self.cfg["watchlist"] = ["SPY", "QQQ", "NVDA"]
         return [c for c in w if E.valid_coin(c)]
 
     def _watch_sel(self):
@@ -9208,7 +9240,7 @@ class App:
     def watch_add(self, coin=None):
         c = (coin or self.watch_entry.get()).strip().upper()
         if not E.valid_coin(c):
-            return messagebox.showinfo("Watchlist", "Type a coin's ticker, like BTC or SOL (or use Browse coins).")
+            return messagebox.showinfo("Watchlist", "Type a ticker, like SPY or NVDA (or use Browse tickers).")
         w = self.watchlist()
         if c not in w:
             w.append(c)
@@ -9431,13 +9463,13 @@ class App:
         sub.grid(row=1, column=1, sticky="w")
         cols = {}
         for j, (k, t) in enumerate((("value", "Worth now"), ("pl", "Profit / loss"), ("avg", "Avg cost / now"),
-                                    ("day", "Today"), ("stake", "Contract"))):
+                                    ("day", "Today"), ("contract", "Contract"))):
             tk.Label(r, text=t, bg=CARD, fg=MUTED, font=("", 7, "bold")).grid(row=0, column=2 + j, sticky="w", padx=(14, 0))
             l = tk.Label(r, text="-", bg=CARD, fg=TEXT, font=("", 9, "bold") if k in ("value", "pl") else ("", 9))
             l.grid(row=1, column=2 + j, sticky="w", padx=(14, 0))
             cols[k] = l
-        cols["stake"].config(cursor="hand2")
-        cols["stake"].bind("<Button-1>", lambda e: self.staking_info(c))
+        cols["contract"].config(cursor="hand2")
+        cols["contract"].bind("<Button-1>", lambda e: self.contract_info(c))
         share = tk.Canvas(r, width=90, height=8, bg=CARD, highlightthickness=0)
         share.grid(row=1, column=7, padx=(14, 0))
         b = tk.Frame(r, bg=CARD)
@@ -9521,8 +9553,7 @@ class App:
                 w["avg"].config(text="-")
                 stake = "-"
                 share = 0
-            kind = "Yes" if q > 0 else "No"
-            w["stake"].config(text=stake, fg=GREEN if kind == "Yes" else MUTED)
+            w["contract"].config(text=stake, fg=GREEN if q > 0 else MUTED)
             cv = w["share"]
             cv.delete("all")
             cv.create_rectangle(0, 0, 90, 8, fill=LINE, outline="")
@@ -9550,7 +9581,7 @@ class App:
                 c.create_text(x + 4, 20, anchor="w", text=f"{name} {v / eq * 100:.0f}%", fill=MUTED, font=("", 7))
             x += wd
 
-    def staking_info(self, c):
+    def contract_info(self, c):
         """Details of the contract the account holds on this ticker: strike, expiry, days left, value and greeks."""
         o = self.opt.get(c)
         if not o or self.pos.get(c, 0) <= 0:
@@ -9673,17 +9704,6 @@ class App:
         ttk.Button(b, text="Cancel", command=w.destroy).pack(side="left", padx=6)
         ttk.Button(b, text="Buy", style="Accent.TButton", command=go).pack(side="left")
 
-    def manual_buy(self, c, usd, px):
-        pct = self.settings["trade_pct"]
-        self.settings["trade_pct"] = usd / self.start_cash * 100
-        try:
-            self.open_option(c, "call", px, "manual buy", 1.0, {})
-        finally:
-            self.settings["trade_pct"] = pct
-
-    def manual_sell(self, c, frac, px):
-        self.sell(c, px, "manual")
-
     # ---------------- animated bot farm strip ----------------
     def build_farm_strip(self, parent):
         self.farm = tk.Canvas(parent, height=46, bg=CARD, highlightthickness=0)
@@ -9723,10 +9743,10 @@ class App:
         try:
             if mode != "Off" and self.root.state() != "iconic" and not self.moving():
                 self.farm_phase = getattr(self, "farm_phase", 0) + 1
-                tab = self.nb.index(self.nb.select()) if hasattr(self, "nb") else 0
-                if tab == 0:
+                tab = self.cur_tab() if hasattr(self, "nb") else "Bot Farm"
+                if "Bot Farm" in tab:
                     self._grid_anim_frame()
-                elif self.nb.tab(tab, "text").strip() == "Strategy scoreboard":
+                elif tab == "Strategy scoreboard":
                     self._draw_farm()
         except Exception:
             pass
@@ -10043,7 +10063,7 @@ class App:
         self.col_head = ttk.Label(top, text="Bot Library", font=("", 13, "bold"))
         self.col_head.pack(anchor="w")
         ttk.Label(top, foreground=MUTED, wraplength=980, text=(
-            "Catch bots from the scoreboard, the Bot Lab or the Hall of Fame. Rarity comes from how much they beat "
+            "Catch bots from the farm, Training camp or the Hall of Fame. Rarity comes from how much they beat "
             "holding, their win rate and how long they kept winning; catching a bot again levels it up. Pick a team "
             f"of up to {E.TEAM_MAX} and tick 'Trade with my team' to run Wildcard with just them.")).pack(anchor="w", pady=(2, 6))
         bar = ttk.Frame(top)
@@ -10142,7 +10162,7 @@ class App:
         self.col_cards = []
         if not bots:
             c.create_text(W // 2, 80, fill=MUTED, justify="center", text=(
-                "No bots here yet.\nSelect bots on the scoreboard and press 'Catch!', or catch Bot Lab passes and "
+                "No bots here yet.\nSelect bots on the scoreboard and press 'Catch!', or catch Training camp graduates and "
                 "Hall of Fame bots.\nHall of Fame bots are caught automatically."))
         for i, b in enumerate(bots):
             x = g + (i % per) * (cw + g)
@@ -10474,12 +10494,12 @@ class App:
         w.after(100, tick)
 
     # ---------------- family tree ----------------
-    def open_family(self):
+    def open_family(self, parent=None):
+        if parent is None:  # it lives as a tab in the family window
+            return self.open_hub('family', 'Family tree')
         if not self.tourn:
-            return messagebox.showinfo("Family tree", "Start the bot with Wildcard ticked first.")
-        w = tk.Toplevel(self.root)
-        w.title("Bot family tree")
-        w.geometry("900x560")
+            return self._nothing(parent, "Family tree", "Start the bot with Wildcard ticked first.")
+        w = parent
         ttk.Label(w, padding=(10, 8, 10, 2), wraplength=860, foreground=MUTED, text=(
             "Every bot's family: starters at the top, their tweaked and bred children underneath. A bred bot has two "
             "parents; it is listed under the first and names the second. Bold = alive, ★ = Hall of Fame. "
@@ -10532,7 +10552,7 @@ class App:
         b = ttk.Frame(w, padding=10)
         b.pack(fill="x")
         ttk.Button(b, text="Refresh", command=fill).pack(side="left")
-        ttk.Button(b, text="Close", command=w.destroy).pack(side="right")
+        ttk.Button(b, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
 
     # ---------------- Hall of Fame ----------------
     def open_hof(self):
@@ -10634,221 +10654,6 @@ class App:
         status.pack(side="right", padx=10)
         fill()
 
-    # ---------------- Bot Lab ----------------
-    def open_lab(self):
-        if getattr(self, "lab_win", None) is not None and self.lab_win.winfo_exists():
-            return self.lab_win.lift()
-        w = self.lab_win = tk.Toplevel(self.root)
-        w.title("Bot Lab")
-        w.geometry("1000x640")
-        top = ttk.Frame(w, padding=(12, 10, 12, 4))
-        top.pack(fill="x")
-        ttk.Label(top, text="Bot Lab: breed bots on past prices, then test them on prices they never saw",
-                  font=("", 12, "bold")).pack(anchor="w")
-        ttk.Label(top, foreground=MUTED, wraplength=960, justify="left", text=(
-            "1. Downloads history for your ticked coins.  2. Runs the full Wildcard tournament (tweaking, crossbreeding, "
-            "retiring) on the older part.  3. Takes its best bots and replays them, unchanged, on the newer part they never "
-            "saw.  A bot passes only if it made money there AND beat just holding. Running several rounds with different "
-            "random seeds shows whether a result is real or luck. Fees and spread are included.")).pack(anchor="w", pady=(2, 8))
-        opts = ttk.Frame(top)
-        opts.pack(fill="x")
-        coins = [c for c, v in self.coin_vars.items() if v.get()]
-        ttk.Label(opts, text="Coins: " + (", ".join(coins) or "none ticked")).grid(row=0, column=0, sticky="w", padx=(0, 16))
-        ttk.Label(opts, text="Candle size").grid(row=0, column=1, sticky="e")
-        gran = tk.StringVar(value=self.cfg.get("lab_gran", "15 min"))
-        ttk.Combobox(opts, textvariable=gran, values=list(LAB_CANDLES), state="readonly", width=8).grid(row=0, column=2, padx=(4, 14))
-        ttk.Label(opts, text="Candles").grid(row=0, column=3, sticky="e")
-        count = tk.StringVar(value=str(self.cfg.get("lab_count", 3000)))
-        ttk.Combobox(opts, textvariable=count, values=["1000", "2000", "3000", "5000"], width=6).grid(row=0, column=4, padx=(4, 14))
-        ttk.Label(opts, text="Rounds").grid(row=0, column=5, sticky="e")
-        rounds = tk.StringVar(value=str(self.cfg.get("lab_rounds", 3)))
-        ttk.Combobox(opts, textvariable=rounds, values=["1", "2", "3", "5", "8"], width=4).grid(row=0, column=6, padx=(4, 14))
-        ttk.Label(opts, text="Learn on").grid(row=0, column=7, sticky="e")
-        split = tk.StringVar(value=self.cfg.get("lab_split", "70%"))
-        ttk.Combobox(opts, textvariable=split, values=["60%", "70%", "80%"], state="readonly", width=5).grid(row=0, column=8, padx=4)
-        span = ttk.Label(top, foreground=MUTED)
-        span.pack(anchor="w", pady=(4, 0))
-
-        def show_span(*_):
-            try:
-                mins = LAB_CANDLES[gran.get()] / 60 * int(count.get())
-                frac = int(split.get().rstrip("%")) / 100
-                span.config(text=f"About {mins / 1440:.1f} days of history: the bots learn on the first {mins * frac / 1440:.1f} "
-                                 f"days and are tested on the last {mins * (1 - frac) / 1440:.1f}.")
-            except (ValueError, KeyError):
-                span.config(text="")
-        for var in (gran, count, split):
-            var.trace_add("write", show_span)
-        show_span()
-        run_row = ttk.Frame(w, padding=(12, 4))
-        run_row.pack(fill="x")
-        self.lab_btn = ttk.Button(run_row, text="Run the Lab", style="Accent.TButton", command=lambda: start())
-        self.lab_btn.pack(side="left")
-        self.lab_bar = ttk.Progressbar(run_row, length=300, mode="determinate", maximum=1.0)
-        self.lab_bar.pack(side="left", padx=10)
-        self.lab_status = ttk.Label(run_row, text="", foreground=MUTED)
-        self.lab_status.pack(side="left")
-        self.lab_summary = tk.Label(w, text="", bg=BG, fg=TEXT, anchor="w", justify="left", padx=12, font=("", 10, "bold"),
-                                    wraplength=960)
-        self.lab_summary.pack(fill="x", pady=(4, 2))
-        mid = ttk.Frame(w, padding=(12, 0))
-        mid.pack(fill="both", expand=True)
-        t = self.lab_tree = self.make_tree(
-            mid, ("strategy", "pace", "stops", "train", "test", "edge", "dd", "trades", "verdict", "round"),
-            (220, 65, 200, 75, 85, 80, 70, 55, 140, 45),
-            ("Strategy", "Pace", "Own stops and traits", "Learned on", "Unseen prices", "vs holding", "Worst drop", "Trades", "Verdict", "Round"))
-        t.configure(selectmode="extended")
-        t.tag_configure("pass", foreground=GREEN)
-        t.tag_configure("fail", foreground=MUTED)
-        t.tag_configure("meh", foreground="#fbbf24" if DARK else "#b45309")
-        self.lab_rows = []
-        b = ttk.Frame(w, padding=12)
-        b.pack(fill="x")
-
-        def picked(only_passed=True):
-            sel = [self.lab_rows[int(i)] for i in t.selection()]
-            return sel or [r for r in self.lab_rows if r["passed"] or not only_passed]
-
-        def export():
-            rows = picked()
-            if not rows:
-                return messagebox.showinfo("Bot Lab", "No bots passed. Select rows to export them anyway.", parent=w)
-            p = filedialog.asksaveasfilename(title="Export Lab bots", defaultextension=".json", parent=w,
-                                             initialfile="lab-passed-bots.json", filetypes=[("Bot file", "*.json")])
-            if p:
-                E.save_bots_file(p, E.export_bots(rows, self.version, note=self.lab_note))
-                self.write(f"Exported {len(rows)} Bot Lab bots to {p}")
-
-        def to_hof():
-            rows = picked()
-            if not rows:
-                return messagebox.showinfo("Bot Lab", "No bots passed. Select rows to add them anyway.", parent=w)
-            n = E.induct(E.export_bots(rows, self.version, note=self.lab_note)["bots"], self.version)
-            self.write(f"Added {n} Bot Lab bots to the Hall of Fame.", "good")
-
-        def to_run():
-            if not self.tourn or not self.seeded:
-                return messagebox.showinfo("Bot Lab", "Start the bot with Wildcard ticked first.", parent=w)
-            closes = {c: self.hist[c] for c in self.session_coins}
-            n = 0
-            for r in picked():
-                if self.tourn.add_variant(r["name"], r["params"], closes, r.get("size", 1.0), note="From the Bot Lab:",
-                                          tf=r["tf"], risk=r.get("risk"), traits=r.get("traits"), vetoes=r.get("vetoes"), layers=r.get("layers"), origin="bot lab"):
-                    n += 1
-            self.flush_events()
-            self.refresh_board()
-            self.write(f"Added {n} Bot Lab bots to this run. Their pace counts in your bar length "
-                       f"({E.fmt_bar(self.session_bar)}), not the Lab's candle size.")
-        ttk.Button(b, text="Export passed...", style="Accent.TButton", command=export).pack(side="left")
-        ttk.Button(b, text="Add passed to Hall of Fame", command=to_hof).pack(side="left", padx=6)
-        ttk.Button(b, text="Add passed to this run", command=to_run).pack(side="left")
-        ttk.Button(b, text="Catch passed", command=lambda: self.catch_rows(picked(), "bot lab") if picked() else
-                   messagebox.showinfo("Bot Lab", "No bots passed. Select rows to catch them anyway.", parent=w)).pack(side="left", padx=6)
-        ttk.Label(b, text="Select rows to use them instead of the passed ones.", foreground=MUTED).pack(side="left", padx=10)
-        ttk.Button(b, text="Close", command=w.destroy).pack(side="right")
-
-        def start():
-            if getattr(self, "lab_busy", False):
-                return
-            cs = [c for c, v in self.coin_vars.items() if v.get()]
-            if not cs:
-                return messagebox.showinfo("Bot Lab", "Tick at least one coin first.", parent=w)
-            try:
-                n_c, n_r = int(count.get()), int(rounds.get())
-                assert 300 <= n_c <= 8000 and 1 <= n_r <= 10
-            except Exception:
-                return messagebox.showerror("Bot Lab", "Candles must be 300 to 8000 and rounds 1 to 10.", parent=w)
-            self.cfg.update(lab_gran=gran.get(), lab_count=n_c, lab_rounds=n_r, lab_split=split.get())
-            E.save_json(CONFIG_PATH, self.cfg)
-            frac = int(split.get().rstrip("%")) / 100
-            self.lab_busy = True
-            self.lab_btn.config(state="disabled", text="Running...")
-            t.delete(*t.get_children())
-            self.lab_rows = []
-            self.lab_summary.config(text="")
-            self.lab_note = f"Bot Lab, {', '.join(cs)}, {gran.get()} candles"
-            s = dict(self.settings)
-            threading.Thread(target=self._lab_work, args=(cs, LAB_CANDLES[gran.get()], n_c, n_r, frac, s, self.cur_quote()),
-                             daemon=True).start()
-
-    def _lab_work(self, coins, gran, count, rounds, frac, settings, quote):
-        try:
-            closes, extra = {}, {}
-            for i, c in enumerate(coins):
-                self.q.put(("lab", ("progress", (f"Downloading {c} history...", 0.1 * i / len(coins)))))
-                d = E.fetch_ohlcv(c, gran, count, quote)
-                closes[c], extra[c] = d["c"], dict(h=d["h"], l=d["l"], v=d["v"], t=list(d.get("t") or []))
-            L = min(len(v) for v in closes.values())
-            if L < 300:
-                return self.q.put(("lab", ("fail", f"Only {L} candles came back. Try a bigger candle size or fewer coins.")))
-            seen, rows, sums = set(), [], []
-            for r in range(rounds):
-                def prog(stage, d, n, r=r):
-                    part = (0.75 if stage == "train" else 0.25) * d / max(n, 1) + (0 if stage == "train" else 0.75)
-                    self.q.put(("lab", ("progress", (f"Round {r + 1} of {rounds}: "
-                                                     f"{'evolving bots' if stage == 'train' else 'testing on unseen prices'}...",
-                                                     0.1 + 0.9 * (r + part) / rounds))))
-                res = E.run_lab(closes, settings, train_frac=frac, seed=1000 + r, progress=prog, extra=extra)
-                sums.append(res)
-                for row in res["rows"]:
-                    k = E.bot_key(row)
-                    if k in seen:
-                        continue
-                    seen.add(k)
-                    row["round"] = r + 1
-                    rows.append(row)
-            self.q.put(("lab", ("done", (rows, sums, L, gran))))
-        except Exception as e:
-            self.q.put(("lab", ("fail", f"{e.__class__.__name__}: {e}")))
-
-    def on_lab_msg(self, kind, data):
-        if kind != "progress":
-            self.lab_busy = False
-        if getattr(self, "lab_win", None) is None or not self.lab_win.winfo_exists():
-            if kind == "done":
-                rows = data[0]
-                self.write(f"Bot Lab finished: {sum(r['passed'] for r in rows)} of {len(rows)} bots passed on unseen prices.")
-            return
-        if kind == "progress":
-            text, frac = data
-            self.lab_status.config(text=text)
-            self.lab_bar["value"] = frac
-            return
-        self.lab_btn.config(state="normal", text="Run the Lab again")
-        if kind == "fail":
-            self.lab_status.config(text=data, foreground=RED)
-            self.lab_bar["value"] = 0
-            return
-        rows, sums, L, gran = data
-        self.lab_bar["value"] = 1.0
-        rows.sort(key=lambda r: (not r["passed"], -r["test_edge"]))
-        self.lab_rows = rows
-        t = self.lab_tree
-        bar_min = gran / 60
-        for i, r in enumerate(rows):
-            tag = "pass" if r["passed"] else "meh" if r["verdict"] == "Lost less than holding" else "fail"
-            t.insert("", "end", iid=str(i), tags=(tag,), values=(
-                friendly_label(r["name"], r["params"]), E.fmt_bar(r["tf"] * bar_min),
-                ", ".join(x for x in (E.risk_text(r.get("risk")), E.traits_text(r.get("traits"))) if x) or "-",
-                pct_txt(r["train_ret"]), pct_txt(r["test_ret"]), pct_txt(r["test_edge"]), f"{r['test_dd'] * 100:.1f}%",
-                r["test_trades"], r["verdict"], r["round"]))
-            r["lifetime"] = dict(return_pct=round(r["test_ret"] * 100, 2), vs_holding_pct=round(r["test_edge"] * 100, 2),
-                                 worst_drop_pct=round(r["test_dd"] * 100, 2), trades=r["test_trades"],
-                                 bar_minutes=bar_min, source="Bot Lab unseen-data test")
-        n_pass = sum(r["passed"] for r in rows)
-        hold = sum(s["test_hold"] for s in sums) / len(sums)
-        wild = sum(s["wildcard"]["ret"] for s in sums) / len(sums)
-        days = (L - sums[0]["split"]) * bar_min / 1440
-        self.lab_summary.config(
-            text=f"{n_pass} of {len(rows)} bots passed.  On the unseen last {days:.1f} days: just holding "
-                 f"{hold * 100:+.1f}%, the full Wildcard system {wild * 100:+.1f}% (average of {len(sums)} rounds). "
-                 + ("A bot that passes in several rounds is more trustworthy than a one-off."
-                    if len(sums) > 1 else "Run more rounds to see if results hold up."),
-            fg=GREEN if n_pass else TEXT)
-        self.lab_status.config(text="Done.", foreground=MUTED)
-        self.write(f"Bot Lab: {n_pass} of {len(rows)} bots passed on unseen prices (holding {hold * 100:+.1f}%).")
-
-    # ---------------- bot picks coins ----------------
     def scout_then_start(self):
         self.write(f"Scouting for {self.settings['auto_coins']} busy tickers that are moving...")
         self.btn.config(state="disabled")
@@ -10873,12 +10678,14 @@ class App:
         self._scouted = True
         self.toggle()
 
-    def show_shortcuts(self):
+    def show_shortcuts(self, parent=None):
+        if parent is None:
+            return self.open_hub("help", 'Shortcuts')
         self.info_window("Keyboard shortcuts", (
             "Ctrl+Enter    Start / stop the bot\n"
-            "Ctrl+L        Bot Lab\n"
+            "Ctrl+L        Learning (backtests, Training camp, Free roam)\n"
             "Ctrl+H        Hall of Fame\n"
-            "Ctrl+K        Browse coins\n"
+            "Ctrl+K        Browse tickers\n"
             "Ctrl+B        Bot Library\n"
             "Ctrl+E        Design an egg\n"
             "Ctrl+,        Settings\n"
@@ -10886,9 +10693,27 @@ class App:
             "Scoreboard: double-click a strategy for its detail card and chart. Select a strategy and pick a coin in "
             "the chart menu to see that bot's entries and exits on the main chart.\n"
             "Chart: hover for exact values, click the range buttons (30 ticks to All), drag the bar under the chart "
-            "to make it taller."))
+            "to make it taller."), parent=parent)
 
     # ---------------- settings / export / updates ----------------
+    EVERYDAY = ("trade_pct", "stop_loss", "take_profit", "trail_stop", "daily_loss", "max_coin_pct", "prem_min", "prem_max",
+                "expiry_days", "pdt_guard", "contract_fee", "max_bots", "bar_minutes", "ctx_tickers", "animations")
+    HIDDEN_SETTINGS = ("maker_fee_pct",)  # nothing in options trading uses these any more
+
+    def settings_groups(self):
+        """Everyday settings first; the full groups (minus those) are the advanced tabs."""
+        fields = {k: (k, lab, typ) for _, _, fs in SETTING_GROUPS for (k, lab, typ) in fs if typ != "head"}
+        out = [("Everyday", "The settings most people change. Tick 'Show advanced settings' below for everything else.",
+                [fields[k] for k in self.EVERYDAY if k in fields])]
+        for title, blurb, fs in SETTING_GROUPS:
+            keep = [f for f in fs if f[0] not in self.EVERYDAY and f[0] not in self.HIDDEN_SETTINGS]
+            while keep and keep[-1][2] == "head":
+                keep.pop()
+            keep = [f for i_, f in enumerate(keep) if not (f[2] == "head" and i_ + 1 < len(keep) and keep[i_ + 1][2] == "head")]
+            if any(f[2] != "head" for f in keep):
+                out.append((title, blurb, keep))
+        return out
+
     def open_settings(self):
         if getattr(self, "settings_win", None) is not None and self.settings_win.winfo_exists():
             return self.settings_win.lift()
@@ -10900,9 +10725,12 @@ class App:
         nb = ttk.Notebook(outer)
         nb.pack()
         ents = {}
-        for title, blurb, fields in SETTING_GROUPS:
+        adv_tabs = []
+        for title, blurb, fields in self.settings_groups():
             f = ttk.Frame(nb, padding=10)
             nb.add(f, text=f"  {title}  ")
+            if title != "Everyday":
+                adv_tabs.append(f)
             ttk.Label(f, text=blurb, foreground=MUTED, wraplength=620).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
             lpos, lr, lc = {}, 1, 0  # Learning tab: switches two per row
             for r, (key, label, typ) in enumerate(fields, start=1):
@@ -10931,11 +10759,17 @@ class App:
                     if title == "Learning":
                         ttk.Checkbutton(f, text=label, variable=var).grid(row=r, column=lpos[r_][1], sticky="w", pady=2,
                                                                           padx=(0, 16))
-                    else:
-                        ttk.Checkbutton(f, text=label, variable=var).grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+                    else:  # long switch labels wrap instead of stretching the window
+                        cf = ttk.Frame(f)
+                        cf.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+                        ttk.Checkbutton(cf, variable=var).pack(side="left", anchor="n")
+                        lb = ttk.Label(cf, text=label, wraplength=560, justify="left", cursor="hand2")
+                        lb.pack(side="left", anchor="w")
+                        lb.bind("<Button-1>", lambda e, v_=var: v_.set(not v_.get()))
                     ents[key] = (var, bool)
                     continue
-                ttk.Label(f, text=label, wraplength=360, justify="left").grid(row=r, column=0, sticky="w", pady=3)
+                ttk.Label(f, text=label, wraplength=520 if title == "Everyday" else 360, justify="left").grid(
+                    row=r, column=0, sticky="w", pady=2 if title == "Everyday" else 3)
                 if typ == "bar":
                     var = tk.StringVar(value=BAR_LABELS.get(float(cur), "1 min"))
                     ttk.Combobox(f, textvariable=var, values=list(BAR_LABELS.values()), state="readonly", width=12).grid(
@@ -10995,10 +10829,18 @@ class App:
                 ttk.Button(f, text="Send a test alert", command=test).grid(row=len(fields) + 1, column=0, sticky="w", pady=(10, 0))
             if title == "Orders":
                 ttk.Label(f, foreground=MUTED, wraplength=520, justify="left", text=(
-                    "Limit orders sit on the order book at the best price (post-only), so they pay the lower maker fee "
-                    "and no spread, but they only fill if the market comes to them. Safety stops and Sell everything "
-                    "always use market orders so they happen right away.")).grid(row=len(fields) + 1, column=0, columnspan=2,
-                                                                                 sticky="w", pady=(10, 0))
+                    "Options are bought with a limit order at the ask and sold with a limit at the bid; if nothing fills "
+                    "in time they're sold at market. Safety stops, expiry and Sell everything sell at market right away.")
+                          ).grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        adv = tk.BooleanVar(value=bool(self.cfg.get("settings_advanced", False)))
+
+        def show_adv():
+            self.cfg["settings_advanced"] = bool(adv.get())
+            for f_ in adv_tabs:
+                nb.tab(f_, state="normal" if adv.get() else "hidden")
+        ttk.Checkbutton(outer, text="Show advanced settings (how the farm breeds and learns, orders, timing, alerts, "
+                                    "Library and Hall of Fame)", variable=adv, command=show_adv).pack(anchor="w", pady=(6, 0))
+        show_adv()
         f = ttk.Frame(nb, padding=10)
         nb.add(f, text="  Strategy details  ")
         ttk.Label(f, text="Starting numbers for each strategy. Wildcard tweaks these on its own.",

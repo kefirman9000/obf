@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.7.0
+**Streamlined: fewer windows, tabs, menus and settings**
+
+- **One Learning window** (Tools, or Ctrl+L): Backtest a bot, Hall of Fame test, Training camp and Free roam are tabs
+  of one window. Bot Lab is gone (Training camp's final exam does the same job), and so is the old strategy backtest.
+- **Merged windows**: Insights (market context, economic calendar, weekly report, farm replay), System (security
+  check, disk use, diagnostics), Family (family tree and drawn bloodlines) and Help (how it works, words, shortcuts,
+  plus the tour and welcome screen) are each one window with tabs.
+- **One Reset window**: tick the account, the farm, or both.
+- **Six main tabs instead of nine**: Markets holds the watchlist and live prices; Trades holds trades, what the bot
+  did and the strategy scoreboard.
+- **Menus**: 35 entries instead of 52 (the Help menu is one item). Sell everything and the KILL SWITCH are in the Account menu.
+- **Settings open on "Everyday"**: the 15 settings most people change. Tick "Show advanced settings" for the rest.
+  Long switch descriptions wrap instead of stretching the window.
+- **Crypto leftovers removed**: the cash-currency box, staking info, the add-on-buys and market/limit order settings,
+  BTC/ETH defaults (the watchlist and tickers now start with SPY and QQQ), "coin" wording, and the welcome and help text
+  (rewritten for options). The "follow the leader" study now follows SPY instead of Bitcoin.
+
 ## 1.6.1
 **Security review**
 
