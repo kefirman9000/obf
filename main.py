@@ -660,6 +660,7 @@ class App:
         E.fill_secrets(self.cfg)
         self.settings = E.merge_settings(self.cfg.get("settings"))
         self.settings["_broker"] = self.cfg.get("broker", "alpaca")
+        self.cfg["roam_on"] = False  # Free roam always starts OFF: it only studies after you switch it on
         wl = self.cfg.get("watchlist")
         if isinstance(wl, list) and wl and all(x in ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA") for x in wl):
             self.cfg["watchlist"] = ["SPY", "QQQ", "NVDA"]  # a crypto-era default list
