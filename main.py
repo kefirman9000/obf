@@ -684,6 +684,8 @@ class App:
         self.cfg = E.load_json(CONFIG_PATH, {})
         apply_theme(root, bool(self.cfg.get("dark", True)))
         self.dark_var = tk.BooleanVar(value=DARK)
+        E.private_dir(E.HOME_DIR)
+        E.fill_secrets(self.cfg)
         self.settings = E.merge_settings(self.cfg.get("settings"))
         self.settings["_broker"] = self.cfg.get("broker", "alpaca")
         if not self.cfg.get("bg_learning_off"):  # 1.5: no learning runs by itself any more (Free roam only when ON)
@@ -1324,6 +1326,7 @@ class App:
         m.add_command(label="Market context: what the bots learned...", command=self.open_context)
         m.add_command(label="Economic calendar...", command=self.open_calendar)
         m.add_command(label="Disk use...", command=self.open_disk)
+        m.add_command(label="Security check...", command=self.open_security)
         m.add_command(label="Free roam (the farm learns from the past by itself)...", command=self.open_roam)
         m.add_command(label="Backtest a bot...", command=lambda: self.open_backtest(None))
         m.add_command(label="Backtest the Hall of Fame...", command=self.backtest_hof)
@@ -2114,7 +2117,7 @@ class App:
             if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
                 os.replace(path, path + ".old")
             with open(path, "a", encoding="utf-8") as f:
-                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {E.redact(msg)}\n")
         except Exception:
             pass
         self.log.config(state="normal")
@@ -3352,7 +3355,7 @@ class App:
             try:
                 os.makedirs(E.HOME_DIR, exist_ok=True)
                 with open(os.path.join(E.HOME_DIR, "crash.log"), "a") as f:
-                    f.write(f"\n--- {datetime.now():%Y-%m-%d %H:%M:%S} ({where}) ---\n{text}")
+                    f.write(f"\n--- {datetime.now():%Y-%m-%d %H:%M:%S} ({where}) ---\n{E.redact(text)}")
             except OSError:
                 pass
             return f"Internal error while {where}: {last}. The bot kept running (details in crash.log)."
@@ -5308,6 +5311,21 @@ class App:
         ask = r["ask"] or r["last"]
         if not ask:
             return messagebox.showinfo("Options", "No price for that contract right now.")
+        days = max(1, int(self.settings.get("expiry_days", 2) or 2))
+        if E.sessions_left(r["exp"]) <= days:
+            return messagebox.showinfo("Options", f"That contract expires within {days} trading day(s), inside the expiry "
+                                                  "guard's window, so it would be sold again right away. Pick a later expiry.")
+        if self.live and self.pdt_blocked():
+            return messagebox.showinfo("Options", "The account has used its 3 day trades in this 5-day window and is under "
+                                                  "$25,000. A new contract couldn't be sold today if it went wrong, so the "
+                                                  "day-trade guard blocks new buys until the window clears.")
+        warn = []
+        if not E.prem_ok(ask):
+            warn.append(f"its price is outside your contract price range ({E.prem_range_text()})")
+        if self.live and not E.liquid(r, float(self.settings.get("max_spread_pct", 0) or 0), 0):
+            warn.append("its bid/ask gap is wide, so it may fill badly")
+        if warn and not messagebox.askyesno("Options", "Heads up: " + "; and ".join(warn) + ".\n\nBuy it anyway?"):
+            return
         qty = simpledialog.askinteger("Buy", f"How many {E.contract_text(r)} contracts at ${ask:.2f} a share "
                                              f"(${ask * E.CONTRACT:,.2f} each)?", initialvalue=1, minvalue=1, maxvalue=500)
         if not qty:
@@ -5318,15 +5336,25 @@ class App:
         o = dict(type=r["type"], K=r["K"], exp=r["exp"], symbol=r["symbol"])
         self.pending_who[c] = "you (by hand)"
         if self.live:
-            if not messagebox.askyesno("Buy", f"Place a REAL order: {qty} x {E.contract_text(r)} at up to ${ask:.2f}?"):
+            ib = self.broker() == "ibkr"
+            if ib and not E.IB.connected():
+                return messagebox.showerror("Buy", "LIVE trades through Interactive Brokers, but it isn't connected "
+                                                   "(Account > Connect Interactive Brokers).")
+            o["broker"] = "ibkr" if ib else "alpaca"
+            if not messagebox.askyesno("Buy", f"Place a REAL order at {'Interactive Brokers' if ib else 'Alpaca'}: "
+                                              f"{qty} x {E.contract_text(r)} at up to ${ask:.2f}?"):
                 return
             self.cash -= cost
             self.pending.add(c)
 
             def work():
                 try:
-                    rr = E.alp_order(r["symbol"], qty, "buy", limit=round(ask, 2))
-                    got, avg = self._wait_order(rr["id"], max(5, int(self.settings.get("limit_wait", 20))))
+                    wait = max(5, int(self.settings.get("limit_wait", 20)))
+                    if ib:
+                        got, avg = E.IB.order(c, r["exp"], r["type"], r["K"], qty, "buy", limit=round(ask, 2), wait=wait)
+                    else:
+                        rr = E.alp_order(r["symbol"], qty, "buy", limit=round(ask, 2))
+                        got, avg = self._wait_order(rr["id"], wait)
                     if got <= 0:
                         return self.q.put(("unfilled", ("buy", c, cost)))
                     self.q.put(("ofill", ("buy", c, got, avg, cost, "manual buy", o)))
@@ -6053,6 +6081,21 @@ class App:
                 dirs[:] = [d for d in dirs if d not in ("cache", "backups")]
                 for fn in files:
                     full = os.path.join(root_, fn)
+                    if fn == "config.json":  # never put keys in a backup, even when the keychain isn't available
+                        try:
+                            c_ = json.load(open(full, encoding="utf-8"))
+                            for k in E.SECRET_CFG:
+                                c_.pop(k, None)
+                            for k in E.SECRET_SETTINGS + self.PRIVATE:
+                                (c_.get("settings") or {}).pop(k, None)
+                            for pr in (c_.get("profiles") or {}).values():
+                                for k in E.SECRET_SETTINGS + self.PRIVATE:
+                                    pr.pop(k, None)
+                            z.writestr("config.json", json.dumps(c_))
+                            n += 1
+                        except Exception:
+                            pass
+                        continue
                     z.write(full, os.path.relpath(full, E.HOME_DIR))
                     n += 1
         self.write(f"Backed up {n} files (Library, Hall of Fame, farms, sessions, settings, trades) to {p}. "
@@ -6081,6 +6124,8 @@ class App:
                 dest = os.path.normpath(os.path.join(E.HOME_DIR, m))
                 if not dest.startswith(os.path.normpath(E.HOME_DIR) + os.sep):
                     continue  # never write outside the data folder
+                if m.endswith("/") or not re.search(r"\.(json|csv|log|txt)$", m, re.I):
+                    continue  # only OBF's own data files (never programs)
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with z.open(m) as src, open(dest, "wb") as out:
                     out.write(src.read())
@@ -6101,16 +6146,22 @@ class App:
             return
 
         def loop():
-            offset = None
+            offset, primed = None, False
             while True:
                 s_ = self.settings
                 if not s_.get("tg_remote") or not s_.get("alert_tg_token") or not s_.get("alert_tg_chat"):
                     time.sleep(15)
+                    primed = False
                     continue
                 try:
+                    if not primed:  # skip anything sent while OBF was closed (an old "/kill confirm" must not fire now)
+                        _, offset = E.tg_updates(s_["alert_tg_token"], offset, timeout=0)
+                        primed = True
                     ups, offset = E.tg_updates(s_["alert_tg_token"], offset)
-                    for chat, text in ups:
-                        if str(chat) == str(s_["alert_tg_chat"]).strip():
+                    for chat, text, sent, private, sender in ups:
+                        # only your own private chat with the bot, and only fresh messages
+                        if (str(chat) == str(s_["alert_tg_chat"]).strip() and private and str(sender) == str(chat)
+                                and time.time() - sent < 120):
                             self.q.put(("call", lambda t=text: self.tg_command(t)))
                 except Exception:
                     time.sleep(20)
@@ -6240,6 +6291,10 @@ class App:
         """Runs every minute while OBF is open, bot running or not: sells contracts inside the expiry window during
         market hours (retrying until they sell), and on expiry day takes the last-resort steps."""
         try:
+            try:
+                self.guard_other_mode()
+            except Exception:
+                pass
             held = [(c, self.opt[c]) for c, q in self.pos.items() if q > 0 and self.opt.get(c) and c not in self.pending]
             if held and self.session and not getattr(self, "_guard_busy", False):
                 self._guard_busy = True
@@ -6259,6 +6314,29 @@ class App:
         finally:
             self.root.after(60000, self.expiry_guard)
 
+    def guard_other_mode(self):
+        """In Practice, the saved LIVE session's contracts aren't on screen, so the guard can't sell them: warn."""
+        if self.live or time.time() - getattr(self, "_other_warned", 0) < 6 * 3600:
+            return
+        try:
+            st = E.load_json(E.state_path(True), {}) or {}
+        except Exception:
+            return
+        days = max(1, int(self.settings.get("expiry_days", 2) or 2))
+        near = [f"  {c} {o.get('K', 0):g} {o.get('type', '')} (expires {datetime.fromtimestamp(o['exp']).strftime('%a %b %d')})"
+                for c, o in (st.get("opt") or {}).items()
+                if (st.get("pos") or {}).get(c, 0) > 0 and o.get("exp") and E.sessions_left(o["exp"]) <= days + 1]
+        if near:
+            self._other_warned = time.time()
+            msg = ("Your LIVE session holds contracts close to expiry:\n" + "\n".join(near) + "\n\nOBF is in Practice, so "
+                   "the expiry guard can't sell them. Click LIVE at the top (you can leave the bot stopped) and the guard "
+                   "sells them within a minute.")
+            self.write(msg.replace("\n", " "), "bad")
+            try:
+                messagebox.showwarning("LIVE contracts near expiry", msg)
+            except tk.TclError:
+                pass
+
     def _guard_act(self, held, is_open):
         now = time.time()
         d = datetime.fromtimestamp(now, timezone.utc)
@@ -6275,7 +6353,7 @@ class App:
                 continue
             # expiry day and still held: last resorts
             key = f"{c}:{int(o['exp'])}"
-            if o.get("broker") == "ibkr" or (self.broker() == "ibkr" and not o.get("broker")):
+            if o.get("broker") == "ibkr":
                 if ny_min >= 15 * 60 + 40 and key not in self._lapsed and E.IB.connected():
                     self._lapsed.add(key)
                     qty = self.pos.get(c, 0)
@@ -6345,6 +6423,81 @@ class App:
             return False
         n, eq, _ = self.pdt_info()
         return n >= 3 and (eq is None or eq < 25000)
+
+    # ---------------- security check ----------------
+    def security_items(self):
+        """[(ok: True / False / None for info, title, detail)] describing how OBF is locked down right now."""
+        out = []
+        kc = E.keychain_ok()
+        out.append((True, "No open ports", "OBF never listens for connections. It only makes outgoing, encrypted (HTTPS) "
+                    "connections: Alpaca for prices and orders, GitHub for updates, FRED for the calendar, Telegram if "
+                    "you turned on alerts or the phone remote."))
+        out.append((kc, "Keys kept in your system keychain" if kc else "System keychain not available",
+                    "Your Alpaca keys, Telegram token, Discord webhook and FRED key are stored in Windows Credential "
+                    "Manager / macOS Keychain, not in OBF's files, backups or exports." if kc else
+                    "Install the 'keyring' package (it comes with OBF's requirements) so keys aren't saved in plain files."))
+        try:
+            raw = open(CONFIG_PATH, encoding="utf-8").read()
+            leak = [k for k in E.SECRET_SETTINGS + E.SECRET_CFG if re.search(rf'"{k}":\s*"[^"]+"', raw)]
+        except OSError:
+            leak = []
+        if leak:
+            out.append((False, "Some keys are still in config.json", ", ".join(leak) + ": they move to the keychain the "
+                        "next time settings are saved (or the keychain isn't available)."))
+        out.append((True, "Logs hide keys", "Anything that looks like a key, token or webhook is blanked before it's "
+                    "written to activity.log or crash.log."))
+        if os.name == "posix":
+            try:
+                mode = os.stat(E.HOME_DIR).st_mode & 0o777
+                out.append((mode & 0o077 == 0, "Data folder private" if mode & 0o077 == 0 else "Data folder readable by others",
+                            f"{E.HOME_DIR} (permissions {oct(mode)})"))
+            except OSError:
+                pass
+        else:
+            out.append((True, "Data folder in your user profile", f"{E.HOME_DIR}: other Windows users can't open it."))
+        out.append((True, "Trading lock", "Buy to open, sell to close only, checked against the broker's own count: "
+                    "nothing naked or uncovered can be sent. LIVE needs you at the computer typing LIVE; the kill switch "
+                    "locks it again. Expiry and day-trade guards: " + ("on" if self.settings.get("pdt_guard", True) else "day-trade guard OFF")))
+        if self.settings.get("tg_remote"):
+            out.append((None, "Telegram phone remote is ON", "Only your own private chat with your bot is obeyed, only "
+                        "messages under 2 minutes old, and anything sent while OBF was closed is ignored. It can pause, "
+                        "report and kill, never start LIVE. Keep the bot token secret: anyone with it could read the chat."))
+        else:
+            out.append((True, "Telegram phone remote is off", "No commands are accepted from outside this computer."))
+        if self.cfg.get("broker") == "ibkr" or E.IB.connected():
+            out.append((E.is_local_host(self.cfg.get("ib_host", "127.0.0.1")), "IBKR: this computer only",
+                        "OBF only connects to IB Gateway / TWS on 127.0.0.1 (that link isn't encrypted). In IB Gateway "
+                        "keep 'Allow connections from localhost only' ticked, and never forward ports 4001, 4002, 7496 "
+                        "or 7497 on your router."))
+        out.append((True, "Expiry guard", f"Every contract is sold {max(1, int(self.settings.get('expiry_days', 2) or 2))} trading "
+                    "day(s) before expiry whenever OBF is open, so nothing you bought is exercised into shares."))
+        out.append((bool(self.settings.get("pdt_guard", True)), "Day-trade guard" + ("" if self.settings.get("pdt_guard", True) else " is OFF"),
+                    "Under $25,000, OBF won't make a 4th day trade in 5 business days (Settings > Basics)."))
+        out.append((None, "Updates", f"Only when you click Update, from github.com/{UPDATE_REPO} over HTTPS; only OBF's own "
+                    "files are replaced, each must compile first, and the old version is backed up. Anyone who can push "
+                    "to that GitHub repository can ship an update, so keep two-factor sign-in on your GitHub account."))
+        out.append((None, "Your broker accounts", "Turn on two-factor sign-in at Alpaca and IBKR, and use paper keys "
+                    "until you're ready. OBF never needs your broker password, only API keys you can revoke any time."))
+        return out
+
+    def open_security(self):
+        w = tk.Toplevel(self.root)
+        w.title("Security check")
+        w.geometry("760x640")
+        w.configure(bg=BG)
+        tk.Label(w, text="Security check", bg=BG, fg=TEXT, font=("", 14, "bold"), anchor="w", padx=14, pady=10).pack(fill="x")
+        t = tk.Text(w, bg=BG, fg=TEXT, relief="flat", wrap="word", padx=14, font=("", 10), highlightthickness=0)
+        t.pack(fill="both", expand=True)
+        t.tag_configure("ok", foreground=GREEN, font=("", 11, "bold"))
+        t.tag_configure("bad", foreground=RED, font=("", 11, "bold"))
+        t.tag_configure("info", foreground=ACCENT, font=("", 11, "bold"))
+        t.tag_configure("d", foreground=MUTED, lmargin1=26, lmargin2=26, spacing3=8)
+        for ok, title, detail in self.security_items():
+            mark, tag = ("OK   ", "ok") if ok else ("NOTE ", "info") if ok is None else ("FIX  ", "bad")
+            t.insert("end", mark + title + "\n", tag)
+            t.insert("end", detail + "\n", "d")
+        t.config(state="disabled")
+        ttk.Button(w, text="Close", command=w.destroy).pack(side="bottom", anchor="e", padx=14, pady=10)
 
     # ---------------- disk use ----------------
     def open_disk(self):
@@ -7466,14 +7619,14 @@ class App:
             got, avg = self._wait_order(r["id"], max(5, int(self.settings.get("limit_wait", 20))))
             if got <= 0:
                 return self.q.put(("unfilled", ("buy", c, spend)))
-            o = dict(type=typ, K=pick["K"], exp=pick["exp"], symbol=pick["symbol"])
+            o = dict(type=typ, K=pick["K"], exp=pick["exp"], symbol=pick["symbol"], broker="alpaca")
             self.q.put(("ofill", ("buy", c, got, avg, spend, reason, o)))
         except Exception as e:
             self.q.put(("fail", ("buy", c, spend, str(e))))
 
     def live_close(self, c, qty, reason):
         """Sells the account's contract: a limit at the bid for normal exits, a market order for stops and expiry."""
-        if (self.opt.get(c) or {}).get("broker") == "ibkr" or (self.broker() == "ibkr" and not (self.opt.get(c) or {}).get("broker")):
+        if (self.opt.get(c) or {}).get("broker") == "ibkr":  # sold where it was bought (no broker noted = Alpaca)
             return self.ib_close(c, qty, reason)
         try:
             o = self.opt.get(c) or {}
