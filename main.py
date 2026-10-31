@@ -113,18 +113,22 @@ SETTING_GROUPS = [
                "Lock in profit take over; these numbers are then the fallback. Fees are always counted.", [
         ("trade_pct", "Trade size: each buy spends this % of your starting money. Example: 10 with $1,000 = $100 per buy "
                       "(winning bots can scale this up to their trade-size multiplier)", float),
-        ("max_coin_pct", "Limit per coin: never have more than this % of your starting money in any single coin. "
-                         "Example: 50 with $1,000 = at most $500 in BTC", float),
-        ("stop_loss", "Safety stop: automatically sell a coin if it falls this % below the price you paid. "
+        ("max_coin_pct", "Limit per ticker: never have more than this % of your starting money in any single ticker's "
+                         "contracts. Example: 50 with $1,000 = at most $500 on SPY", float),
+        ("stop_loss", "Safety stop: automatically sell a contract if it falls this % below the price you paid. "
                       "Example: 5 = sell if a $100 position drops to $95 (0 = off)", float),
-        ("take_profit", "Lock in profit: automatically sell a coin once it is up this % on what you paid. "
+        ("take_profit", "Lock in profit: automatically sell a contract once it is up this % on what you paid. "
                         "Example: 10 = sell when a $100 position reaches $110 (0 = off)", float),
-        ("trail_stop", "Trailing stop: sell a coin if it falls this % from its highest price since you bought it. "
-                       "Example: 4 = a coin that rose to $120 is sold at $115.20 (0 = off)", float),
-        ("min_hold_min", "Minimum hold: keep a coin at least this many minutes before a strategy may sell it. "
+        ("trail_stop", "Trailing stop: sell a contract if it falls this % from its highest price since you bought it. "
+                       "Example: 4 = a contract that rose to $120 is sold at $115.20 (0 = off)", float),
+        ("min_hold_min", "Minimum hold: keep a contract at least this many minutes before a strategy may sell it. "
                          "Safety stops still sell at any time (0 = off)", float),
         ("daily_loss", "Daily loss limit: stop trading for the rest of the day if the account falls this % since "
-                       "midnight. Open coins are kept, not sold (0 = off). The TODAY tile shows how close you are", float),
+                       "midnight. Open contracts are kept, not sold (0 = off). The TODAY tile shows how close you are", float),
+        ("prem_min", "Cheapest contract the bots may buy, in $ per share (the quoted price; x100 per contract). "
+                     "Example: 0.50 = no contracts under $50. The bots move their strike to fit, or skip the trade (0 = no limit)", float),
+        ("prem_max", "Most expensive contract the bots may buy, in $ per share. Example: 3.00 = nothing over $300 a "
+                     "contract (0 = no limit). Applies to practice, backtests, every farm and LIVE", float),
         ("bot_allowance", "Allowance per bot: the most of your starting money that one bot's buy votes may have tied up "
                           "at once. Stops one bad dragon draining the account. Example: 25 with $1,000 = $250 per bot (0 = no limit)", float),
     ]),
@@ -168,10 +172,6 @@ SETTING_GROUPS = [
         ("coin_prefs", "Favourite coins: skip coins it keeps losing on (re-checked in hindsight)", bool),
         ("post_review", "Post-trade review: losing trades teach which never-rules to try next", bool),
         ("multicore", "Learn on several processor cores at once at the start (faster warm-up)", bool),
-        (None, "Free roam (self-study)", "head"),
-        ("free_roam", "Free roam: while idle, the farm backtests its own bots on random stretches of history and runs "
-                      "small training camps, saving every lesson", bool),
-        ("free_roam_running", "...also while the bot is running (uses a bit more computer power)", bool),
     ]),
     ("Library & Hall of Fame", "The Bot Library keeps every bot you save, plus long-term winners the farm saves for you. "
                                "The Hall of Fame holds only the bots you promote yourself (right-click a bot).", [
@@ -674,6 +674,11 @@ class App:
         apply_theme(root, bool(self.cfg.get("dark", True)))
         self.dark_var = tk.BooleanVar(value=DARK)
         self.settings = E.merge_settings(self.cfg.get("settings"))
+        if not self.cfg.get("bg_learning_off"):  # 1.5: no learning runs by itself any more (Free roam only when ON)
+            self.settings["retest_nightly"] = False
+            self.cfg["bg_learning_off"] = True
+            self.cfg["settings"] = self.settings
+            E.save_json(CONFIG_PATH, self.cfg)
         CHARACTER_MODE["mode"] = self.settings.get("characters", "Themed dragons")
         if not self.cfg.get("live_feel_v1"):  # one-time move to the faster defaults (1-minute bars, 2-second prices)
             self.settings["bar_minutes"], self.settings["refresh"] = 1, 2
@@ -758,10 +763,10 @@ class App:
         if not self.session:
             return
         if not force:
-            if time.time() - getattr(self, "_saved_at", 0) < 5:
+            if time.time() - getattr(self, "_saved_at", 0) < 30:  # routine saves at most every 30 s (trades save at once)
                 if not getattr(self, "_save_pending", False):
                     self._save_pending = True
-                    self.root.after(5000, lambda: (setattr(self, "_save_pending", False), self.save_state()))
+                    self.root.after(30000, lambda: (setattr(self, "_save_pending", False), self.save_state()))
                 return
         self._saved_at = time.time()
         E.save_json(E.state_path(self.live), dict(
@@ -779,8 +784,9 @@ class App:
         where it left off. Done every 20 decisions and whenever the bot stops, switches mode or the app closes."""
         if not (self.session and self.tourn and self.seeded):
             return
-        if not force and self.bar_n % 20:
-            return
+        if not force and (self.bar_n % 20 or time.time() - getattr(self, "_farm_saved", 0) < 300):
+            return  # routine farm saves: every 20 decisions, and never more than once every 5 minutes
+        self._farm_saved = time.time()
         try:
             E.save_json(E.farm_path(self.live), dict(coins=self.session_coins, bar=self.session_bar,
                                                       saved_at=time.time(), farm=self.tourn.to_state()))
@@ -1287,6 +1293,7 @@ class App:
         m.add_command(label="Training camp (a whole farm through history)...", command=self.open_training)
         m.add_command(label="Market context: what the bots learned...", command=self.open_context)
         m.add_command(label="Economic calendar...", command=self.open_calendar)
+        m.add_command(label="Disk use...", command=self.open_disk)
         m.add_command(label="Free roam (the farm learns from the past by itself)...", command=self.open_roam)
         m.add_command(label="Backtest a bot...", command=lambda: self.open_backtest(None))
         m.add_command(label="Backtest the Hall of Fame...", command=self.backtest_hof)
@@ -4493,8 +4500,8 @@ class App:
         return os.path.join(E.HOME_DIR, "free-roam.json")
 
     def start_free_roam(self):
-        """Free roam: the farm goes back in time on its own. With Free roam mode ON it studies back to back; otherwise
-        (Settings > Learning) it studies quietly now and then while idle. Each study either backtests some of its own
+        """Free roam: the farm goes back in time on its own, ONLY while Free roam is switched ON (nothing runs in the
+        background otherwise). Each study either backtests some of its own
         bots on a stretch of history (anywhere back to 2016), or runs a small practice farm there; every lesson is saved."""
         if getattr(self, "_roam_thread", None) and self._roam_thread.is_alive():
             return
@@ -4511,14 +4518,9 @@ class App:
             while True:
                 time.sleep(1)
                 try:
-                    s_ = self.settings
                     t = self.tourn
-                    mode = bool(self.cfg.get("roam_on"))
-                    if t is None or not self.session_coins:
+                    if not self.cfg.get("roam_on") or t is None or not self.session_coins:
                         continue
-                    if not mode:
-                        if not s_.get("free_roam", True) or (self.running and not s_.get("free_roam_running", False)):
-                            continue
                     wait = self.roam_wait()
                     if time.time() - getattr(self, "_roam_last", 0) < wait:
                         continue
@@ -4542,7 +4544,12 @@ class App:
         self._roam_thread.start()
 
     def roam_wait(self):
-        return 3 if self.cfg.get("roam_on") else (900 if self.running else 120)
+        return 3
+
+    def roam_check_on(self, t=None):
+        """Stops the study in progress as soon as Free roam is switched off (or the farm changes)."""
+        if not self.cfg.get("roam_on") or (t is not None and self.tourn is not t):
+            raise E.TrainingStopped()
 
     def roam_watching(self):
         """Is the Free roam screen open? (A flag the screen sets: background threads must never touch Tk.)"""
@@ -4550,6 +4557,8 @@ class App:
 
     def _roam_feed(self, who, c, tr, ts, kind):
         """One trade from a Free roam study, for the live trade list."""
+        if kind == "test":
+            self.roam_check_on()
         self.roam_trades = getattr(self, "roam_trades", 0) + 1
         o = tr.get("contract")
         what = E.contract_text(dict(o, under=c)) if o else c
@@ -4583,7 +4592,8 @@ class App:
                                  t0=time.time(), done=0, total=1)
             try:
                 closes, extra, info = self.load_stretch(
-                    coins, gran, a, b, note=lambda txt: self.roam_now and self.roam_now.update(text=txt), max_bars=2500)
+                    coins, gran, a, b, note=lambda txt: (self.roam_check_on(), self.roam_now and self.roam_now.update(text=txt)),
+                    max_bars=2500)
                 if info["bars"] >= min_bars // 2:
                     break
                 last_err = RuntimeError("too few candles there")
@@ -4641,6 +4651,7 @@ class App:
             self.roam_now.update(done=i, text=f"{names[i]} is testing itself ({i + 1} of {len(picks)})")
 
             def prog(d, n, i=i):
+                self.roam_check_on(t)
                 if self.roam_now:
                     self.roam_now["done"] = i + d / max(1, n)
             out.append((v, E.backtest_bot(v, closes, extra, self.start_cash, fee, self.settings["trade_pct"] / 100, slip,
@@ -4660,7 +4671,7 @@ class App:
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=res,
                        summary=f"{good} of {len(res)} beat holding")
             self._roam_finish(rec)
-            if not self.cfg.get("roam_on"):
+            if False:
                 self.write(f"◇ Free roam: {len(res)} bots tested themselves on {self._when(info['start'], True)} to "
                            f"{self._when(info['end'], True)}; {good} beat holding. Lessons saved.")
         self.q.put(("call", apply))
@@ -4690,7 +4701,7 @@ class App:
         res = E.train_farm(closes, extra, E.tournament_opts(self.settings), cap=20, passes=1, exam_frac=0.25,
                            seed_genes=seeds, start_cash=self.start_cash, fee=fee, pct=self.settings["trade_pct"] / 100,
                            evolve=int(self.settings["evolve_every"]), params=self.settings["params"], progress=prog,
-                           stop=lambda: self.tourn is not t, on_trade=on_trade)
+                           stop=lambda: self.tourn is not t or not self.cfg.get("roam_on"), on_trade=on_trade)
 
         def apply():
             if self.tourn is not t:
@@ -4716,7 +4727,7 @@ class App:
                        passed=len(passed), graduate=grad,
                        summary=f"{gen} generations, {len(passed)} passed the exam" + (f"; {grad} joined your farm" if grad else ""))
             self._roam_finish(rec)
-            if not self.cfg.get("roam_on"):
+            if False:
                 self.write(f"◇ Free roam: a practice farm lived through {self._when(info['start'], True)} to "
                            f"{self._when(info['end'], True)}. {rec['summary']}.")
         self.q.put(("call", apply))
@@ -4731,7 +4742,7 @@ class App:
                        "straight away) and Free roam keeps learning.", "warn")
         else:
             self.write("◇ Free roam mode ON: the farm is going back in time to learn on its own." if on else
-                       "◇ Free roam mode OFF.", "good" if on else None)
+                       "◇ Free roam mode OFF: it stops the study in progress, and nothing learns in the background.", "good" if on else None)
         if hasattr(self, "roam_btn"):
             self.roam_btn.config(text="◇ Free roam: ON" if on else "◇ Free roam")
         self.start_free_roam()
@@ -4890,8 +4901,7 @@ class App:
                 state_lbl.config(text="Studying back to back" + (" (alongside live prices)" if self.running else
                                                                  " (the farm is paused, so it has the computer to itself)"), fg=MUTED)
             else:
-                state_lbl.config(text="Off. " + ("It still studies now and then while idle (Settings > Learning)."
-                                                 if self.settings.get("free_roam", True) else "Idle studies are off too."), fg=MUTED)
+                state_lbl.config(text="Off. Nothing studies in the background: Free roam only learns while this is ON.", fg=MUTED)
             cur = self.roam_now
             draw_timeline(cur)
             draw_price(cur)
@@ -4983,7 +4993,7 @@ class App:
                 colr, big = ACCENT, "GETTING READY"
             elif err and time.time() - err[0] < 120:
                 colr, big = RED, "PROBLEM"
-            elif self.tourn and (on or self.settings.get("free_roam", True)):
+            elif self.tourn and on:
                 colr, big = MUTED, "RESTING"
             else:
                 colr, big = MUTED, "OFF" if not self.tourn or not on else "WAITING"
@@ -5024,8 +5034,7 @@ class App:
                 left_s = max(0, int(self.roam_wait() - (time.time() - getattr(self, "_roam_last", 0))))
                 ban.create_text(220, 18, anchor="w", text=(f"Next study in about {left_s} s" if left_s > 2 else "Starting the next study..."),
                                 fill=TEXT, font=("", 10))
-                ban.create_text(76, 46, anchor="w", text="Between studies it saves what it learned. Switch Free roam ON to study back to back."
-                                if not on else "Saving what it learned before the next study.", fill=MUTED, font=("", 9))
+                ban.create_text(76, 46, anchor="w", text="Saving what it learned before the next study.", fill=MUTED, font=("", 9))
             else:
                 ban.create_text(220, 18, anchor="w", text="Not studying right now.", fill=TEXT, font=("", 10))
                 ban.create_text(76, 46, anchor="w", text=state_lbl.cget("text")[:160], fill=MUTED, font=("", 9))
@@ -6174,6 +6183,92 @@ class App:
                         d["rules"].append((st[1] / st[0] if st[0] else 0, E.ctx_text(e), E.bot_nickname(v.key())))
         return out
 
+    # ---------------- disk use ----------------
+    def open_disk(self):
+        """What OBF keeps on disk and how much it has written since it started."""
+        w = tk.Toplevel(self.root)
+        w.title("Disk use")
+        w.geometry("720x560")
+        w.configure(bg=BG)
+        tk.Label(w, bg=BG, fg=MUTED, justify="left", anchor="w", wraplength=690, padx=12, pady=8, text=(
+            "Everything OBF keeps is in one folder (File > Open data folder). It only writes when something changes: your "
+            "account and farm are saved as they trade (routine saves at most every 30 seconds and 5 minutes), and price "
+            "history is saved once when a backtest, Training camp or Free roam first downloads it. Nothing learns or "
+            "downloads in the background unless you switch it on. For scale: a modern SSD is rated for hundreds of "
+            "terabytes of writes, so even a busy day of trading is a tiny fraction of that.")).pack(fill="x")
+        tk.Label(w, text="STORED ON DISK", bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w", padx=12).pack(fill="x")
+        f1 = tk.Frame(w, bg=BG, padx=12)
+        f1.pack(fill="x")
+        t1 = self.make_tree(f1, ("who", "size", "files"), (360, 140, 120), ("What", "Size", "Files"))
+        t1.configure(height=7)
+        tk.Label(w, text="WRITTEN SINCE OBF STARTED", bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w",
+                 padx=12).pack(fill="x", pady=(10, 0))
+        f2 = tk.Frame(w, bg=BG, padx=12)
+        f2.pack(fill="x")
+        t2 = self.make_tree(f2, ("who", "n", "size", "rate"), (260, 100, 120, 160), ("What", "Times", "Written", "Per hour"))
+        t2.configure(height=5)
+        bb = tk.Frame(w, bg=BG, padx=12, pady=10)
+        bb.pack(side="bottom", fill="x")
+
+        def mb(b):
+            return f"{b / 1e6:,.1f} MB" if b >= 1e5 else f"{b / 1e3:,.0f} KB"
+
+        def walk(sub):
+            n = b = 0
+            for r_, _, fs in os.walk(os.path.join(E.HOME_DIR, sub)):
+                for f_ in fs:
+                    n += 1
+                    try:
+                        b += os.path.getsize(os.path.join(r_, f_))
+                    except OSError:
+                        pass
+            return n, b
+
+        def fill():
+            t1.delete(*t1.get_children())
+            groups = {"Farms (your bots and their memory)": [], "Bot Library and Hall of Fame": [],
+                      "Sessions, settings, logs, trades": []}
+            try:
+                for f_ in os.listdir(E.HOME_DIR):
+                    p_ = os.path.join(E.HOME_DIR, f_)
+                    if os.path.isfile(p_):
+                        k = ("Farms (your bots and their memory)" if f_.startswith("farm-") else
+                             "Bot Library and Hall of Fame" if any(x in f_.lower() for x in ("library", "hof", "hall", "collection"))
+                             else "Sessions, settings, logs, trades")
+                        groups[k].append(os.path.getsize(p_))
+            except OSError:
+                pass
+            for k, v in groups.items():
+                t1.insert("", "end", values=(k, mb(sum(v)), len(v)))
+            for lab, sub in (("Price history (downloaded once, by year)", "history"), ("Recent prices and calendar", "cache")):
+                n, b = walk(sub)
+                if n:
+                    t1.insert("", "end", values=(lab, mb(b), n))
+            t2.delete(*t2.get_children())
+            hrs = max(1 / 60, (time.time() - E.DISK_T0) / 3600)
+            for k, (n, b) in sorted(E.DISK_WRITES.items(), key=lambda kv: -kv[1][1]):
+                t2.insert("", "end", values=(k, n, mb(b), mb(b / hrs) if hrs >= 0.25 else "after 15 min"))
+            if w.winfo_exists():
+                w.after(5000, fill)
+
+        def clear(sub, what):
+            if not messagebox.askyesno("Disk use", f"Delete the {what}? It's downloaded again when it's needed.", parent=w):
+                return
+            if sub == "cache":  # keep the economic calendar
+                for f_ in os.listdir(os.path.join(E.HOME_DIR, sub)) if os.path.isdir(os.path.join(E.HOME_DIR, sub)) else []:
+                    if f_ != "events.json":
+                        try:
+                            os.remove(os.path.join(E.HOME_DIR, sub, f_))
+                        except OSError:
+                            pass
+            else:
+                shutil.rmtree(os.path.join(E.HOME_DIR, sub), ignore_errors=True)
+            self.write(f"Deleted the {what}.")
+        ttk.Button(bb, text="Delete downloaded history", command=lambda: clear("history", "downloaded price history")).pack(side="left")
+        ttk.Button(bb, text="Delete price cache", command=lambda: clear("cache", "recent price cache")).pack(side="left", padx=6)
+        ttk.Button(bb, text="Close", command=w.destroy).pack(side="right")
+        fill()
+
     # ---------------- economic calendar ----------------
     def news_card_refresh(self):
         try:
@@ -7111,6 +7206,15 @@ class App:
                 f"using up to ${self.cash:,.2f}.\nBots allowed to trade: {who}.\n"
                 f"Options can lose their whole value, and automated strategies can lose money.{warn}\nType LIVE to continue:")
             return (ans or "").strip() == "LIVE"
+        try:
+            lvl = int(float((E.alp_account() or {}).get("options_trading_level") or 0))
+        except Exception:
+            lvl = None
+        if lvl is not None and lvl < 2:
+            messagebox.showerror("Live mode", f"Your Alpaca account is approved for options level {lvl}. The bots buy calls "
+                                              "and puts, which Alpaca calls level 2 (still never naked: the most a trade can "
+                                              "lose is what it paid). Ask Alpaca for level 2 in the dashboard, then try again.")
+            return False
         if E.ALPACA.get("paper", True):
             return messagebox.askyesno(
                 "Trade your Alpaca PAPER account", f"This places option orders on your Alpaca PAPER account (pretend money "
@@ -7152,7 +7256,9 @@ class App:
             chain = E.option_chain(c, d0, d1, typ, S * 0.75, S * 1.25)
             pick = E.pick_contract(chain, S, typ, dte, otm, now)
             if not pick:
-                raise RuntimeError(f"no {typ} contracts with prices near what the bots want")
+                rng = E.prem_range_text()
+                raise RuntimeError(f"no {typ} contracts with prices near what the bots want"
+                                   + (f" inside your contract price range ({rng})" if rng else ""))
             ask = pick["ask"]
             qty = int(spend // (ask * E.CONTRACT))
             if qty < 1 and ask * E.CONTRACT <= min(self.cash + spend, spend * 2.5):
@@ -7183,16 +7289,30 @@ class App:
                 q = E.option_quotes([sym]).get(sym)
                 if q and q[0] > 0:
                     limit = round(q[0], 2)
-            r = E.alp_order(sym, int(qty), "sell", limit=limit)
+            held = self.broker_held_alpaca(sym)  # the broker's own count: never sell more than it says we own
+            qty = min(int(qty), held)
+            if qty <= 0:
+                raise E.UnsafeOrder(f"Alpaca shows no {sym} contracts in the account, so nothing was sold "
+                                    "(selling would open a short position).")
+            r = E.alp_order(sym, qty, "sell", limit=limit, held=held)
             got, avg = self._wait_order(r["id"], 30 if urgent else max(5, int(self.settings.get("limit_wait", 20))))
             if got <= 0 and limit:  # nobody took the limit: sell at market
-                r = E.alp_order(sym, int(qty), "sell")
+                r = E.alp_order(sym, qty, "sell", held=held)
                 got, avg = self._wait_order(r["id"], 30)
             if got <= 0:
                 return self.q.put(("unfilled", ("sell", c, 0)))
             self.q.put(("ofill", ("sell", c, got, avg, 0, reason, dict(o))))
         except Exception as e:
             self.q.put(("fail", ("sell", c, 0, str(e))))
+
+    @staticmethod
+    def broker_held_alpaca(sym):
+        """Long contracts of this option symbol in the Alpaca account."""
+        for p_ in E.alp_positions() or []:
+            if p_.get("symbol") == sym:
+                q = float(p_.get("qty") or 0)
+                return int(q) if q > 0 and p_.get("side", "long") == "long" else 0
+        return 0
 
     # ---------------- Interactive Brokers ----------------
     def broker(self):
@@ -7243,9 +7363,14 @@ class App:
                 bid, ask, _ = E.IB.quote(c, o["exp"], o["type"], o["K"])
                 limit = round(bid, 2) if bid else None
             wait = 30 if urgent else max(5, int(self.settings.get("limit_wait", 20)))
-            got, avg = E.IB.order(c, o["exp"], o["type"], o["K"], int(qty), "sell", limit=limit, wait=wait)
+            held = int(max(0, E.IB.held(c, o["exp"], o["type"], o["K"])))  # IBKR's own count
+            qty = min(int(qty), held)
+            if qty <= 0:
+                raise E.UnsafeOrder("IBKR shows none of this contract in the account, so nothing was sold "
+                                    "(selling would open a short position).")
+            got, avg = E.IB.order(c, o["exp"], o["type"], o["K"], qty, "sell", limit=limit, wait=wait, held=held)
             if got <= 0 and limit:
-                got, avg = E.IB.order(c, o["exp"], o["type"], o["K"], int(qty), "sell", wait=30)
+                got, avg = E.IB.order(c, o["exp"], o["type"], o["K"], qty, "sell", wait=30, held=held)
             if got <= 0:
                 return self.q.put(("unfilled", ("sell", c, 0)))
             self.q.put(("ofill", ("sell", c, got, avg, 0, reason, dict(o))))

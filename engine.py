@@ -370,7 +370,9 @@ def _save_shard(coin, gran, year, sh):
     with open(tmp, "w") as f:
         json.dump(dict(spans=sh["spans"], t=ts, c=[r[0] for r in rows], h=[r[1] for r in rows], l=[r[2] for r in rows],
                        v=[r[3] for r in rows]), f, separators=(",", ":"))
+        n = f.tell()
     os.replace(tmp, p)
+    note_write(p, n)
 
 
 def _merge_spans(spans):
@@ -590,7 +592,7 @@ def pick_contract(chain, S, typ, dte, otm_pct, now=None):
     now = now or time.time()
     want_exp = now + dte * 86400
     want_K = S * (1 + otm_pct / 100) if typ == "call" else S * (1 - otm_pct / 100)
-    cands = [r for r in chain if r["type"] == typ and r["exp"] > now + 86400 and r["ask"] > 0]
+    cands = [r for r in chain if r["type"] == typ and r["exp"] > now + 86400 and r["ask"] > 0 and prem_ok(r["ask"])]
     if not cands:
         return None
     return min(cands, key=lambda r: (abs(r["exp"] - want_exp) / 86400 / max(3, dte)) + abs(r["K"] - want_K) / S * 10)
@@ -892,8 +894,25 @@ class IBBridge:
             return exp, float(K)
         return self.call(job, 60)
 
-    def order(self, under, exp_ts, typ, K, qty, side, limit=None, wait=20):
+    def held(self, under, exp_ts, typ, K):
+        """Contracts of this option the IBKR account holds right now (negative = short)."""
+        d = datetime.fromtimestamp(exp_ts, timezone.utc).strftime("%Y%m%d")
+        right = "C" if typ == "call" else "P"
+
+        def job(ib):
+            tot = 0.0
+            for p in ib.positions():
+                c = p.contract
+                if (getattr(c, "secType", "") == "OPT" and c.symbol == under and str(c.lastTradeDateOrContractMonth)[:8] == d
+                        and abs(float(c.strike) - float(K)) < 1e-6 and c.right == right):
+                    tot += float(p.position)
+            return tot
+        return self.call(job, 30)
+
+    def order(self, under, exp_ts, typ, K, qty, side, limit=None, wait=20, held=None):
         """Places a limit (or market) order and waits for the fill. -> (filled contracts, avg price per share)."""
+        check_order(side, qty, held)
+
         def job(ib):
             c = self._option(under, exp_ts, typ, K)
             if not ib.qualifyContracts(c):
@@ -926,7 +945,24 @@ def alp_account(creds=None):
                creds=creds)
 
 
-def alp_order(symbol, qty, side, limit=None, tif="day"):
+class UnsafeOrder(RuntimeError):
+    pass
+
+
+def check_order(side, qty, held=None):
+    """The safety lock: OBF only BUYS options to open and SELLS to close contracts it holds, never more than it holds.
+    No selling to open (naked / uncovered), so no trade can lose more than what was paid for it."""
+    if side == "buy":
+        return
+    if side != "sell":
+        raise UnsafeOrder(f"unknown order side {side!r}")
+    if held is None or int(qty) > int(held) or int(qty) <= 0:
+        raise UnsafeOrder(f"blocked: selling {qty} contract(s) while holding {held or 0} would open a short (uncovered) "
+                          f"position. OBF only sells contracts it owns.")
+
+
+def alp_order(symbol, qty, side, limit=None, tif="day", held=None):
+    check_order(side, qty, held)
     body = dict(symbol=symbol, qty=str(int(qty)), side=side, type="limit" if limit else "market", time_in_force=tif)
     if limit:
         body["limit_price"] = f"{limit:.2f}"
@@ -1367,13 +1403,13 @@ DEFAULT_SETTINGS = {
     "mut_memory": True,          # the farm remembers which kinds of change make winners and does more of those
     "multicore": True,           # warm up the islands on several processor cores at once
     "shadow_live": True,         # follow your Hall of Fame bots with pretend money in real time (Shadow Live)
-    "retest_nightly": True,      # once a day, re-backtest the Hall of Fame on the latest prices; stale ones get a RUSTY badge
+    "retest_nightly": False,     # once a day, re-backtest the Hall of Fame on the latest prices; stale ones get a RUSTY badge
     "graduation": True,          # before real money: check each Hall of Fame / team bot has earned it
     "grad_hours": 24.0,          # ...hours it must have spent Winning
     "trade_hours": "",           # account trades only in these hours, like "9-17" or "22-6" (empty = any time; stops always run)
     "weekdays_only": False,      # ...and only Monday to Friday
     "tg_remote": False,          # control CBBF from Telegram: /status /pause /resume /report /kill
-    "free_roam": True,           # when the farm is idle, it backtests its own bots and runs small training camps by itself
+    "free_roam": False,          # (retired: Free roam only runs while its switch is ON)
     "free_roam_running": False,  # ...also while the bot runs (uses a little more computer power and network)
     "slow_trades_account": False,  # the slow farm (hourly candles) may also trade your account
     "slow_size": 30,             # bots on the slow farm
@@ -1394,6 +1430,8 @@ DEFAULT_SETTINGS = {
     "fee_aware": True,           # don't sell for a profit smaller than the round-trip fees (losses and stops still sell)
     "max_trades_hour": 30,       # brake: most signal trades the account may make in an hour (0 = no limit)
     "trail_stop": 0.0,           # % trailing stop: sell if a coin falls this far from its high since buying (0 = off)
+    "prem_min": 0.0,             # contract price range the bots may buy, $ per share (0 = no limit)
+    "prem_max": 0.0,
     "slippage": 2.0,             # % of the premium lost to the bid/ask spread on each option fill (Practice)
     "order_type": "market",      # "market" or "limit" (post-only maker orders, lower fees)
     "maker_fee_pct": 0.4,        # fee for limit orders that rest on the book (Practice)
@@ -1602,6 +1640,34 @@ def realized_vol(p, times=None, n=120):
     return v
 
 
+PREM_RANGE = [0.0, 0.0]  # contract price range bots may buy, $ per share; 0 = no limit on that side
+
+
+def set_prem_range(lo, hi):
+    try:
+        lo, hi = max(0.0, float(lo or 0)), max(0.0, float(hi or 0))
+    except (TypeError, ValueError):
+        lo, hi = 0.0, 0.0
+    if lo and hi and lo > hi:
+        lo, hi = hi, lo
+    PREM_RANGE[:] = [lo, hi]
+
+
+def prem_ok(p):
+    """Is a premium ($ per share) inside the chosen contract price range?"""
+    lo, hi = PREM_RANGE
+    return (not lo or p >= lo) and (not hi or p <= hi)
+
+
+def prem_range_text():
+    lo, hi = PREM_RANGE
+    if not lo and not hi:
+        return ""
+    if lo and hi:
+        return f"${lo:,.2f} to ${hi:,.2f} a share (${lo * 100:,.0f} to ${hi * 100:,.0f} a contract)"
+    return (f"at least ${lo:,.2f} a share" if lo else f"at most ${hi:,.2f} a share (${hi * 100:,.0f} a contract)")
+
+
 def strike_step(S):
     return 0.5 if S < 25 else 1.0 if S < 200 else 5.0 if S < 1000 else 10.0
 
@@ -1670,6 +1736,24 @@ class OptionSim(Sim):
         exp = next_expiry(self.now, int(g.get("odte", 14) or 14))
         self.opt[c] = dict(type=typ, K=K, exp=exp, under=c)
         prem = self.mark_one(c, S)
+        if (PREM_RANGE[0] or PREM_RANGE[1]) and not prem_ok(prem / CONTRACT):
+            # outside the price range: walk the strike (further out of the money = cheaper, closer in = dearer)
+            cheaper = 1 if typ == "call" else -1
+            way = cheaper if (PREM_RANGE[1] and prem / CONTRACT > PREM_RANGE[1]) else -cheaper
+            for _ in range(60):
+                K = K + way * step
+                if K <= 0:
+                    break
+                self.opt[c]["K"] = K
+                prem = self.mark_one(c, S)
+                if prem_ok(prem / CONTRACT):
+                    break
+                if (way == cheaper and PREM_RANGE[0] and prem / CONTRACT < PREM_RANGE[0]) or \
+                        (way != cheaper and PREM_RANGE[1] and prem / CONTRACT > PREM_RANGE[1]):
+                    break  # stepped right over the range: no contract fits
+            if not prem_ok(prem / CONTRACT):
+                self.opt.pop(c, None)
+                return False
         if prem <= 0.5:
             self.opt.pop(c, None)
             return False
@@ -1771,6 +1855,7 @@ def data_now(extra, coins):
 def tournament_opts(settings):
     """Picks the winner/shaky-strategy knobs out of the app settings."""
     fee, slip = cost_model(settings)
+    set_prem_range(settings.get("prem_min", 0), settings.get("prem_max", 0))
     return dict(trade_more=bool(settings.get("winners_trade_more", True)),
                 winner_boost=float(settings.get("winner_boost", 2.5)),
                 add_every=int(settings.get("add_every", 3)),
@@ -1790,7 +1875,8 @@ def tournament_opts(settings):
                 htf_studies=bool(settings.get("htf_studies", True)), lead_study=bool(settings.get("lead_study", True)),
                 ctx=[c for c in (settings.get("ctx_tickers") or []) if valid_coin(c)] if settings.get("ctx_studies", True) else [],
                 post_review=bool(settings.get("post_review", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
-                adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)))
+                adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
+                prem=list(PREM_RANGE))
 
 
 RISK_BOUNDS = {"sl": (2.0, 95.0), "tp": (2.0, 500.0)}  # a bot's own stop / target on the PREMIUM it paid, % (0 = none)
@@ -2483,6 +2569,8 @@ class Tournament:
                       layers=True)
         self.replaying = False
         self.o.update(opts or {})
+        if self.o.get("prem"):  # worker processes get the contract price range this way
+            set_prem_range(*self.o["prem"])
         self.slowed, self.cool, self.add_cool, self.kind = [], {}, {}, {}
         self.rng = rng or random.Random()
         self.n = 0
@@ -4299,12 +4387,28 @@ def load_json(path, default=None):
         return default
 
 
+DISK_WRITES = {}  # what OBF has written since it started: kind -> [times, bytes]
+DISK_T0 = time.time()
+
+
+def note_write(path, nbytes):
+    base = os.path.basename(path)
+    kind = ("Farm saves" if base.startswith("farm-") else "Session saves" if base.startswith("state-") else
+            "Price history" if os.sep + "history" + os.sep in path or os.sep + "cache" + os.sep in path else
+            "Slow farm" if "slow" in base else "Settings and other")
+    w = DISK_WRITES.setdefault(kind, [0, 0])
+    w[0] += 1
+    w[1] += nbytes
+
+
 def save_json(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(obj, f)
+        n = f.tell()
     os.replace(tmp, path)
+    note_write(path, n)
 
 
 def state_path(live):
