@@ -574,6 +574,29 @@ def option_chain(under, exp_from=None, exp_to=None, typ=None, strike_lo=None, st
     return sorted(out, key=lambda r: (r["exp"], r["K"], r["type"]))
 
 
+def option_oi(under, exp_from=None, exp_to=None, typ=None):
+    """{option symbol: open interest} from Alpaca's contract list (open interest is updated once a day)."""
+    q = [f"underlying_symbols={urllib.parse.quote(under)}", "limit=10000", "status=active"]
+    if exp_from:
+        q.append(f"expiration_date_gte={exp_from}")
+    if exp_to:
+        q.append(f"expiration_date_lte={exp_to}")
+    if typ:
+        q.append(f"type={typ}")
+    out, token = {}, None
+    for _ in range(5):
+        d = alp("GET", f"{trade_url()}/v2/options/contracts?" + "&".join(q) + (f"&page_token={token}" if token else ""))
+        for r in d.get("option_contracts") or []:
+            try:
+                out[r["symbol"]] = int(float(r.get("open_interest") or 0))
+            except (TypeError, ValueError, KeyError):
+                continue
+        token = d.get("next_page_token")
+        if not token:
+            break
+    return out
+
+
 def option_quotes(symbols):
     """{option symbol: (bid, ask, time)} for specific contracts."""
     out = {}
@@ -587,12 +610,27 @@ def option_quotes(symbols):
     return out
 
 
-def pick_contract(chain, S, typ, dte, otm_pct, now=None):
-    """The listed contract closest to what a bot wants: its type, about dte days out, about otm_pct% out of the money."""
+def liquid(r, max_spread_pct=15.0, min_oi=50):
+    """Is this contract busy enough to trade? A narrow bid/ask gap and enough open contracts (when known)."""
+    bid, ask = r.get("bid") or 0, r.get("ask") or 0
+    if ask <= 0:
+        return False
+    if max_spread_pct and (bid <= 0 or (ask - bid) / ((ask + bid) / 2) * 100 > max_spread_pct):
+        return False
+    oi = r.get("oi")
+    if min_oi and oi is not None and oi < min_oi:
+        return False
+    return True
+
+
+def pick_contract(chain, S, typ, dte, otm_pct, now=None, min_sessions=1, max_spread_pct=0.0, min_oi=0):
+    """The listed contract closest to what a bot wants: its type, about dte days out, about otm_pct% out of the money;
+    only ones inside the price range, liquid enough, and with more than min_sessions trading days left."""
     now = now or time.time()
     want_exp = now + dte * 86400
     want_K = S * (1 + otm_pct / 100) if typ == "call" else S * (1 - otm_pct / 100)
-    cands = [r for r in chain if r["type"] == typ and r["exp"] > now + 86400 and r["ask"] > 0 and prem_ok(r["ask"])]
+    cands = [r for r in chain if r["type"] == typ and r["exp"] > now + 86400 and r["ask"] > 0 and prem_ok(r["ask"])
+             and sessions_left(r["exp"], now) > min_sessions and liquid(r, max_spread_pct, min_oi)]
     if not cands:
         return None
     return min(cands, key=lambda r: (abs(r["exp"] - want_exp) / 86400 / max(3, dte)) + abs(r["K"] - want_K) / S * 10)
@@ -929,6 +967,37 @@ class IBBridge:
             st = tr.orderStatus
             return float(st.filled or 0), float(st.avgFillPrice or 0)
         return self.call(job, wait + 30)
+
+    def lapse(self, under, exp_ts, typ, K, qty):
+        """Tells IBKR NOT to exercise this long option at expiry (it expires worthless instead of turning into shares).
+        A last resort when it couldn't be sold."""
+        def job(ib):
+            c = self._option(under, exp_ts, typ, K)
+            if not ib.qualifyContracts(c):
+                raise RuntimeError("IBKR doesn't list that contract")
+            ib.exerciseOptions(c, 2, int(qty), self.account, 0)  # 2 = lapse
+            return True
+        return self.call(job, 30)
+
+    def day_trades_left(self):
+        """IBKR's own count of day trades left before the pattern-day-trader rule (None if it doesn't say)."""
+        def job(ib):
+            for v in ib.accountSummary():
+                if v.tag == "DayTradesRemaining":
+                    try:
+                        return int(float(v.value))
+                    except (TypeError, ValueError):
+                        return None
+            return None
+        return self.call(job, 30)
+
+    def equity(self):
+        def job(ib):
+            for v in ib.accountSummary():
+                if v.tag == "NetLiquidation" and v.currency in ("USD", "BASE", ""):
+                    return float(v.value)
+            return None
+        return self.call(job, 30)
 
     def cancel_all(self):
         try:
@@ -1430,6 +1499,12 @@ DEFAULT_SETTINGS = {
     "fee_aware": True,           # don't sell for a profit smaller than the round-trip fees (losses and stops still sell)
     "max_trades_hour": 30,       # brake: most signal trades the account may make in an hour (0 = no limit)
     "trail_stop": 0.0,           # % trailing stop: sell if a coin falls this far from its high since buying (0 = off)
+    "_broker": "alpaca",         # (kept in step with Account > broker; sets the per-contract fee)
+    "expiry_days": 2,            # sell every account contract this many trading days before it expires
+    "pdt_guard": True,           # under $25k: never make a 4th day trade in 5 business days
+    "contract_fee": -1.0,        # $ per contract per side; -1 = the broker's own (Alpaca ~$0.04, IBKR ~$0.69)
+    "max_spread_pct": 15.0,      # LIVE: skip contracts whose bid/ask gap is wider than this % of the price (0 = off)
+    "min_oi": 50,                # LIVE: skip contracts with fewer open contracts than this (0 = off)
     "prem_min": 0.0,             # contract price range the bots may buy, $ per share (0 = no limit)
     "prem_max": 0.0,
     "slippage": 2.0,             # % of the premium lost to the bid/ask spread on each option fill (Practice)
@@ -1640,6 +1715,38 @@ def realized_vol(p, times=None, n=120):
     return v
 
 
+CONTRACT_FEE = [0.04]    # $ per contract per side (commission + regulatory fees), set from the broker
+
+
+def broker_contract_fee(broker, setting=-1.0):
+    """Per-contract fee: the setting if you gave one, else the broker's usual (Alpaca: no commission, about $0.04 of
+    regulatory fees; IBKR: about $0.65 commission plus the same fees)."""
+    try:
+        x = float(setting)
+    except (TypeError, ValueError):
+        x = -1.0
+    if x >= 0:
+        return x
+    return 0.69 if broker == "ibkr" else 0.04
+
+
+def ny_date(ts):
+    d = datetime.fromtimestamp(ts, timezone.utc)
+    return (d - timedelta(hours=_ny_offset(d))).date()
+
+
+def sessions_left(exp, now=None):
+    """Trading days from today until expiry day (expiry day counts, today doesn't): Wednesday for a Friday expiry = 2,
+    Thursday = 1, expiry day itself = 0. Weekends are skipped (holidays aren't, so it errs on the early side)."""
+    a, b = ny_date(now or time.time()), ny_date(exp)
+    n, d = 0, a
+    while d < b and n < 400:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            n += 1
+    return n
+
+
 PREM_RANGE = [0.0, 0.0]  # contract price range bots may buy, $ per share; 0 = no limit on that side
 
 
@@ -1765,12 +1872,12 @@ class OptionSim(Sim):
         if qty < 1:
             self.opt.pop(c, None)
             return False
-        cost = qty * fill * (1 + self.fee)
+        cost = qty * fill * (1 + self.fee) + qty * CONTRACT_FEE[0]
         if cost > self.cash:
             self.opt.pop(c, None)
             return False
         self.cash -= cost
-        self.fees += qty * fill * self.fee + qty * prem * self.slip
+        self.fees += qty * fill * self.fee + qty * prem * self.slip + qty * CONTRACT_FEE[0]
         self.pos[c] = qty
         self.cost[c] = cost
         self.tbars.append(n)
@@ -1800,8 +1907,8 @@ class OptionSim(Sim):
         prem = self.mark_one(c, px)
         expired = o and self.now >= o["exp"]
         fill = prem if expired else prem * (1 - self.slip)
-        proceeds = q * fill * (1 - (0 if expired else self.fee))
-        self.fees += 0 if expired else q * prem * self.slip + q * fill * self.fee
+        proceeds = q * fill * (1 - (0 if expired else self.fee)) - (0 if expired else q * CONTRACT_FEE[0])
+        self.fees += 0 if expired else q * prem * self.slip + q * fill * self.fee + q * CONTRACT_FEE[0]
         self.cash += proceeds
         self.last = dict(side="sell", coin=c, qty=q, price=fill, usd=proceeds, pl=proceeds - self.cost.get(c, 0), contract=o)
         self.pos[c], self.cost[c] = 0, 0
@@ -1856,6 +1963,7 @@ def tournament_opts(settings):
     """Picks the winner/shaky-strategy knobs out of the app settings."""
     fee, slip = cost_model(settings)
     set_prem_range(settings.get("prem_min", 0), settings.get("prem_max", 0))
+    CONTRACT_FEE[0] = broker_contract_fee(settings.get("_broker", "alpaca"), settings.get("contract_fee", -1))
     return dict(trade_more=bool(settings.get("winners_trade_more", True)),
                 winner_boost=float(settings.get("winner_boost", 2.5)),
                 add_every=int(settings.get("add_every", 3)),
@@ -1876,7 +1984,7 @@ def tournament_opts(settings):
                 ctx=[c for c in (settings.get("ctx_tickers") or []) if valid_coin(c)] if settings.get("ctx_studies", True) else [],
                 post_review=bool(settings.get("post_review", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
-                prem=list(PREM_RANGE))
+                prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0])
 
 
 RISK_BOUNDS = {"sl": (2.0, 95.0), "tp": (2.0, 500.0)}  # a bot's own stop / target on the PREMIUM it paid, % (0 = none)
@@ -2571,6 +2679,8 @@ class Tournament:
         self.o.update(opts or {})
         if self.o.get("prem"):  # worker processes get the contract price range this way
             set_prem_range(*self.o["prem"])
+        if self.o.get("cfee") is not None:
+            CONTRACT_FEE[0] = float(self.o["cfee"])
         self.slowed, self.cool, self.add_cool, self.kind = [], {}, {}, {}
         self.rng = rng or random.Random()
         self.n = 0

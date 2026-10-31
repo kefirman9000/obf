@@ -50,7 +50,7 @@ import uuid
 import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -125,6 +125,17 @@ SETTING_GROUPS = [
                          "Safety stops still sell at any time (0 = off)", float),
         ("daily_loss", "Daily loss limit: stop trading for the rest of the day if the account falls this % since "
                        "midnight. Open contracts are kept, not sold (0 = off). The TODAY tile shows how close you are", float),
+        ("expiry_days", "Expiry guard: sell every contract this many trading days before it expires, so nothing is "
+                        "ever exercised into shares. 2 = sell on Wednesday for a Friday expiry (at least 1). Runs whenever "
+                        "OBF is open, even with the bot stopped", int),
+        ("pdt_guard", "Day-trade guard: under $25,000, never make a 4th day trade (buy and sell the same contract the same "
+                      "day) in 5 business days, so the broker doesn't flag the account as a pattern day trader. Safety "
+                      "exits (stops, expiry, kill switch, your own sells) still go through", bool),
+        ("contract_fee", "Fee per contract, each way, in $ (-1 = your broker's usual: Alpaca about $0.04 of regulatory "
+                         "fees, IBKR about $0.65 + $0.04). Charged in practice, backtests and every farm", float),
+        ("max_spread_pct", "LIVE: skip contracts whose bid/ask gap is wider than this % of their price (thin contracts "
+                           "fill badly). Example: 15 (0 = off)", float),
+        ("min_oi", "LIVE: skip contracts with fewer open contracts (open interest) than this. Example: 50 (0 = off)", int),
         ("prem_min", "Cheapest contract the bots may buy, in $ per share (the quoted price; x100 per contract). "
                      "Example: 0.50 = no contracts under $50. The bots move their strike to fit, or skip the trade (0 = no limit)", float),
         ("prem_max", "Most expensive contract the bots may buy, in $ per share. Example: 3.00 = nothing over $300 a "
@@ -674,6 +685,7 @@ class App:
         apply_theme(root, bool(self.cfg.get("dark", True)))
         self.dark_var = tk.BooleanVar(value=DARK)
         self.settings = E.merge_settings(self.cfg.get("settings"))
+        self.settings["_broker"] = self.cfg.get("broker", "alpaca")
         if not self.cfg.get("bg_learning_off"):  # 1.5: no learning runs by itself any more (Free roam only when ON)
             self.settings["retest_nightly"] = False
             self.cfg["bg_learning_off"] = True
@@ -700,6 +712,8 @@ class App:
         root.after(400, self.auto_login)
         root.after(700, self.maybe_welcome)
         root.after(4000, self.start_tg_remote)
+        self._pdt_note, self._lapsed = {}, set()
+        root.after(30000, self.expiry_guard)
         if self.cfg.get("fred_key") and time.time() - E.events_fetched() > 7 * 86400:
             root.after(6000, lambda: self.fetch_calendar(quiet=True))
         if self.cfg.get("broker") == "ibkr" and self.cfg.get("ib_auto", True) and E.ib_lib() is not None:
@@ -866,6 +880,22 @@ class App:
             self.shadow_live, self.shadow_curve = None, []
 
     def on_close(self):
+        near = self.expiring_soon(extra=1)
+        if near:
+            ans = messagebox.askyesnocancel(
+                "Contracts close to expiry", "These contracts expire soon:\n\n" + "\n".join(near) + "\n\nThe expiry guard can "
+                "only sell them while OBF is open. If one is still held at expiry and ends in the money, the broker may "
+                "exercise it into 100 shares per contract.\n\nYes = sell them now and stay open until they're sold.\n"
+                "No = quit anyway.\nCancel = don't quit.")
+            if ans is None:
+                return
+            if ans:
+                for c in list(self.pos):
+                    o = self.opt.get(c)
+                    if self.pos.get(c, 0) > 0 and o and E.sessions_left(o["exp"]) <= int(self.settings.get("expiry_days", 2) or 2) + 1:
+                        self.sell(c, self.last.get(c, 0), "expiry")
+                self.write("Selling the contracts close to expiry. Close OBF again once they're sold.", "warn")
+                return
         if self.running and not messagebox.askyesno(
                 "Quit", "The bot is running. Quitting stops it (open positions stay open).\n\nQuit anyway?"):
             return
@@ -3270,7 +3300,9 @@ class App:
                         if self.broker() == "ibkr" and E.IB.connected():
                             self.q.put(("balances", {"USD": E.IB.funds()}))
                         else:
-                            self.q.put(("balances", self.read_balances(E.alp_account())))
+                            acct = E.alp_account()
+                            self.acct_info = acct
+                            self.q.put(("balances", self.read_balances(acct)))
                     except Exception:
                         pass
             except Exception:  # never let the feed die
@@ -6183,6 +6215,137 @@ class App:
                         d["rules"].append((st[1] / st[0] if st[0] else 0, E.ctx_text(e), E.bot_nickname(v.key())))
         return out
 
+    # ---------------- expiry guard and day-trade guard ----------------
+    SAFETY_EXITS = ("stop-loss", "trailing-stop", "expiry", "manual", "kill switch", "daily-loss")
+
+    def near_expiry(self, o):
+        return E.sessions_left(o["exp"]) <= max(1, int(self.settings.get("expiry_days", 2) or 2))
+
+    def expiring_soon(self, extra=0):
+        """Labels of account contracts inside the expiry window (+ extra trading days)."""
+        out = []
+        for c, q in self.pos.items():
+            o = self.opt.get(c)
+            if q > 0 and o and E.sessions_left(o["exp"]) <= max(1, int(self.settings.get("expiry_days", 2) or 2)) + extra:
+                out.append(f"  {self.contract_label(c)}  ({'LIVE' if self.live else 'Practice'}, expires "
+                           f"{datetime.fromtimestamp(o['exp']).strftime('%a %b %d')})")
+        return out
+
+    def pick_rules(self):
+        return dict(min_sessions=max(1, int(self.settings.get("expiry_days", 2) or 2)),
+                    max_spread_pct=float(self.settings.get("max_spread_pct", 0) or 0),
+                    min_oi=int(self.settings.get("min_oi", 0) or 0))
+
+    def expiry_guard(self):
+        """Runs every minute while OBF is open, bot running or not: sells contracts inside the expiry window during
+        market hours (retrying until they sell), and on expiry day takes the last-resort steps."""
+        try:
+            held = [(c, self.opt[c]) for c, q in self.pos.items() if q > 0 and self.opt.get(c) and c not in self.pending]
+            if held and self.session and not getattr(self, "_guard_busy", False):
+                self._guard_busy = True
+
+                def work():
+                    try:
+                        is_open = True
+                        if self.live:
+                            try:
+                                is_open = bool(E.market_clock().get("is_open"))
+                            except Exception:
+                                is_open = False
+                        self.q.put(("call", lambda: self._guard_act(held, is_open)))
+                    finally:
+                        self._guard_busy = False
+                threading.Thread(target=work, daemon=True).start()
+        finally:
+            self.root.after(60000, self.expiry_guard)
+
+    def _guard_act(self, held, is_open):
+        now = time.time()
+        d = datetime.fromtimestamp(now, timezone.utc)
+        ny_min = ((d.hour - E._ny_offset(d)) % 24) * 60 + d.minute
+        for c, o in held:
+            if self.pos.get(c, 0) <= 0 or c in self.pending or not self.near_expiry(o):
+                continue
+            if is_open or not self.live:
+                if not self.running:
+                    self.write(f"Expiry guard: selling {self.contract_label(c)} (expires "
+                               f"{datetime.fromtimestamp(o['exp']).strftime('%a %b %d')}).", "warn")
+                self.sell(c, self.last.get(c, 0), "expiry")
+            if not self.live or E.sessions_left(o["exp"]) > 0:
+                continue
+            # expiry day and still held: last resorts
+            key = f"{c}:{int(o['exp'])}"
+            if o.get("broker") == "ibkr" or (self.broker() == "ibkr" and not o.get("broker")):
+                if ny_min >= 15 * 60 + 40 and key not in self._lapsed and E.IB.connected():
+                    self._lapsed.add(key)
+                    qty = self.pos.get(c, 0)
+
+                    def lapse(c=c, o=o, qty=qty):
+                        try:
+                            E.IB.lapse(c, o["exp"], o["type"], o["K"], qty)
+                            self.q.put(("log", (f"Expiry guard: {self.contract_label(c)} couldn't be sold, so IBKR was told "
+                                                f"NOT to exercise it (it expires instead of turning into shares).", "warn")))
+                        except Exception as e:
+                            self.q.put(("log", (f"Expiry guard: couldn't send IBKR the do-not-exercise for "
+                                                f"{self.contract_label(c)}: {e}. Do it in TWS (Option Exercise) before 4:30 pm.", "bad")))
+                    threading.Thread(target=lapse, daemon=True).start()
+            elif ny_min >= 13 * 60 and key not in self._lapsed and o.get("type") == "call":
+                self._lapsed.add(key)
+                msg = (f"{self.contract_label(c)} expires TODAY and hasn't sold yet. OBF keeps trying until the close. If "
+                       f"it's still held at 3 pm and in the money, Alpaca will exercise it into 100 shares per contract: "
+                       f"email Alpaca support for a 'Do Not Exercise' before 3 pm ET. (Alpaca handles puts itself.)")
+                self.write(msg, "bad")
+                try:
+                    messagebox.showwarning("Expiry today", msg)
+                except tk.TclError:
+                    pass
+
+    def is_day_trade(self, c):
+        """Was this contract bought today (New York date)? Selling it today would be a day trade."""
+        t = self.bought_at.get(c)
+        return bool(t) and E.ny_date(t) == E.ny_date(time.time())
+
+    def pdt_info(self):
+        """(day trades in the last 5 business days, account equity or None, who said so)."""
+        a = getattr(self, "acct_info", None) or {}
+        if self.broker() == "ibkr" and E.IB.connected():
+            try:
+                left = E.IB.day_trades_left()
+                eq = E.IB.equity()
+                if left is not None:
+                    return max(0, 3 - left), eq, "IBKR"
+            except Exception:
+                pass
+        if a.get("daytrade_count") is not None:
+            try:
+                return int(a["daytrade_count"]), float(a.get("equity") or 0) or None, "Alpaca"
+            except (TypeError, ValueError):
+                pass
+        # our own count: live buys and sells of the same contract on the same day, last 5 business days
+        days = set()
+        d = E.ny_date(time.time())
+        while len(days) < 5:
+            if d.weekday() < 5:
+                days.add(d.isoformat())
+            d -= timedelta(days=1)
+        opened = {}
+        n = 0
+        for t in self.trades:
+            if t.get("mode") != "live" or str(t.get("time", ""))[:10] not in days:
+                continue
+            k = (t["coin"], str(t["time"])[:10])
+            if t["side"] == "buy":
+                opened[k] = True
+            elif opened.get(k):
+                n += 1
+        return n, self.equity() if self.live else None, "OBF's own count"
+
+    def pdt_blocked(self):
+        if not self.settings.get("pdt_guard", True) or not self.live:
+            return False
+        n, eq, _ = self.pdt_info()
+        return n >= 3 and (eq is None or eq < 25000)
+
     # ---------------- disk use ----------------
     def open_disk(self):
         """What OBF keeps on disk and how much it has written since it started."""
@@ -6856,7 +7019,7 @@ class App:
             if q <= 0 or c in self.pending:
                 continue
             o = self.opt.get(c)
-            if o and time.time() >= o["exp"] - 86400:
+            if o and self.near_expiry(o):
                 self.sell(c, self.last.get(c, 0), "expiry")
                 continue
             val = self.position_price(c)
@@ -6927,6 +7090,12 @@ class App:
         if self.live:
             if spend < MIN_LIVE_ORDER:
                 return
+            if self.pdt_blocked():
+                if time.time() - self._pdt_note.get("_open", 0) > 1800:
+                    self._pdt_note["_open"] = time.time()
+                    self.write("No new contracts today: the account has used its 3 day trades for this 5-day window and is "
+                               "under $25,000, so a new contract couldn't be sold today if it went wrong.", "warn")
+                return
             self.cash -= spend  # reserved until the fill comes back
             self.pending.add(c)
             self.executor.submit(self.live_open, c, typ, S, spend, dte, otm, reason)
@@ -6938,6 +7107,19 @@ class App:
         T = max(0.0, exp - time.time()) / E.YEAR
         vol = E.IV_HINT.get(c) or E.realized_vol(self.hist.get(c) or [S], (self.hx.get(c) or {}).get("t"))
         prem = E.bs_price(S, K, T, vol, typ) * E.CONTRACT
+        if (E.PREM_RANGE[0] or E.PREM_RANGE[1]) and not E.prem_ok(prem / E.CONTRACT):
+            cheaper = 1 if typ == "call" else -1  # walk the strike into the price range
+            way = cheaper if (E.PREM_RANGE[1] and prem / E.CONTRACT > E.PREM_RANGE[1]) else -cheaper
+            for _ in range(60):
+                K += way * step
+                if K <= 0:
+                    break
+                prem = E.bs_price(S, K, T, vol, typ) * E.CONTRACT
+                if E.prem_ok(prem / E.CONTRACT):
+                    break
+            if K <= 0 or not E.prem_ok(prem / E.CONTRACT):
+                return
+            o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(c, exp, typ, K))
         fee, slip = E.cost_model(self.settings)
         fill = prem * (1 + max(slip, 0.02))
         if fill <= 1:
@@ -6945,14 +7127,14 @@ class App:
         qty = int(spend // fill)
         if qty < 1 and fill <= min(self.cash * 0.3, spend * 2.5):
             qty = 1
-        cost = qty * fill * (1 + fee)
+        cost = qty * fill * (1 + fee) + qty * E.CONTRACT_FEE[0]
         if qty < 1 or cost > self.cash:
             if time.time() - getattr(self, "_afford_note", 0) > 900:
                 self._afford_note = time.time()
                 self.write(f"Skipped a {typ} on {c}: one contract costs ${fill:,.0f}, more than this trade's size allows. "
                            f"(Raise Trade size, or give the bots more practice money.)", "warn")
             return
-        self.fees_paid += qty * fill * fee + qty * prem * max(slip, 0.02)
+        self.fees_paid += qty * fill * fee + qty * prem * max(slip, 0.02) + qty * E.CONTRACT_FEE[0]
         self.cash -= cost
         self.opt[c] = o
         self.pos[c] = qty
@@ -6964,6 +7146,13 @@ class App:
         qty = self.pos.get(c, 0)
         if qty <= 0 or c in self.pending:
             return
+        if self.live and reason not in self.SAFETY_EXITS and self.is_day_trade(c) and self.pdt_blocked():
+            if time.time() - self._pdt_note.get(c, 0) > 1800:
+                self._pdt_note[c] = time.time()
+                self.write(f"Holding {self.contract_label(c)} until tomorrow: selling it today would be a 4th day trade "
+                           f"in 5 business days, and the account is under $25,000 (Settings > Basics > Day-trade guard). "
+                           f"Safety stops and expiry still sell it.", "warn")
+            return
         if self.live:
             self.pending.add(c)
             self.executor.submit(self.live_close, c, qty, reason)
@@ -6973,8 +7162,8 @@ class App:
         expired = o and time.time() >= o.get("exp", 0)
         fee, slip = E.cost_model(self.settings)
         fill = value if expired else value * (1 - max(slip, 0.02))
-        proceeds = qty * fill * (1 - (0 if expired else fee))
-        self.fees_paid += 0 if expired else qty * value * max(slip, 0.02) + qty * fill * fee
+        proceeds = qty * fill * (1 - (0 if expired else fee)) - (0 if expired else qty * E.CONTRACT_FEE[0])
+        self.fees_paid += 0 if expired else qty * value * max(slip, 0.02) + qty * fill * fee + qty * E.CONTRACT_FEE[0]
         pl = proceeds - self.cost.get(c, 0)
         self.cash += proceeds
         label = self.contract_label(c)
@@ -7207,7 +7396,8 @@ class App:
                 f"Options can lose their whole value, and automated strategies can lose money.{warn}\nType LIVE to continue:")
             return (ans or "").strip() == "LIVE"
         try:
-            lvl = int(float((E.alp_account() or {}).get("options_trading_level") or 0))
+            self.acct_info = E.alp_account() or {}
+            lvl = int(float(self.acct_info.get("options_trading_level") or 0))
         except Exception:
             lvl = None
         if lvl is not None and lvl < 2:
@@ -7254,7 +7444,14 @@ class App:
             d0 = datetime.fromtimestamp(now + max(1, dte - 10) * 86400).strftime("%Y-%m-%d")
             d1 = datetime.fromtimestamp(now + (dte + 21) * 86400).strftime("%Y-%m-%d")
             chain = E.option_chain(c, d0, d1, typ, S * 0.75, S * 1.25)
-            pick = E.pick_contract(chain, S, typ, dte, otm, now)
+            try:
+                oi = E.option_oi(c, d0, d1, typ) if int(self.settings.get("min_oi", 0) or 0) else {}
+            except Exception:
+                oi = {}
+            for r_ in chain:
+                if r_["symbol"] in oi:
+                    r_["oi"] = oi[r_["symbol"]]
+            pick = E.pick_contract(chain, S, typ, dte, otm, now, **self.pick_rules())
             if not pick:
                 rng = E.prem_range_text()
                 raise RuntimeError(f"no {typ} contracts with prices near what the bots want"
@@ -7326,16 +7523,22 @@ class App:
                 now = time.time()
                 d0 = datetime.fromtimestamp(now + max(1, dte - 10) * 86400).strftime("%Y-%m-%d")
                 d1 = datetime.fromtimestamp(now + (dte + 21) * 86400).strftime("%Y-%m-%d")
-                pick = E.pick_contract(E.option_chain(c, d0, d1, typ, S * 0.75, S * 1.25), S, typ, dte, otm, now)
+                pick = E.pick_contract(E.option_chain(c, d0, d1, typ, S * 0.75, S * 1.25), S, typ, dte, otm, now,
+                                       **self.pick_rules())
             except Exception:
                 pick = None
             if pick:
                 exp, K = pick["exp"], pick["K"]
             else:
                 exp, K = E.IB.pick(c, S, typ, dte, otm)
+                if E.sessions_left(exp) <= int(self.settings.get("expiry_days", 2) or 2):
+                    raise RuntimeError("the nearest contract expires too soon for the expiry guard")
             bid, ask, _ = E.IB.quote(c, exp, typ, K)
             if not ask and pick:
                 ask = pick["ask"]
+            mx = float(self.settings.get("max_spread_pct", 0) or 0)
+            if mx and bid and ask and (ask - bid) / ((ask + bid) / 2) * 100 > mx:
+                raise RuntimeError(f"the bid/ask gap is too wide right now (${bid:.2f} / ${ask:.2f})")
             if not ask:
                 raise RuntimeError("IBKR has no price for that contract right now")
             qty = int(spend // (ask * E.CONTRACT))
@@ -7444,6 +7647,8 @@ class App:
                 return messagebox.showerror("IBKR", "The client ID must be a number (any number not used by another app).", parent=w)
             self.cfg.update(ib_port_label=port.get(), ib_host=host.get().strip() or "127.0.0.1", ib_client=cid_,
                             ib_auto=bool(auto.get()), ib_quotes=bool(ibq.get()), broker="ibkr" if use.get() else "alpaca")
+            self.settings["_broker"] = self.cfg["broker"]
+            E.tournament_opts(self.settings)
             E.save_json(CONFIG_PATH, self.cfg)
             res.config(text="Connecting...", foreground=MUTED)
             self.ib_connect(lambda ok, msg: res.config(text=msg, foreground=GREEN if ok else RED) if w.winfo_exists() else None)
@@ -7484,6 +7689,8 @@ class App:
             return messagebox.showinfo("IBKR", "Stop trading first.")
         E.IB.disconnect()
         self.cfg["broker"] = "alpaca"
+        self.settings["_broker"] = "alpaca"
+        E.tournament_opts(self.settings)
         E.save_json(CONFIG_PATH, self.cfg)
         self.update_status()
         self.write("Disconnected from Interactive Brokers. LIVE mode trades through Alpaca again.")
