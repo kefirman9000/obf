@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.7.2
+- Diagnostics (Tools > System) no longer copies itself to your clipboard when you open it; press Copy all.
+- A hint that still pointed to the old Backtest menu now points to Tools > Learning.
+
 ## 1.7.1
 - Free roam always starts OFF when OBF opens, even if it was on when you closed it. It only studies after you switch
   it on.

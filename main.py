@@ -2802,7 +2802,7 @@ class App:
             self.verdict_lbl.config(text=f"The bot is ahead of just holding by ${gap:,.2f}.", fg=GREEN)
         else:
             self.verdict_lbl.config(text=f"The bot is behind just holding by ${-gap:,.2f}. That's common, "
-                                         f"check the Backtest in the Tools menu.", fg=RED)
+                                         f"test the bots under Tools > Learning.", fg=RED)
         if self.session:
             last = self.trades[-1] if self.trades else None
             lt = (f" (last: {last['side'].upper()} {last['coin']} at {str(last.get('time', ''))[11:16]})" if last else "")
@@ -3478,7 +3478,6 @@ class App:
             btn.config(text="Copied")
         btn = ttk.Button(w, text="Copy all", command=copy)
         btn.pack(pady=(0, 8))
-        copy()
 
     def on_cb_error(self, exc, val, tb):
         import traceback
