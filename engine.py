@@ -5306,7 +5306,7 @@ def changelog_since(text, current):
     return "\n".join(out).strip()
 
 
-UPDATE_FILES = re.compile(r"^(?:[\w.-]+\.py|VERSION|README\.md|CHANGELOG\.md|requirements\.txt|[\w .-]+\.bat)$")
+UPDATE_FILES = re.compile(r"^(?:[\w.-]+\.pyw?|VERSION|README\.md|CHANGELOG\.md|requirements\.txt|[\w .-]+\.bat)$")
 
 
 def install_update(zip_bytes, here, current_version):

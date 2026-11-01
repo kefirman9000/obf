@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.10.1
+- **No more black command window**: Run OBF.bat now starts OBF with Python's windowless version and closes right away.
+  There's also a new OBF.pyw in the folder: double-click it to start with no window flashing at all (you can pin a
+  shortcut to it). If Python can't start OBF, a message box explains why instead of the command window.
+
 ## 1.10.0
 - **Tickers that move together**: the account never puts more than 50% of your money (adjustable) into calls, or into
   puts, on tickers whose prices have been moving in step (SPY and QQQ often move as one).
