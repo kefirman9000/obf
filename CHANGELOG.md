@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.9.0
+- **Update alerts on the icon**: while OBF runs in the background it still checks for updates and shows a small note
+  when one is out. Nothing installs until you open OBF and say yes.
+- **Daily recap**: once a day, a short note on how the bots did vs just holding, plus new BEASTS (on the icon and in
+  the log). Settings > "Daily recap".
+- **Learning from its own losses**: when one never-rule would have stopped at least 3 of a bot's losing buys and
+  clearly fewer of its winners, the bot takes that rule on itself during its lifetime. It's graded afterwards like
+  every other rule. Settings > Learning > "Learn from its own losses".
+- **Ready for LIVE? checklist** (Account menu): plain evidence that the practice farm is ready: time spent learning,
+  Winning bots, beating holding, enough trades, twin test passed, no deep slump, and the account itself ahead.
+- **Weekly backup**: once a week a copy of your bots, farms, sessions and settings goes into your data folder under
+  auto-backups (the last 4 are kept, no keys, price history left out to keep them small). Settings > "Weekly backup".
+- **New from CBBF**: bots can learn to skip the opening or closing rush (never opens a contract in the first or last
+  minutes of the trading day, graded in hindsight), and the account trades bigger when several different strategies
+  agree, smaller when the farm is split. "Sell in parts" was left out: a contract can't be split in half.
+
 ## 1.8.1
 - When Windows signs out or shuts down, OBF now saves the whole farm and session first, so the bots pick up
   from that exact point next time (before, up to 5 minutes of learning could be lost).
