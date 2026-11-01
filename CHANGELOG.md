@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.6
+- **Luck check**: a bot's score now counts for less while it rests on only a few trades (3 trades counts about a
+  third, 40 trades almost fully). This applies to which bots steer your account and which ones breed, so a few lucky
+  trades can't fill the farm with copies. Settings > Learning > "Luck check".
+
 ## 1.7.5
 - **Snappier window**: background work (Free roam, warm-up, history loading) no longer makes the window stutter.
   The longest freezes while Free roam runs dropped from about 1.5 seconds to under 0.2.

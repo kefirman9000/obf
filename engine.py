@@ -1569,6 +1569,7 @@ DEFAULT_SETTINGS = {
     "vetoes": True,              # bots can evolve never-rules, each graded by what the blocked trade would have done
     "prove_live": True,          # a bot can only be Winning after it also made money on prices it hadn't seen yet
     "risk_adjusted": True,       # rank winners by gain per unit of downside swing, not raw gain
+    "luck_check": True,          # a bot's score counts for less when it rests on only a few trades
     "long_holds": True,          # include slow, longer-holding bots from the start
     "min_hold_min": 0.0,         # account: minutes to hold before a strategy signal may sell (stops still sell)
     "fee_aware": True,           # don't sell for a profit smaller than the round-trip fees (losses and stops still sell)
@@ -2056,7 +2057,7 @@ def tournament_opts(settings):
                 crossbreed=bool(settings.get("crossbreed", True)),
                 regime_aware=bool(settings.get("regime_aware", True)),
                 slip=slip, fee_aware=bool(settings.get("fee_aware", True)),
-                prove_live=bool(settings.get("prove_live", True)), risk_adjusted=bool(settings.get("risk_adjusted", True)),
+                prove_live=bool(settings.get("prove_live", True)), risk_adjusted=bool(settings.get("risk_adjusted", True)), luck_check=bool(settings.get("luck_check", True)),
                 classics=bool(settings.get("classics", True)), classic_rate=float(settings.get("classic_rate", 25)) / 100,
                 vetoes=bool(settings.get("vetoes", True)), layers=bool(settings.get("layers", True)),
                 long_holds=bool(settings.get("long_holds", True)),
@@ -2229,6 +2230,14 @@ def _veto(v, k, x, c, closes, n, extra, coins):
     if k == "panic":
         return (p[-1] / p[-2] - 1) * 100 <= -x
     return False
+
+
+def luck_factor(v):
+    """0..1: how much to trust a bot's score given how many trades it rests on. 3 trades = mostly luck,
+    40 trades = mostly skill. Slow bots trade rarely by design, so they need fewer."""
+    n = len(v.sim.tbars)
+    k = 6 if v.tf < 10 else 2
+    return n / (n + k) if n else 0.0
 
 
 def _grade_vetoes(v, closes, n):
@@ -3327,6 +3336,8 @@ class Tournament:
                 w *= 1 + v.power / 10  # proven power: a bigger say
             if w > 0 and v.twin is not None and v.twin <= 0:
                 w *= 0.6  # failed its twin test: probably lucky, so it counts for less
+            if w > 0 and o.get("luck_check", True):
+                w *= luck_factor(v)  # a great score from a handful of trades counts for less than one from many
             if w > 0 and o["regime_aware"]:
                 fit = self.mood_fit(v)
                 if fit is not None:
@@ -3359,6 +3370,9 @@ class Tournament:
 
     def ranking(self):
         r = [(v, self.score(v)) for v in self.vars]
+        if self.o.get("luck_check", True):  # breeding and culling also trust long records over short lucky ones
+            return sorted([x for x in r if x[1] is not None],
+                          key=lambda x: -(x[1] * luck_factor(x[0]) if x[1] > 0 else x[1]))
         return sorted([x for x in r if x[1] is not None], key=lambda x: -x[1])
 
     def drivers(self):

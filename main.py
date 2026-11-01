@@ -176,6 +176,7 @@ SETTING_GROUPS = [
                         "which isn't in the free data feed)", "tickers"),
         ("vetoes", "Never-rules: things a bot refuses to do, each graded in hindsight", bool),
         ("adapt_exits", "Adaptive stops: wider in wild markets, tighter in calm ones", bool),
+        ("luck_check", "Luck check: a bot's great score counts for less while it rests on only a few trades", bool),
         ("confidence_sizing", "Confidence sizing: bigger when its studies clearly agree", bool),
         (None, "Memory", "head"),
         ("seasons", "Seasons: a champion per market mood, woken when that mood returns", bool),
