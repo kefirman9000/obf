@@ -720,7 +720,7 @@ class App:
         root.after(4000, self.auto_check_update)
         root.after(1200, self.restore_last_session)
         root.after(90000, self.hourly)  # weekly backup, daily recap
-        root.after(3500 if self.tray_mode else 2500, self.tray_autotrain if self.tray_mode else self.auto_resume)
+        root.after(120000 if self.tray_mode else 2500, self.tray_autotrain if self.tray_mode else self.auto_resume)  # tray: let Windows finish starting first
         self.fit_and_center()
         if self.tray_mode:
             root.withdraw()
@@ -1091,7 +1091,13 @@ class App:
         if hide:
             self.hide_to_tray(quiet=quiet)
 
+    def bg_workers(self):
+        """Processor cores for the start-up warm-up: just one while running as the icon (barely noticeable),
+        all of them with the window open. Safe to call from background threads (reads a plain flag)."""
+        return 1 if getattr(self, "_in_tray", False) else None
+
     def hide_to_tray(self, quiet=False):
+        self._in_tray = True
         self.root.withdraw()
         self.apply_awake()
         if not quiet and not getattr(self, "_tray_told", False):
@@ -1100,6 +1106,7 @@ class App:
         self.write("Running in the background (icon by the clock).")
 
     def show_window(self):
+        self._in_tray = False
         self.root.deiconify()
         self.root.lift()
         try:
@@ -1179,6 +1186,29 @@ class App:
         else:
             self.write("Couldn't change the Windows start-up setting.", "bad")
         self.tray_tick(loop=False)
+
+    def menu_autostart(self):
+        """File > Start with Windows. Sets up the icon add-on first if it isn't installed yet."""
+        T = self.tray_lib()
+        want = bool(self._autostart_var.get())
+        if T is None:
+            self._autostart_var.set(False)
+            return messagebox.showerror("Start with Windows", f"tray.py is missing from the {APP_SHORT} folder. Updating puts it back.")
+        if want and not T.tray_ready():
+            self._autostart_var.set(False)
+            if not messagebox.askyesno("Start with Windows", f"Starting with Windows runs {APP_SHORT} as a small icon by the clock, "
+                                       "which needs two small add-ons (pystray and pillow).\n\nInstall them now?"):
+                return
+            self.write("Installing the add-ons for background mode...")
+
+            def work():
+                ok, msg = E.install_packages(T.TRAY_PIP, lambda line: None)
+                self.q.put(("call", lambda: (self._autostart_var.set(True), self.menu_autostart()) if ok and T.tray_ready()
+                            else self.write("Background mode couldn't be set up: " + msg, "bad")))
+            threading.Thread(target=work, daemon=True).start()
+            return
+        if T.autostart_enabled(APP_SHORT) != want:
+            self.tray_autostart()
 
     def tray_quit(self):
         self._quitting = "tray"
@@ -1581,6 +1611,12 @@ class App:
         m.add_separator()
         m.add_command(label="Reset...", command=self.open_reset)
         m.add_command(label="Run in the background (icon by the clock)", command=self.go_background)
+        if sys.platform.startswith("win"):
+            self._autostart_var = tk.BooleanVar(value=False)
+            m.add_checkbutton(label="Start with Windows (as the icon, practice training only)",
+                              variable=self._autostart_var, command=self.menu_autostart)
+            m.configure(postcommand=lambda: self._autostart_var.set(bool((T := self.tray_lib()) and
+                                                                          T.autostart_enabled(APP_SHORT))))
         m.add_command(label="Quit", command=lambda: (setattr(self, "_quitting", True), self.on_close()))
         bar.add_cascade(label="File", menu=m)
         m = tk.Menu(bar, tearoff=0)
@@ -3637,7 +3673,7 @@ class App:
                 self.q.put(("log", f"Warming up {opts['islands']} islands on several processor cores..."))
                 tourn = E.warm_islands(coins, self.start_cash, fee, pct, evolve, self.settings["params"], opts,
                                        int(self.settings["max_bots"]), self.retire_steps(bar_min), hist, hx_all,
-                                       log=lambda m: self.q.put(("log", m)))
+                                       log=lambda m: self.q.put(("log", m)), workers=self.bg_workers())
             if tourn is None:
                 tourn = E.Tournament(coins, self.start_cash, fee, pct, evolve, params=self.settings["params"],
                                      opts=opts, cap=int(self.settings["max_bots"]),
@@ -6100,7 +6136,7 @@ class App:
                     sl["status"] = f"Warming up on {L} hours of history..."
                     t = None
                     if self.settings.get("multicore", True) and opts.get("islands", 1) > 1:
-                        t = E.warm_islands(coins, cash, fee, pct, 24, self.settings["params"], dict(opts), cap, 24 * 14, hist, hx)
+                        t = E.warm_islands(coins, cash, fee, pct, 24, self.settings["params"], dict(opts), cap, 24 * 14, hist, hx, workers=self.bg_workers())
                         if t is not None:
                             t.risk_caps = dict(E.SLOW_RISK)
                             t.W = 72
