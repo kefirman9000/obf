@@ -1589,6 +1589,7 @@ DEFAULT_SETTINGS = {
     "min_oi": 50,                # LIVE: skip contracts with fewer open contracts than this (0 = off)
     "prem_min": 0.0,             # contract price range the bots may buy, $ per share (0 = no limit)
     "prem_max": 0.0,
+    "max_group_pct": 50,         # never more than this % of your money in calls (or puts) on tickers that move together
     "slippage": 2.0,             # % of the premium lost to the bid/ask spread on each option fill (Practice)
     "order_type": "market",      # (options always use limit orders at the bid / ask; kept for old settings files)
     "maker_fee_pct": 0.4,        # fee for limit orders that rest on the book (Practice)

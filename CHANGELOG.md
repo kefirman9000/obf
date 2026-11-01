@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.10.0
+- **Tickers that move together**: the account never puts more than 50% of your money (adjustable) into calls, or into
+  puts, on tickers whose prices have been moving in step (SPY and QQQ often move as one).
+  Settings > Basics > "Tickers that move together".
+
 ## 1.9.1
 - **Start with Windows** is now also in the File menu (it was only on the icon). It runs OBF as the icon by the clock,
   training on practice prices only. It sets up the icon add-on first if needed.

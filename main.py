@@ -114,6 +114,8 @@ SETTING_GROUPS = [
                "Lock in profit take over; these numbers are then the fallback. Fees are always counted.", [
         ("trade_pct", "Trade size: each buy spends this % of your starting money. Example: 10 with $1,000 = $100 per buy "
                       "(winning bots can scale this up to their trade-size multiplier)", float),
+        ("max_group_pct", "Tickers that move together: never have more than this % of your starting money in calls (or puts) "
+                          "on a group of tickers whose prices have been moving in step (0 = off)", float),
         ("max_coin_pct", "Limit per ticker: never have more than this % of your starting money in any single ticker's "
                          "contracts. Example: 50 with $1,000 = at most $500 on SPY", float),
         ("stop_loss", "Safety stop: automatically sell a contract if it falls this % below the price you paid. "
@@ -7849,12 +7851,47 @@ class App:
         top = max(voters, key=lambda v: self.tourn.info.get(id(v), {}).get("weight", 0))
         return dict(top.traits)
 
+    def group_room(self, c, typ, spend):
+        """Tickers that move together: the account never puts more than max_group_pct of its money into calls (or puts)
+        on a group of tickers whose prices have been moving in step (SPY and QQQ often move as one)."""
+        pct = float(self.settings.get("max_group_pct", 0) or 0)
+        if pct <= 0 or spend <= 0:
+            return spend
+
+        def rets(k, n=120):
+            h = (self.hist.get(k) or [])[-n - 1:]
+            return [h[i] / h[i - 1] - 1 for i in range(1, len(h)) if h[i - 1]]
+
+        def corr(a, b):
+            n = min(len(a), len(b))
+            if n < 30:
+                return 0.0
+            a, b = a[-n:], b[-n:]
+            ma, mb = sum(a) / n, sum(b) / n
+            va, vb = sum((x - ma) ** 2 for x in a), sum((y - mb) ** 2 for y in b)
+            return sum((x - ma) * (y - mb) for x, y in zip(a, b)) / (va * vb) ** 0.5 if va > 0 and vb > 0 else 0.0
+        mine = rets(c)
+        group = [k for k in self.session_coins if k != c and self.pos.get(k, 0) > 0
+                 and (self.opt.get(k) or {}).get("type") == typ and corr(mine, rets(k)) >= 0.6]
+        if not group:
+            return spend
+        room = self.start_cash * pct / 100 - sum(self.cost.get(k, 0) for k in group)
+        if room < 1:
+            if time.time() - getattr(self, "_group_note", 0) > 900:
+                self._group_note = time.time()
+                self.write(f"Skipped a {typ} on {c}: it has been moving together with {', '.join(group)}, and {typ}s on "
+                           f"that group already use {pct:g}% of your money. (Settings > Basics > Tickers that move together)", "warn")
+            return 0.0
+        return min(spend, room)
+
     def open_option(self, c, typ, S, reason="signal", mult=1.0, genes=None):
         g = genes or {}
         mode = int(g.get("omode", 3) or 3)
         if (typ == "call" and mode == 2) or (typ == "put" and mode == 1):
             return
-        spend = self.trade_size(c, mult)
+        spend = self.group_room(c, typ, self.trade_size(c, mult))
+        if spend <= 0:
+            return
         dte, otm = int(g.get("odte", 14) or 14), float(g.get("otm", 1.0) or 1.0)
         if self.live:
             if spend < MIN_LIVE_ORDER:
