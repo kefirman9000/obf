@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.3
+- **Free roam only studies history that exists**: it checks each ticker's daily history first, so newly listed tickers
+  don't send it looking at years they didn't trade.
+- **Backtest and Training camp say what's there** ("XYZ: Mar 2024 to now"), and trim a stretch with a long hole in it.
+- **Test on any ticker**: Backtest and Training camp have a tickers box, up to 8, separate from what the farm trades.
+- **Smoother**: the chart redraws at most about once a second while prices tick, and bots share prepared candle
+  summaries (about 2x less work per price update with ~50 bots).
+
 ## 1.7.2
 - Diagnostics (Tools > System) no longer copies itself to your clipboard when you open it; press Copy all.
 - A hint that still pointed to the old Backtest menu now points to Tools > Learning.

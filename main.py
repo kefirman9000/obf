@@ -2502,7 +2502,22 @@ class App:
                         marks.append((t, px, side, False, ""))
         return series, marks, "px", c
 
+    def chart_tick(self):
+        """Price ticks redraw the chart at most about once a second (Light animations: every 2 s); clicks and
+        resizes still redraw at once. Most of the app's drawing time went into redrawing the same chart."""
+        gap = 2.0 if self.settings.get("animations", "Full") != "Full" else 1.0
+        since = time.time() - getattr(self, "_chart_at", 0)
+        if since >= gap:
+            self.draw_chart()
+        else:
+            self.later(self._chart_due, int((gap - since) * 1000) + 20)
+
+    def _chart_due(self):
+        if time.time() - getattr(self, "_chart_at", 0) >= 0.5:
+            self.draw_chart()
+
     def draw_chart(self):
+        self._chart_at = time.time()
         if self.in_bg():
             self._bg_dirty = True
             return
@@ -2814,7 +2829,7 @@ class App:
             return self.later(self.refresh_view, 300)
         self.ctx_card_refresh()
         self.refresh_prices()
-        self.draw_chart()
+        self.chart_tick()
         self.headline_lbl.config(text=self.headline())
 
     def refresh_board(self):
@@ -3925,8 +3940,23 @@ class App:
     def est_candles(start, end, gran):
         return int((end - start) / 86400 * 5 / 7 * E.bars_per_day(gran))
 
+    def test_coins_field(self, parent, prefix, default):
+        """A box for which tickers to test on (any ticker with history, not just the ones the farm trades)."""
+        var = tk.StringVar(value=self.cfg.get(prefix + "_coins") or ", ".join(default))
+        e = ttk.Entry(parent, textvariable=var, width=34)
+        Tip(e, "Any tickers, separated by commas, up to 8. For example: SPY, QQQ, AAPL, NVDA, MSFT, TSLA, AMD. The bots don't have to trade them "
+               "in your farm: this is just what they're tested on.")
+        return var, e
+
+    def parse_coins(self, text):
+        out = []
+        for x in re.split(r"[,\s;]+", (text or "").upper()):
+            if E.valid_coin(x) and x not in out:
+                out.append(x)
+        return out[:8]
+
     def load_stretch(self, coins, gran, start, end, note=None, max_bars=None):
-        """Past prices for these tickers between two dates, lined up bar by bar, with the watched context tickers.
+        """Past prices for these tickers between two dates, lined up bar by bar, with the watched tickers.
         -> (closes, extra, info)"""
         data = {}
         for c in coins:
@@ -3934,13 +3964,28 @@ class App:
                 note(f"Loading {c}...")
             d = E.fetch_range(c, gran, start, end, self.quote, note=note)
             if len(d["c"]) < 60:
-                raise RuntimeError(f"Not enough {c} history in that period ({len(d['c'])} candles). "
-                                   f"It may not have traded then, or pick a longer period or smaller candles.")
+                try:
+                    had = E.history_text(c, self.quote)
+                except Exception:
+                    had = f"{c} may not have traded then"
+                raise E.NoHistory(f"Not enough {c} history in that period ({len(d['c'])} candles). There's {had}. "
+                                  f"Pick a stretch inside that, or untick {c}.")
             data[c] = d
         closes, extra = E.common_stretch(data)
         L = len(next(iter(closes.values()))) if closes else 0
         if L < 60:
-            raise RuntimeError("These tickers share too few candles in that period.")
+            raise E.NoHistory("These tickers share too few candles in that period: " + "; ".join(
+                E.history_text(c, self.quote) for c in coins) + ".")
+        # a ticker that was suspended for a while leaves a hole: keep the longest unbroken stretch
+        t_ = next(iter(extra.values()))["t"]
+        a_, b_ = E.longest_run(t_, gran)
+        gap = (b_ - a_) < L
+        if gap:
+            closes = {c: x[a_:b_] for c, x in closes.items()}
+            extra = {c: {k: x[a_:b_] for k, x in d.items()} for c, d in extra.items()}
+            L = b_ - a_
+            if L < 60:
+                raise E.NoHistory("That stretch has a long hole in its history (a ticker wasn't trading for a while). Pick another stretch.")
         trimmed = bool(max_bars and L > max_bars)
         if trimmed:
             closes = {c: x[-max_bars:] for c, x in closes.items()}
@@ -3949,7 +3994,7 @@ class App:
             note("Loading the watched tickers...")
         self.add_ctx(extra, gran, 0, self.quote)
         t = next(iter(extra.values()))["t"]
-        return closes, extra, dict(start=t[0], end=t[-1], bars=len(t), trimmed=trimmed)
+        return closes, extra, dict(start=t[0], end=t[-1], bars=len(t), trimmed=trimmed, gap=gap)
 
     def period_picker(self, parent, prefix, default_len="1 month", default_candle="15 min"):
         """History length + candles + 'most recent' or 'starting on'. -> dict of tk variables."""
@@ -4024,7 +4069,9 @@ class App:
         r0.pack(fill="x")
         tk.Label(r0, text="Bot", bg=CARD, fg=TEXT).pack(side="left")
         ttk.Combobox(r0, textvariable=pick, values=names, state="readonly", width=58).pack(side="left", padx=8)
-        tk.Label(r0, text="on " + ", ".join(coins), bg=CARD, fg=MUTED).pack(side="left", padx=6)
+        tk.Label(r0, text="on", bg=CARD, fg=TEXT).pack(side="left", padx=(6, 4))
+        coins_var, ce = self.test_coins_field(r0, "bt", coins)
+        ce.pack(side="left")
         r1 = ttk.Frame(sc)
         r1.pack(fill="x", pady=(8, 0))
         per = self.period_picker(r1, "bt", "1 month", "15 min")
@@ -4105,6 +4152,11 @@ class App:
             except ValueError as e:
                 return messagebox.showerror("Backtest", str(e), parent=w)
             gran = per["gran"]()
+            picked = self.parse_coins(coins_var.get())
+            if not picked:
+                return messagebox.showerror("Backtest", "Type at least one ticker, like SPY.", parent=w)
+            coins[:] = picked
+            self.cfg["bt_coins"] = ", ".join(picked)
             per["save"]()
             go.config(state="disabled")
             pbar.start(12)
@@ -4390,6 +4442,11 @@ class App:
             ttk.Combobox(f, textvariable=var, values=vals, state="readonly" if lab not in ("Farm size",) else "normal",
                          width=wd).grid(row=r0 + 1, column=col, sticky="w", padx=(0, 14))
         coins = list(self.session_coins or [k for k, x in self.coin_vars.items() if x.get()] or ["SPY", "QQQ"])
+        cf_ = ttk.Frame(f)
+        cf_.grid(row=3, column=0, columnspan=6, sticky="w", pady=(0, 8))
+        ttk.Label(cf_, text="Tickers to train on").pack(side="left")
+        tc_coins, tce = self.test_coins_field(cf_, "tc", coins)
+        tce.pack(side="left", padx=8)
         note = ttk.Label(f, text="", foreground=MUTED)
         note.grid(row=6, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
@@ -4400,9 +4457,9 @@ class App:
                 return note.config(text="Write the start date like 2020-03-02.")
             n = self.est_candles(a, b, per["gran"]())
             cap = f" (only the latest {self.TC_MAX:,} are used: pick bigger candles for the whole period)" if n > self.TC_MAX else ""
-            note.config(text=f"Tickers: {', '.join(coins)}   |   about {min(n, self.TC_MAX):,} candles per ticker{cap}   |   "
+            note.config(text=f"Tickers: {', '.join(self.parse_coins(tc_coins.get()) or coins)}   |   about {min(n, self.TC_MAX):,} candles per ticker{cap}   |   "
                              f"about {min(n, self.TC_MAX) * int(passes.get() or 1):,} farm decisions in total")
-        for var in (per["length"], per["candle"], per["when"], per["date"], passes):
+        for var in (per["length"], per["candle"], per["when"], per["date"], passes, tc_coins):
             var.trace_add("write", update_note)
         update_note()
         row = ttk.Frame(f)
@@ -4444,6 +4501,11 @@ class App:
             except ValueError as e:
                 return messagebox.showerror("Training camp", str(e), parent=w)
             gran = per["gran"]()
+            picked = self.parse_coins(tc_coins.get())
+            if not picked:
+                return messagebox.showerror("Training camp", "Type at least one ticker, like SPY.", parent=w)
+            coins[:] = picked
+            self.cfg["tc_coins"] = ", ".join(picked)
             per["save"]()
             try:
                 n_pass = min(5, max(1, int(passes.get())))
@@ -4665,25 +4727,34 @@ class App:
             time.sleep(0.03 if kind == "test" else 0.004)  # someone's watching: let the trades scroll by
 
     def _roam_pick(self, rng, min_bars=400):
-        """The farm chooses where to learn: a candle size, then a stretch of history it has studied least (any time
-        back to 2016), downloads it if needed, and lines the tickers up."""
+        """The farm chooses where to learn: a candle size, then a stretch of history it has studied least, but only
+        stretches where every ticker really traded (checked against each ticker's daily history first)."""
         coins = list(self.session_coins)
         now = time.time()
         earliest = max(E.HIST_START, datetime(int(self.settings.get("roam_from", 2016)), 1, 4).timestamp())
         covered = [(x["start"], x["end"]) for x in self.roam_log[-150:]]
+        self.roam_now = dict(kind="Getting ready", phase="download", gran=None, coins=coins, start=None, end=None,
+                             text="Checking which stretches of history your tickers have", t0=time.time(), done=0, total=1)
+        days = [d for d in E.common_days(coins, self.quote) if d >= earliest - 86400]
+        self.roam_check_on()
+        if len(days) < 3:
+            raise E.NoHistory("Your tickers don't share enough history to study: "
+                              + "; ".join(E.history_text(c, self.quote) for c in coins))
+        dset = set(days)
         last_err = None
-        for _attempt in range(3):
+        for _attempt in range(4):
             gran = rng.choice(self.ROAM_CANDLES)
             n = rng.randint(min_bars, max(min_bars, 1500))
-            days = n / E.bars_per_day(gran) * 7 / 5 * 1.04
-            hi = now - days * 86400
-            if hi <= earliest:
-                a_opts = [earliest]
-                days = (now - earliest) / 86400
-            else:
-                a_opts = [rng.uniform(earliest, hi) for _ in range(10)]
-            best = min(a_opts, key=lambda a: sum(max(0, min(a + days * 86400, e) - max(a, s0)) for s0, e in covered))
-            a, b = best, min(now, best + days * 86400)
+            span = n / E.bars_per_day(gran) * 7 / 5 * 1.04 * 86400
+            span = min(span, (days[-1] - days[0]) + 86400)
+            # start days where the whole window has history (every ticker traded on at least 95% of its weekdays)
+            starts = [d for d in rng.sample(days, min(len(days), 60))
+                      if d + span <= now + 86400 and E.coverage(dset, d, d + span) >= 0.95]
+            if not starts:
+                last_err = E.NoHistory("no stretch that long where every ticker was trading")
+                continue
+            best = min(starts, key=lambda a: sum(max(0, min(a + span, e) - max(a, s0)) for s0, e in covered))
+            a, b = best, min(now, best + span)
             self.roam_now = dict(kind="Getting ready", phase="download", gran=gran, coins=coins, start=a, end=b,
                                  text=f"Fetching {E.fmt_bar(gran / 60)} candles for {self._when(a, True)} to {self._when(b, True)}",
                                  t0=time.time(), done=0, total=1)
@@ -4693,13 +4764,11 @@ class App:
                     max_bars=2500)
                 if info["bars"] >= min_bars // 2:
                     break
-                last_err = RuntimeError("too few candles there")
-            except RuntimeError as e:
-                if "history" not in str(e).lower() and "candles" not in str(e).lower():
-                    raise
+                last_err = E.NoHistory("too few candles there")
+            except E.NoHistory as e:
                 last_err = e
         else:
-            raise last_err or RuntimeError("couldn't find a stretch of history to study")
+            raise last_err or E.NoHistory("couldn't find a stretch of history to study")
         times = next(iter(extra.values()))["t"]
         span = len(times)
         hold = sum(closes[c][-1] / closes[c][0] for c in coins) / len(coins) - 1
