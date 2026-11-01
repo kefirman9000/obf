@@ -4785,11 +4785,12 @@ class App:
     def _when(ts, year=False):
         return datetime.fromtimestamp(ts).strftime("%b %d %Y" if year else "%b %d %Y %H:%M")
 
-    def _roam_finish(self, rec):
+    def _roam_finish(self, rec, cur=None):
         self.roam_log.append(rec)
         del self.roam_log[:-300]
         self.roam_n = getattr(self, "roam_n", 0) + 1
-        self.roam_now = None
+        if cur is None or self.roam_now is cur:  # a newer study may already be under way: leave its status alone
+            self.roam_now = None
         try:
             E.save_json(self.roam_path(), dict(n=self.roam_n, log=self.roam_log))
         except OSError:
@@ -4807,6 +4808,7 @@ class App:
         names = [E.bot_nickname(v.key()) for v in picks]
         self.roam_now = dict(info, kind="Self-test", phase="study", text=f"{len(picks)} bots are testing themselves",
                              bots=names, done=0, total=len(picks), t0=time.time())
+        cur = self.roam_now  # this study's own status (a newer study replaces self.roam_now)
         self.roam_feed.append(dict(kind="sep", text=f"Self-test on {self._when(info['start'], True)} to "
                                                     f"{self._when(info['end'], True)}  ({E.fmt_bar(info['gran'] / 60)} candles)"))
         fee, slip = E.cost_model(self.settings)
@@ -4814,12 +4816,12 @@ class App:
         for i, v in enumerate(picks):
             if self.tourn is not t:
                 return
-            self.roam_now.update(done=i, text=f"{names[i]} is testing itself ({i + 1} of {len(picks)})")
+            cur.update(done=i, text=f"{names[i]} is testing itself ({i + 1} of {len(picks)})")
 
             def prog(d, n, i=i):
                 self.roam_check_on(t)
-                if self.roam_now:
-                    self.roam_now["done"] = i + d / max(1, n)
+                if cur:
+                    cur["done"] = i + d / max(1, n)
             out.append((v, E.backtest_bot(v, closes, extra, self.start_cash, fee, self.settings["trade_pct"] / 100, slip,
                                           progress=prog,
                                           on_trade=lambda c, tr, ts, nm=names[i]: self._roam_feed(nm, c, tr, ts, "test"))))
@@ -4836,7 +4838,7 @@ class App:
             rec = dict(time=time.time(), kind="Self-test", start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=res,
                        summary=f"{good} of {len(res)} beat holding")
-            self._roam_finish(rec)
+            self._roam_finish(rec, cur)
             if False:
                 self.write(f"◇ Free roam: {len(res)} bots tested themselves on {self._when(info['start'], True)} to "
                            f"{self._when(info['end'], True)}; {good} beat holding. Lessons saved.")
@@ -4852,14 +4854,14 @@ class App:
         seeds = [E._genes(v) for v in lead]
         self.roam_now = dict(info, kind="Practice farm", phase="study", text="A practice farm is living through this stretch",
                              bots=[E.bot_nickname(v.key()) for v in lead], done=0, total=1, t0=time.time())
+        cur = self.roam_now  # this study's own status (a newer study replaces self.roam_now)
         self.roam_feed.append(dict(kind="sep", text=f"Practice farm on {self._when(info['start'], True)} to "
                                                     f"{self._when(info['end'], True)}  ({E.fmt_bar(info['gran'] / 60)} candles)"))
         fee, slip = E.cost_model(self.settings)
         names = {}
 
         def prog(done, total, text):
-            if self.roam_now:
-                self.roam_now.update(done=done, total=total, text=f"Practice farm: {text}")
+            cur.update(done=done, total=total, text=f"Practice farm: {text}")
 
         def on_trade(v, c, tr, ts):
             nm = names.get(id(v)) or names.setdefault(id(v), E.bot_nickname(v.key()))
@@ -4892,7 +4894,7 @@ class App:
                                  r["trades"]) for r in top],
                        passed=len(passed), graduate=grad,
                        summary=f"{gen} generations, {len(passed)} passed the exam" + (f"; {grad} joined your farm" if grad else ""))
-            self._roam_finish(rec)
+            self._roam_finish(rec, cur)
             if False:
                 self.write(f"◇ Free roam: a practice farm lived through {self._when(info['start'], True)} to "
                            f"{self._when(info['end'], True)}. {rec['summary']}.")

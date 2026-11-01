@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.7.4
+- Fixed: Free roam could stop with an error when one study's results were saved just as the next study began.
+
 ## 1.7.3
 - **Free roam only studies history that exists**: it checks each ticker's daily history first, so newly listed tickers
   don't send it looking at years they didn't trade.
