@@ -5272,7 +5272,9 @@ class App:
                     if time.time() - getattr(self, "_roam_last", 0) < wait:
                         continue
                     k += 1
-                    if k % 3 == 0:
+                    if self.cfg.get("roam_scalp", True) and t.scalpers() and k % 4 == 2:
+                        self._roam_scalp(t)
+                    elif k % 3 == 0:
                         self._roam_camp(t)
                     else:
                         self._roam_check(t)
@@ -5432,6 +5434,136 @@ class App:
                            f"{self._when(info['end'], True)}; {good} beat holding. Lessons saved.")
         self.q.put(("call", apply))
 
+    def _roam_scalp(self, t):
+        """Scalp roam: your best scalpers, plus a few new ones, try a whole trading day on 1-minute prices across many
+        tickers (with VIXY and SPY for their volatility gates). While the market is open that day is today, live;
+        otherwise a random past day the scalpers haven't studied yet. Lessons are saved; a new scalper that clearly
+        beats yours joins your farm."""
+        rng = random.Random()
+        live = False
+        try:
+            live = bool(self.client) and E.market_clock()["is_open"]
+        except Exception:
+            pass
+        uni = self.scan_universe()
+        tickers = list(dict.fromkeys(list(self.session_coins) + rng.sample(uni, min(len(uni), 14))))[:16]
+        covered = {r.get("day") for r in self.roam_log if r.get("kind") == "Scalp roam" and not r.get("live")}
+        earliest = max(E.HIST_START, datetime(int(self.settings.get("roam_from", 2016)), 1, 4).timestamp())
+        self.roam_now = dict(kind="Scalp roam", phase="download", gran=60, coins=tickers, start=None, end=None,
+                             text="Choosing a trading day for the scalpers", t0=time.time(), done=0, total=1)
+        cur = self.roam_now
+        day = None
+        for _attempt in range(8):
+            d = E.ny_date(time.time()) if live else E.ny_date(rng.uniform(earliest, time.time() - 86400))
+            if d.weekday() >= 5 or (not live and d.isoformat() in covered):
+                continue
+            day0 = E.ny_time(d.isoformat(), 9, 30)
+            close = day0 + 390 * 60
+            bars = {}
+            for i, sym in enumerate(tickers + ["VIXY", "SPY"]):
+                self.roam_check_on(t)
+                cur.update(start=day0, end=close, text=f"Loading 1-minute prices for {d:%b %d %Y}: {sym} ({i + 1} of {len(tickers) + 2})")
+                try:
+                    x = (E.fetch_ohlcv(sym, 60, 470, self.quote) if live
+                         else E.fetch_range(sym, 60, day0 - 4 * 86400, close + 60, self.quote))
+                except Exception:
+                    continue
+                keep = [j for j, tt in enumerate(x.get("t") or []) if tt <= close + 60][-470:]
+                if sum(1 for j in keep if x["t"][j] >= day0) >= (20 if live else 200):  # it really traded that day
+                    bars[sym] = {k: [x[k][j] for j in keep] for k in ("c", "h", "l", "v", "t")}
+            if len([c for c in bars if c not in ("VIXY",)]) >= 4:
+                day = d
+                break
+            if live:
+                break
+        if day is None:
+            raise E.NoHistory("no trading day with enough 1-minute prices for the scalp roam")
+        ctx = {k: dict(c=bars[k]["c"], t=bars[k]["t"]) for k in ("VIXY", "SPY") if k in bars}
+        if live and E.ivx_today():
+            ctx[E.IVX_KEY] = dict(c=[x[1] for x in E.ivx_today()], t=[x[0] for x in E.ivx_today()])
+        trade = {c: b for c, b in bars.items() if c in tickers}
+        genes = self.scan_genes()
+        ranked = [v for v, _ in t.ranking() if E.is_scalp(v.name)]
+        newbies = []
+        for j in range(4):  # a few new scalpers try out too: two tweaked from your best, two brand new
+            par = (ranked[0] if j == 0 else rng.choice(ranked[:4])) if ranked and j < 2 else None
+            nv = (t._new(par.name, t.mutate(par.name, par.params, 0.3), t.mutate_tf(par.tf), t.mutate_risk(par.risk),
+                         t.mutate_traits(par.traits), dict(par.vetoes), json.loads(json.dumps(par.layers)))
+                  if par else t._rand_scalper())
+            newbies.append(dict(E._genes(nv), uid=-(j + 1)))
+        allg = genes + newbies
+        who = {g["uid"]: E.bot_nickname(E.bot_key(g)) for g in allg}
+        day0 = E.ny_time(day.isoformat(), 9, 30)
+        close = day0 + 390 * 60
+        on_day = {c: [p for p, tt in zip(b["c"], b["t"]) if tt >= day0] for c, b in trade.items()}
+        on_day = {c: p for c, p in on_day.items() if len(p) > 2}
+        n_ = min(len(p) for p in on_day.values())
+        step = max(1, n_ // 300)
+        prev = [sum(p[i] / p[0] for p in on_day.values()) / len(on_day) for i in range(0, n_, step)]
+        t0_ = next(iter(trade.values()))["t"]
+        tday = [tt for tt in t0_ if tt >= day0]
+        hold = sum(p[-1] / p[0] for p in on_day.values()) / len(on_day) - 1
+        mood = E.market_mood(on_day.get("SPY") or next(iter(on_day.values())))[0]
+        cur.update(phase="study", start=day0, end=min(close, time.time()), bars=n_, preview=prev,
+                   preview_t=[tday[i] for i in range(0, min(n_, len(tday)), step)], bots=[who[g["uid"]] for g in allg],
+                   total=1, done=0, text=f"{len(allg)} scalpers are trading {len(trade)} tickers through {day:%a %b %d %Y}"
+                                         + (" (today, live)" if live else ""))
+        self.roam_feed.append(dict(kind="sep", text=f"Scalp roam on {day:%b %d %Y}" + (" (today)" if live else "")
+                                                    + f": {len(allg)} scalpers x {len(trade)} tickers (1-minute candles)"))
+        job = dict(bars=trade, genes=allg, day=day.isoformat(), ctx=ctx, feed=True,
+                   spread={k: list(v) for k, v in E.SPREAD_FIT.items()}, sspread=E.SCALP_SPREAD[0], iv=dict(E.IV_HINT))
+        res = self._scan_run(job)
+        self.roam_check_on(t)
+        for x in sorted(res.get("feed") or [], key=lambda x: x["t"]):  # its trades scroll by in the live list
+            self._roam_feed(who.get(x["uid"], x["who"]), x["c"], dict(x, contract=x.get("contract")), x["t"], "scalp")
+
+        def apply():
+            if self.tourn is not t:
+                return
+            if live:
+                self.scan_done(res)  # today's live results also fill the Scalp scan tab
+            by_uid = {v.uid: v for v in t.vars}
+            rows = []
+            for g in allg:
+                b = res["bots"].get(g["uid"]) or [0, 0, 0.0, 0.0]
+                pct = b[2] / b[3] * 100 if b[3] else 0.0
+                rows.append((g, b, pct))
+                v = by_uid.get(g["uid"]) if g["uid"] > 0 else None
+                if v is not None and not live:  # its record across past days (older days slowly count for less)
+                    rs = v.roam_scan or [0, 0, 0.0, 0.0]
+                    v.roam_scan = [round(rs[0] * 0.9 + b[0], 2), round(rs[1] * 0.9 + b[1], 2), rs[2] * 0.9 + b[2], rs[3] * 0.9 + b[3]]
+                    if b[0] >= 8 and b[2] > 0:  # a scalper that paid on a day it never saw: an elder for future eggs
+                        t.elders.append(dict(name=v.name, params=dict(v.params), tf=v.tf, edge=b[2] / b[3]))
+                        del t.elders[:-40]
+            mine = [(g, b, pct) for g, b, pct in rows if g["uid"] >= 0 and b[0] >= 10]
+            best_mine = max((pct for _, _, pct in mine), default=0.0)
+            new = sorted(((g, b, pct) for g, b, pct in rows if g["uid"] < 0 and b[0] >= 10 and pct > 0 and pct > best_mine),
+                         key=lambda x: -x[2])
+            grad = ""
+            if new and self.seeded and len(t.vars) < t.cap + 2:
+                g = new[0][0]
+                v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
+                                  note="Free roam scalp graduate:", tf=g["tf"], origin="free roam", risk=g["risk"],
+                                  traits=g["traits"], vetoes=g["vetoes"], layers=g["layers"])
+                if v:
+                    grad = E.bot_nickname(v.key())
+                    b = new[0][1]
+                    v.roam_scan = [b[0], b[1], b[2], b[3]]
+                    self.refresh_board()
+            tot = [sum(b[k] for _, b, _ in rows) for k in range(4)]
+            best_t = max(res["tickers"].items(), key=lambda kv: kv[1]["pl"] / kv[1]["paid"] if kv[1]["paid"] else -1e9, default=None)
+            top = sorted(rows, key=lambda x: -x[2])[:6]
+            rec = dict(time=time.time(), kind="Scalp roam", day=day.isoformat(), live=live, start=day0, end=close, gran=60,
+                       bars=n_, hold=round(hold * 100, 2), mood=mood, pl=tot[2], paid=tot[3], graduate=grad, passed=1 if grad else 0,
+                       results=[(who[g["uid"]], round(pct, 2), int(b[0])) for g, b, pct in top if b[0]],
+                       summary=(f"{int(tot[0])} scalps, {tot[1] / tot[0] * 100 if tot[0] else 0:.0f}% won, "
+                                f"{tot[2] / tot[3] * 100 if tot[3] else 0:+.1f}% on premium"
+                                + (f"; best ticker {best_t[0]} ({best_t[1]['pl'] / best_t[1]['paid'] * 100:+.1f}%)"
+                                   if best_t and best_t[1]["paid"] else "")
+                                + (f"; {grad} joined your farm" if grad else "")))
+            self._roam_finish(rec, cur)
+        self.q.put(("call", apply))
+
     def _roam_camp(self, t):
         """A practice farm (seeded with the farm's leaders) lives through the chosen stretch; your farm learns its
         lessons and adopts its best graduate."""
@@ -5542,6 +5674,13 @@ class App:
         tog = tk.Button(top, relief="flat", bd=0, padx=16, pady=5, cursor="hand2", font=("", 10, "bold"), fg="white",
                         activeforeground="white")
         tog.pack(side="left", padx=14)
+        scalp_var = tk.BooleanVar(value=bool(self.cfg.get("roam_scalp", True)))
+        sc_cb = ttk.Checkbutton(top, text="\u26a1 Scalp roams", variable=scalp_var,
+                                command=lambda: (self.cfg.__setitem__("roam_scalp", bool(scalp_var.get())),
+                                                 E.save_json(CONFIG_PATH, self.cfg)))
+        sc_cb.pack(side="left", padx=(0, 12))
+        Tip(sc_cb, "Every fourth study, your scalpers (and a few new ones) trade a whole day on 1-minute prices across "
+                   "many tickers: today while the market is open, a past day otherwise. Needs scalpers on the farm.")
         state_lbl = tk.Label(top, text="", bg=BG, fg=MUTED, font=("", 9), justify="left", anchor="w")
         state_lbl.pack(side="left", fill="x", expand=True)
 
@@ -5605,7 +5744,7 @@ class App:
         fr.pack(fill="x", pady=(4, 2))
         tk.Label(fr, text="Show", bg=BG, fg=MUTED).pack(side="left")
         flt = tk.StringVar(value="All")
-        ttk.Combobox(fr, textvariable=flt, values=["All", "Good finds", "Bad results", "Self-tests", "Practice farms"],
+        ttk.Combobox(fr, textvariable=flt, values=["All", "Good finds", "Bad results", "Self-tests", "Practice farms", "Scalp roams"],
                      state="readonly", width=14).pack(side="left", padx=6)
         lb = tk.Frame(t2, bg=BG)
         lb.pack(fill="both", expand=True)
@@ -5629,6 +5768,15 @@ class App:
             "graduate' (it still has to prove itself on live prices).\n"
             "   • Your farm also learns the practice farm's memory: its elders, season champions, post-trade review and "
             "which kinds of mutation made winners.\n\n"
+            "SCALP ROAM  (\u26a1, every fourth study when your farm has scalpers)  Your best scalpers and four new ones "
+            "(two tweaked from your best, two brand new) trade a whole day on 1-minute prices across about 16 tickers, "
+            "with VIXY and SPY for their volatility gates and real bid/ask costs. While the market is open the day is "
+            "today; otherwise it's a past day they haven't studied.\n"
+            "   • Each scalper's results across past days build up (older days count a little less): ones that keep paying "
+            "on tickers and days they never saw get a bigger say on your farm, ones that don't get less.\n"
+            "   • A scalper with 8+ winning scalps on a day becomes an ELDER, nudging future scalp eggs.\n"
+            "   • A new scalper that beats all of yours there (10+ scalps, in profit) joins your farm as a 'Free roam scalp "
+            "graduate'. For scalp roams, the % shown is the scalps' profit on the premium paid.\n\n"
             "HOW TO READ THE 'BEST TO WORST' TAB  Green bots beat holding in at least half their tests and on average: "
             "they're your strongest candidates for the Hall of Fame. Orange = mixed (could be luck). Red = usually worse "
             "than holding. 'Now' shows whether the bot is still in your farm. One good test can be luck; look for bots "
@@ -5676,6 +5824,8 @@ class App:
             res = r.get("results") or []
             if r["kind"] == "Practice farm":
                 return "good" if r.get("passed") else "bad"
+            if r["kind"] == "Scalp roam":
+                return "good" if r.get("pl", 0) > 0 else "bad"
             good = sum(1 for x in res if x[1] > 0)
             return "good" if good * 2 > len(res) else "bad" if good == 0 else "mixed"
 
@@ -5685,7 +5835,8 @@ class App:
             for r in reversed(self.roam_log[-300:]):
                 v_ = verdict(r)
                 if (f_ == "Good finds" and v_ != "good") or (f_ == "Bad results" and v_ != "bad") or \
-                        (f_ == "Self-tests" and r["kind"] != "Self-test") or (f_ == "Practice farms" and r["kind"] != "Practice farm"):
+                        (f_ == "Self-tests" and r["kind"] != "Self-test") or (f_ == "Practice farms" and r["kind"] != "Practice farm") or \
+                        (f_ == "Scalp roams" and r["kind"] != "Scalp roam"):
                     continue
                 ex = r["summary"] + (":  " + ",  ".join(f"{n} {e:+.1f}%" for n, e, _ in r.get("results", [])[:4]) if r.get("results") else "")
                 log.insert("", "end", tags=(v_,), values=(
@@ -10120,7 +10271,8 @@ class App:
                  text="Every 5 minutes while the market is open, your farm's best scalpers are tried on today's 1-minute "
                       "prices of many tickers (yours, your watchlist and the most-traded ones) with pretend money, real "
                       "bid/ask costs and their own exits. Scalpers that also win here get a bigger say on your farm; ones "
-                      "that only win on your own tickers get less. Nothing here trades your account.").pack(fill="x")
+                      "that only win on your own tickers get less. Nothing here trades your account. Free roam can also take your "
+                      "scalpers back to past trading days: switch on Free roam with \u26a1 Scalp roams ticked.").pack(fill="x")
         sp = tk.PanedWindow(parent, orient="vertical", bg=BG, sashwidth=5, bd=0)
         sp.pack(fill="both", expand=True, padx=6, pady=(2, 6))
         top, low = tk.Frame(sp, bg=CARD), tk.Frame(sp, bg=CARD)
@@ -10280,14 +10432,19 @@ class App:
                    spread={k: list(v) for k, v in E.SPREAD_FIT.items()}, sspread=E.SCALP_SPREAD[0],
                    iv=dict(E.IV_HINT), ctx=dict(ctx, **({E.IVX_KEY: dict(c=[x[1] for x in E.ivx_today()], t=[x[0] for x in E.ivx_today()])}
                                                          if E.ivx_today() else {})))
-        try:  # its own processor core, so the window never stutters
+        res = self._scan_run(job)
+        self.q.put(("call", lambda: self.scan_done(res)))
+
+    @staticmethod
+    def _scan_run(job):
+        """Runs a scalp scan on its own processor core (so the window never stutters), or here if that isn't possible."""
+        try:
             import concurrent.futures as cf
             import multiprocessing as mp
             with cf.ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn")) as ex:
-                res = ex.submit(E.scan_scalps, job).result(timeout=600)
+                return ex.submit(E.scan_scalps, job).result(timeout=900)
         except Exception:
-            res = E.scan_scalps(job)
-        self.q.put(("call", lambda: self.scan_done(res)))
+            return E.scan_scalps(job)
 
     def scan_done(self, res):
         self.scan.update(at=time.time(), res=res, status="")

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.14.0
+- **Scalp roams in Free roam**: Free roam now has a third kind of study next to Self-tests and Practice farms. Every
+  fourth study, your best scalpers plus four new ones (two tweaked from your best, two brand new) trade a whole day on
+  1-minute prices across about 16 tickers, with VIXY and SPY for their volatility gates and real bid/ask costs. While
+  the market is open the day is today, live; otherwise it's a random past day back to 2016 they haven't studied yet.
+  Their trades scroll by in Free roam's live list, and each day goes into the study log (filter: "Scalp roams").
+- **What scalp roams teach your farm**: each scalper's results across past days build up (older days count a little
+  less), so scalpers that keep paying on tickers and days they never saw get a bigger say, and ones that don't get less.
+  A scalper with 8+ winning scalps on a day becomes an elder for future scalp eggs, and a new scalper that beats all of
+  yours there (10+ scalps, in profit) joins your farm as a "Free roam scalp graduate". These records survive restarts.
+- Switch them on or off with "\u26a1 Scalp roams" at the top of the Free roam screen (on by default when your farm has
+  scalpers).
+
 ## 1.13.0
 - **Scalpers read volatility (VIX)**: every scalper now carries a volatility gate, chosen and evolved by the farm:
   only calm markets, only when volatility is rising, only spikes, never a spike, or ignore it. Some also widen their

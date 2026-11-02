@@ -3089,6 +3089,7 @@ class Variant:
         self.live_eq0 = None     # its equity when it started trading live (after any replay)
         self.log = deque(maxlen=300)  # (decision number, coin, side, price) of this bot's own trades, for charts
         self.log_ct = {}  # (decision, ticker) -> "call" / "put" of the contract traded there
+        self.roam_scan = None  # scalpers: [trades, wins, pl, paid] from Free roam's scalp roams on past days (fading)
         self.trade_eq = deque(maxlen=SCALP_JUDGE + 1)  # scalpers: (decision, equity) after each finished trade
 
     @property
@@ -3847,8 +3848,9 @@ class Tournament:
                 w *= 0.6  # failed its twin test: probably lucky, so it counts for less
             if w > 0 and o.get("luck_check", True):
                 w *= luck_factor(v)
-            scn = getattr(v, "scan", None)  # scalp scan: [trades, wins, pl, paid] on other tickers today
-            if w > 0 and scn and scn[0] >= 10 and scn[3] > 0:
+            scn = [a + b for a, b in zip(getattr(v, "scan", None) or [0, 0, 0.0, 0.0],
+                                         getattr(v, "roam_scan", None) or [0, 0, 0.0, 0.0])]  # [trades, wins, pl, paid]
+            if w > 0 and scn[0] >= 10 and scn[3] > 0:  # scalp scan today + scalp roams in the past, on other tickers
                 w *= 1.2 if scn[2] > 0 else 0.75  # a great score from a handful of trades counts for less than one from many
             if w > 0 and o["regime_aware"]:
                 fit = self.mood_fit(v)
@@ -4370,7 +4372,7 @@ class Tournament:
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
-                "backtests", "own_review")
+                "backtests", "own_review", "roam_scan")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -4881,7 +4883,7 @@ def slice_extra(extra, i):
 SCAN_CASH = 100000.0  # pretend money each scalper gets on each ticker it's tried on (big enough for one contract)
 
 
-def _scan_one(g, sym, bars, day_start, ctx=None):
+def _scan_one(g, sym, bars, day_start, ctx=None, feed=None):
     """Replays one scalper (plain genes) over one ticker's 1-minute bars. Only trades from day_start on count;
     earlier bars just warm up its indicators. ctx: {'VIXY': closes, 'SPY': closes} lined up with this ticker's bars, so
     its volatility gate and market studies see what they would have seen. -> dict of its day there."""
@@ -4902,6 +4904,9 @@ def _scan_one(g, sym, bars, day_start, ctx=None):
         if i < day_start:
             continue
         for _, t in made:
+            if feed is not None and len(feed) < 600:  # for Free roam's live trade list
+                feed.append(dict(t=bars["t"][i], who=g["name"], uid=g.get("uid", 0), c=sym, side=t["side"],
+                                 contract=t.get("contract"), price=t.get("price"), pl=t.get("pl"), usd=t.get("usd")))
             if t["side"] == "sell" and t.get("pl") is not None:
                 out["trades"] += 1
                 out["wins"] += t["pl"] > 0
@@ -4928,7 +4933,8 @@ def scan_scalps(job):
     if job.get("sspread"):
         SCALP_SPREAD[0] = float(job["sspread"])
     day0 = ny_time(job["day"], 9, 30)
-    res = dict(tickers={}, bots={}, now=[])
+    res = dict(tickers={}, bots={}, now=[], feed=[])
+    feed = res["feed"] if job.get("feed") else None
     for sym, bars in job["bars"].items():
         if len(bars.get("c") or ()) < WARM + 5:
             continue
@@ -4940,7 +4946,7 @@ def scan_scalps(job):
         tk_["regime"] = vol_regime({sym: bars["c"]}, {CTX_KEY: ctx}, sym)[0] if ctx else ""
         for g in job["genes"]:
             try:
-                r = _scan_one(g, sym, bars, start, ctx)
+                r = _scan_one(g, sym, bars, start, ctx, feed)
             except Exception:
                 continue
             pl = r["pl"] + (r["open"]["pl"] if r["open"] else 0.0)
