@@ -5390,12 +5390,38 @@ def save_json(path, obj):
     note_write(path, n)
 
 
+def _sess_tag(m):
+    """Which saved session: 'paper' (PRACTICE, inside OBF), 'alpaca' (ALPACA PAPER), 'ibkrpaper' (IBKR PAPER) or 'live'
+    (real money). Old callers pass True / False for live / practice."""
+    if m is True:
+        return "live"
+    if m in (False, None):
+        return "paper"
+    return str(m)
+
+
 def state_path(live):
-    return os.path.join(HOME_DIR, f"state-{'live' if live else 'paper'}.json")
+    return os.path.join(HOME_DIR, f"state-{_sess_tag(live)}.json")
 
 
 def farm_path(live):
-    return os.path.join(HOME_DIR, f"farm-{'live' if live else 'paper'}.json")
+    return os.path.join(HOME_DIR, f"farm-{_sess_tag(live)}.json")
+
+
+def migrate_paper_sessions(paper_login):
+    """Before 1.17 an Alpaca paper session was saved as the LIVE session. If the saved login is a paper key and there's
+    no ALPACA PAPER session yet, that session (and its farm) is moved to ALPACA PAPER, where it belongs."""
+    if not paper_login or os.path.exists(state_path("alpaca")):
+        return False
+    moved = False
+    for fn in (state_path, farm_path):
+        try:
+            if os.path.exists(fn(True)):
+                os.replace(fn(True), fn("alpaca"))
+                moved = True
+        except OSError:
+            pass
+    return moved
 
 
 def strategies_path():
