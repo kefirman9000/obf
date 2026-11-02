@@ -1507,7 +1507,7 @@ class App:
         tiles = tk.Frame(right, bg=BG)
         tiles.pack(fill="x")
         self.tiles = {}
-        for i, (key, title) in enumerate((("equity", "TOTAL VALUE"), ("pl", "PROFIT / LOSS"), ("day", "TODAY"), ("cash", "CASH LEFT"), ("hold", "IF YOU JUST HELD"))):
+        for i, (key, title) in enumerate((("equity", "TOTAL VALUE"), ("pl", "PROFIT / LOSS"), ("day", "TODAY"), ("cash", "CASH LEFT"), ("hold", "VS THE MARKET"))):
             f, c = self.card(tiles, title)
             f.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0))
             tiles.columnconfigure(i, weight=1)
@@ -1517,15 +1517,21 @@ class App:
             lbl = tk.Label(c, text="-", bg=CARD, fg=TEXT, font=("", 15, "bold"))
             lbl.pack(anchor="w")
             self.tiles[key] = lbl
+            if key in ("pl", "hold"):
+                sub = tk.Label(c, text="", bg=CARD, fg=MUTED, font=("", 7))
+                sub.pack(anchor="w")
+                self.__dict__.setdefault("tile_subs", {})[key] = sub
             if key == "day":
                 self.day_sub = tk.Label(c, text="", bg=CARD, fg=MUTED, font=("", 7))
                 self.day_sub.pack(anchor="w")
                 Tip(self.day_sub, "How much of today's loss limit is used up. At 100% the bot stops trading for the rest "
                                   "of the day (Settings > Basics > Daily loss limit).")
             Tip(lbl, {"equity": "Cash plus the current value of every coin you own.",
-                      "pl": "How much you've made or lost since you started.",
+                      "pl": "How much your account (practice or LIVE) has made or lost since this session started. The "
+                            "farm's own test trades are pretend and never count here.",
                       "cash": "Money not currently invested in a coin.",
-                      "hold": "How far the bot is ahead of (or behind) what you'd have made by buying once and doing nothing.",
+                      "hold": "Your account's profit/loss minus the market's: the market = your starting money split across "
+                              "your tickers at the start and left alone. Positive = your account did better (or lost less).",
                       "day": "How much your total value has changed since today began."}[key])
         self.root.after(50, self.apply_compact)
         self.verdict_lbl = tk.Label(right, text="", bg=BG, fg=MUTED, anchor="w", font=("", 10, "bold"))
@@ -1651,14 +1657,14 @@ class App:
         self.trade_count_lbl.pack(side="left")
         ttk.Button(trade_bar, text="Refresh", style="Plain.TButton",
                    command=self.refresh_trades).pack(side="right")
-        self.show_bots_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(trade_bar, text="Show every bot's test trades", variable=self.show_bots_var,
+        self.show_bots_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(trade_bar, text="Also show the farm's test trades (pretend, never your balance)", variable=self.show_bots_var,
                         command=self.refresh_trades).pack(side="right", padx=8)
         self.board.bind("<<TreeviewSelect>>", lambda e: self.soon(self._after_select))
         self.trade_tree = self.make_tree(
             t5, ("time", "mode", "side", "coin", "qty", "usd", "price", "pl", "who", "why"),
-            (125, 55, 55, 55, 105, 80, 90, 80, 200, 170),
-            ("Time", "Mode", "Action", "Contract", "Contracts", "Value ($)", "Price", "Profit / loss", "Strategy behind it", "Why"))
+            (125, 125, 55, 55, 105, 80, 90, 80, 200, 170),
+            ("Time", "Account", "Action", "Contract", "Contracts", "Value ($)", "Price", "Profit / loss", "Strategy behind it", "Why"))
         self.trade_tree.tag_configure("buy", foreground=GREEN)
         self.trade_tree.tag_configure("sell", foreground=RED)
         self.trade_tree.tag_configure("bot", foreground=MUTED)
@@ -2081,14 +2087,17 @@ class App:
             live_n = sum(str(r.get("mode", "")).lower() == "live" for r in rows)
             bot_n = sum(str(r.get("mode", "")).lower() == "bot" for r in rows)
             self.trade_count_lbl.config(
-                text=f"{len(rows)} trades  |  Your practice account: {paper_n}  |  Live: {live_n}  |  Bot tests: {bot_n}")
+                text=f"Your practice account: {paper_n} trades  |  Your LIVE account: {live_n}"
+                     + (f"  |  Farm tests (pretend): {bot_n}" if bot_n else ""))
         for r in rows[:1000]:
             side = str(r.get("side", "")).lower()
             pl = r.get("pl")
             try:
                 is_bot = str(r.get("mode", "")).lower() == "bot"
                 iid = t.insert("", "end", tags=("bot",) if is_bot else ("buy" if side == "buy" else "sell",), values=(
-                    str(r.get("time", "")).replace("T", " "), str(r.get("mode", "")).upper(),
+                    str(r.get("time", "")).replace("T", " "),
+                    {"paper": "PRACTICE ACCOUNT", "live": "LIVE ACCOUNT", "bot": "FARM TEST"}.get(str(r.get("mode", "")).lower(),
+                                                                                                str(r.get("mode", "")).upper()),
                     side.upper() if side in ("buy", "sell") else str(r.get("side", "")).upper(),
                     r.get("coin", ""),
                     f"{number(r.get('qty')):.6f}".rstrip("0").rstrip("."),
@@ -3195,9 +3204,16 @@ class App:
         return self.cash + sum(q * self.position_price(c) for c, q in self.pos.items())
 
     def bench_equity(self):
+        """What your starting money would be worth now if it had bought the session's tickers at the start (equal
+        shares) and kept them: 'the market'. A ticker with no price right now counts at its last known price."""
         if not self.bench_units:
             return self.equity()
-        return sum(u * self.last.get(c, 0) for c, u in self.bench_units.items())
+        share = self.start_cash / max(1, len(self.bench_units))
+        tot = 0.0
+        for c, u in self.bench_units.items():
+            px = self.last.get(c) or (self.hist.get(c) or [0])[-1] or (share / u if u else 0)
+            tot += u * px
+        return tot
 
     def refresh_view(self):
         eq = self.equity()
@@ -3213,6 +3229,12 @@ class App:
         self.tiles["equity"].config(text=f"${eq:,.2f}")
         pct = pl / self.start_cash * 100 if self.start_cash else 0.0
         self.tiles["pl"].config(text=f"{pl:+,.2f}  ({pct:+.2f}%)", fg=GREEN if pl >= 0 else RED)
+        subs = getattr(self, "tile_subs", {})
+        if "pl" in subs:
+            subs["pl"].config(text=("your LIVE account" if live else "your practice account") if self.session else "")
+        if "hold" in subs:
+            subs["hold"].config(text=(f"you {pl:+,.2f}   |   market {hold:+,.2f}" if self.session and self.curve and self.bench_units
+                                      else ""))
         self.tiles["cash"].config(text=f"${self.cash:,.2f}")
         lead = pl - hold
         if not self.session or not self.curve:
@@ -3256,8 +3278,10 @@ class App:
         if self.session:
             last = self.trades[-1] if self.trades else None
             lt = (f" (last: {last['side'].upper()} {last['coin']} at {str(last.get('time', ''))[11:16]})" if last else "")
-            self.activity_lbl.config(text=f"Bots made {len(self.shadow_trades)} practice trades inside the farm (they don't "
-                                          f"change your balance). Your account made {len(self.trades)} trades{lt}.")
+            self.activity_lbl.config(text=f"Your {'LIVE' if self.live else 'practice'} account made {len(self.trades)} trades{lt}: "
+                                          f"those are what the tiles above count. Separately, the farm's bots made "
+                                          f"{len(self.shadow_trades)} test trades with pretend money inside the farm "
+                                          f"(they never touch your balance).")
         else:
             self.activity_lbl.config(text="")
         if self.moving():
