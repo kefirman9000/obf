@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.12.0
+- **Scalps and long-term trades no longer trip over each other**: your account now keeps two books on every ticker, one
+  for scalps and one for long-term trades. Each follows only its own bots' votes, so a scalper's "sell" can never close a
+  long-term contract, and a scalp can open on SPY while a long-term SPY contract is held. The per-ticker limit counts
+  both, and LIVE never buys the same contract in both books. Scalps show as "(scalp)" everywhere.
+- **Scalp scan** (new tab): every 5 minutes while the market is open, your farm's best scalpers are tried on today's
+  1-minute prices of up to 30 tickers (yours, your watchlist and the most-traded ones), with pretend money and real
+  bid/ask costs. See where scalps are paying today, which setups are firing right now, and add a hot ticker to your list
+  in one click. Scalpers that also win out there get a bigger say on your farm; ones that only win on your own tickers
+  get less. It never trades your account. Needs the Alpaca login.
+- **Bot positions** (new tab): every bot's open pretend contracts on both farms, with what it paid, what it's worth now,
+  P/L in $ and %, how long it's held and its exit plan. Filter by farm or by scalpers / long-term.
+- **Calls and puts are labelled**: chart arrows say CALL or PUT, the farm's pop-ups say "BUY CALL!" / "SELL PUT!", and
+  trade notifications name the contract instead of just the ticker.
+- Fixed: your account's own trades now show on a ticker's chart (they were missing, because the trade said "SPY 680C"
+  instead of "SPY"), placed at the stock price.
+
 ## 1.11.0
 - **Scalpers: a new breed (wind dragons)**: fast in-and-out bots for the quick moves the long-term bots let pass.
   Five scalp instincts of their own: Micro pullback, Volume burst, VWAP reclaim, Range scalp and Quick flip.

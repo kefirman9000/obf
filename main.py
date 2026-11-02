@@ -50,6 +50,7 @@ import re
 import webbrowser
 import shutil
 import subprocess
+import random
 import threading
 import time
 import tkinter as tk
@@ -289,6 +290,32 @@ STATUS_TEXT = {"active": "Winning (following)", "slowed": "Shaky (slowed)", "sta
                "benched": "Stopped", "warming up": "Learning..."}
 STATUS_TAG = {"active": "win", "slowed": "shaky", "standby": "standby", "benched": "stopped", "warming up": "learning"}
 ORDER_LABELS = {"market": "Market (fills now, full fee)", "limit": "Limit / maker (lower fee, may not fill)"}
+SCALP_BOOK = "~scalp"  # the account keeps scalps in their own book per ticker: "SPY" (long-term) and "SPY~scalp"
+
+
+def scalp_key(c):
+    return c + SCALP_BOOK
+
+
+def tick_of(k):
+    """The ticker behind an account book key ("SPY~scalp" -> "SPY")."""
+    return k.split("~", 1)[0] if isinstance(k, str) else k
+
+
+def trade_kind(tr):
+    """'call' / 'put' of an account trade row, or ''."""
+    txt = f"{tr.get('contract', '')} {tr.get('coin', '')}".lower()
+    if " call" in txt or re.search(r"\d(c)\b", txt):
+        return "call"
+    if " put" in txt or re.search(r"\d(p)\b", txt):
+        return "put"
+    return ""
+
+
+def is_scalp_book(k):
+    return isinstance(k, str) and k.endswith(SCALP_BOOK)
+
+
 STRAT_LABELS = {
     "SMA crossover": "Trend follower", "RSI": "Buy dips / sell peaks", "Momentum": "Ride the rise",
     "Bollinger bands": "Buy low / sell high", "Dollar-cost averaging": "Steady buyer (DCA)",
@@ -936,7 +963,7 @@ class App:
                 for c in list(self.pos):
                     o = self.opt.get(c)
                     if self.pos.get(c, 0) > 0 and o and E.sessions_left(o["exp"]) <= int(self.settings.get("expiry_days", 2) or 2) + 1:
-                        self.sell(c, self.last.get(c, 0), "expiry")
+                        self.sell(c, self.last.get(tick_of(c), 0), "expiry")
                 self.write("Selling the contracts close to expiry. Close OBF again once they're sold.", "warn")
                 return
         if self.running and not quiet and not messagebox.askyesno(
@@ -1526,11 +1553,13 @@ class App:
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
-        t0, t1, t7, t8, tm, tt = (ttk.Frame(nb) for _ in range(6))
+        t0, t1, t7, t8, tm, tt, tb, ts = (ttk.Frame(nb) for _ in range(8))
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t7, text="  \u25c7 Slow farm  ")
         nb.add(t8, text="  Options  ")
         nb.add(t1, text="  Portfolio  ")
+        nb.add(tb, text="  Bot positions  ")
+        nb.add(ts, text="  \u26a1 Scalp scan  ")
         nb.add(tm, text="  Markets  ")
         nb.add(tt, text="  Trades  ")
         # Markets = watchlist + live prices; Trades = trades + what the bot did + the strategy scoreboard
@@ -1553,6 +1582,8 @@ class App:
         self.build_slow_tab(t7)
         self.build_options_tab(t8)
         self.build_portfolio(t1)
+        self.build_botpos_tab(tb)
+        self.build_scan_tab(ts)
         self.build_watchlist(t6)
         tk.Label(t2, bg=CARD, fg=MUTED, justify="left", anchor="w", padx=8, pady=4, wraplength=700,
                  text="The bot tests every strategy with pretend trades. Winning = copied with bigger trades. "
@@ -2834,7 +2865,8 @@ class App:
                 series.append((E.bot_nickname(v.key()), [(self.bar_time(n0 + i), e) for i, e in enumerate(v.eq)], "#a855f7", 2))
                 for n, coin, side, px in v.log:
                     if n >= n0:
-                        marks.append((self.bar_time(n), v.eq[n - n0], side, False, coin))
+                        marks.append((self.bar_time(n), v.eq[n - n0], side, False,
+                                      f"{coin} {getattr(v, 'log_ct', {}).get((n, coin), '')}".strip()))
             return series, marks, "$", None
         if view == "Hall of Fame shadow":
             series.append(("account", [(p[2], p[0]) for p in pts] if pts and len(pts[0]) >= 3 else [], ACCENT, 1))
@@ -2855,7 +2887,8 @@ class App:
                     if t is None or t < ts_list[0]:
                         continue
                     i = min(bisect.bisect_left(ts_list, t), len(pts) - 1)
-                    marks.append((t, pts[i][0], tr.get("side"), True, tr.get("coin", "")))
+                    marks.append((t, pts[i][0], tr.get("side"), True,
+                                  f"{str(tr.get('coin', '')).split(' ')[0]} {trade_kind(tr)}".strip()))
             return series, marks, "$", None
         c = view
         ticks = list(self.tick_px.get(c, ()))
@@ -2868,19 +2901,23 @@ class App:
             bars = [(ref - (len(hh) - 1 - i) * self.session_bar * 60, px) for i, px in enumerate(hh)]
             ticks = bars + [t for t in ticks if t[0] > bars[-1][0]]
         series.append((c, ticks, coin_color(c) if self.cfg.get("chart_coin_colors", True) else ACCENT, 2))
-        if self.chart_marks.get():
+        if self.chart_marks.get() and ticks:
+            import bisect
+            tts = [x[0] for x in ticks]
             for tr in self.trades[-400:]:
-                if tr.get("coin") == c:
+                if str(tr.get("coin", "")).split(" ")[0] == c:
                     t = self._ts(tr.get("time"))
-                    if t is not None:
-                        marks.append((t, float(tr.get("price") or 0), tr.get("side"), True, ""))
+                    if t is not None:  # the mark sits on the stock price at that moment (the row holds the option price)
+                        i = min(bisect.bisect_left(tts, t), len(ticks) - 1)
+                        marks.append((t, ticks[i][1], tr.get("side"), True,
+                                      trade_kind(tr) + (" scalp" if "(scalp)" in str(tr.get("coin", "")) else "")))
         v = self.chart_bot_variant() if self.chart_bot.get() else None
         if v:
             for n, coin, side, px in v.log:
                 if coin == c:
                     t = self.bar_time(n)
                     if t is not None:
-                        marks.append((t, px, side, False, ""))
+                        marks.append((t, px, side, False, getattr(v, "log_ct", {}).get((n, coin), "")))
         return series, marks, "px", c
 
     def chart_tick(self):
@@ -3040,6 +3077,10 @@ class App:
             else:
                 pts = (x, yy - 3, x - 6, yy - 13, x + 6, yy - 13)
             c.create_polygon(*pts, fill=col if filled else CARD, outline=col, width=1 if filled else 2)
+            word = next((wd for wd in ("call", "put") if wd in str(lab).split()), "")
+            if word:  # CALL / PUT next to each trade arrow
+                c.create_text(x, yy + 20 if side == "buy" else yy - 20, text=word.upper() + (" S" if "scalp" in str(lab) else ""),
+                              fill=col, font=("", 7, "bold"))
         legend = [(n, col) for n, seg, col, _ in vis]
         if candles:
             legend[-1] = (f"{main_name} candles", legend[-1][1])
@@ -3091,12 +3132,13 @@ class App:
         q = self.opt_quotes.get(o.get("symbol"))
         if q and time.time() - q[2] < 180 and q[0] > 0 and q[1] > 0:
             return (q[0] + q[1]) / 2 * E.CONTRACT
-        S = self.last.get(coin) or (self.hist.get(coin) or [0])[-1]
+        t = tick_of(coin)
+        S = self.last.get(t) or (self.hist.get(t) or [0])[-1]
         if not S:
             qty = self.pos.get(coin, 0)
             return self.cost.get(coin, 0) / qty if qty else 0.0
         T = max(0.0, o["exp"] - time.time()) / E.YEAR
-        vol = E.IV_HINT.get(coin) or E.realized_vol(self.hist.get(coin) or [S], (self.hx.get(coin) or {}).get("t"))
+        vol = E.IV_HINT.get(t) or E.realized_vol(self.hist.get(t) or [S], (self.hx.get(t) or {}).get("t"))
         return E.bs_price(S, o["K"], T, vol, o["type"]) * E.CONTRACT
 
     def ctx_list(self, coins=None):
@@ -3134,7 +3176,8 @@ class App:
 
     def contract_label(self, c):
         o = self.opt.get(c)
-        return E.contract_text(dict(o, under=c)) if o else c
+        label = E.contract_text(dict(o, under=tick_of(c))) if o else tick_of(c)
+        return label + (" (scalp)" if is_scalp_book(c) else "")
 
     def equity(self):
         # Total value is always cash plus the marked-to-market value of open positions.
@@ -4167,16 +4210,20 @@ class App:
                 self.write("Wildcard: " + friendly_text(e[0].lower() + e[1:]))
             self.update_wild_msg()
             self.refresh_board()
-        for c in self.session_coins:
-            if c in self.pending:
+        books = [("long", c, c) for c in self.session_coins]
+        if self.wild and self.tourn and self.tourn.scalpers():  # scalpers trade their own book on each ticker
+            books += [("scalp", c, scalp_key(c)) for c in self.session_coins]
+        for breed, c, k in books:  # c = the ticker, k = the account's book for it
+            if k in self.pending:
                 continue
             mult, who, voters = 1.0, [], []
             if self.wild and self.tourn:
-                sig, mult = self.tourn.vote(c)
+                sig, mult = self.tourn.vote(c, breed if len(books) > len(self.session_coins) else None, k)
                 if sig:
-                    add = self.tourn.kind.get(c) == "add"
+                    add = self.tourn.kind.get(k) == "add"
                     pool = self.tourn.active if add else self.tourn.active + self.tourn.slowed
-                    voters = [v for v in pool if (self.tourn._holding(v, c) if add else v.sig.get(c) == sig)]
+                    voters = [v for v in pool if (E.is_scalp(v.name) == (breed == "scalp") or len(books) == len(self.session_coins))
+                              and (self.tourn._holding(v, c) if add else v.sig.get(c) == sig)]
                     who = [v.name for v in voters]
             else:
                 votes = [E.strat_signal(n, self.hist[c], self.bar_n, self.settings["params"][n], 1, self.hx.get(c))
@@ -4196,41 +4243,43 @@ class App:
                                "Settings > Orders > Trading hours", "warn")
                 sig = None
             hold_min = float(self.settings.get("min_hold_min", 0) or 0)
-            if sig == "sell" and hold_min > 0 and c in self.bought_at and time.time() - self.bought_at[c] < hold_min * 60:
+            if sig == "sell" and hold_min > 0 and k in self.bought_at and time.time() - self.bought_at[k] < hold_min * 60:
                 sig = None  # minimum hold time not reached yet
-            if sig == "sell" and self.settings.get("fee_aware", True) and self.pos.get(c, 0) > 0 \
-                    and (self.opt.get(c) or {}).get("type") == "call":
+            if sig == "sell" and self.settings.get("fee_aware", True) and self.pos.get(k, 0) > 0 \
+                    and (self.opt.get(k) or {}).get("type") == "call":
                 fee, slip = E.cost_model(self.settings)
-                gain = self.position_price(c) / (self.cost[c] / self.pos[c]) - 1
+                gain = self.position_price(k) / (self.cost[k] / self.pos[k]) - 1
                 if 0 <= gain < 2 * (fee + max(slip, 0.02)):
                     sig = None  # the profit wouldn't cover the spread: keep holding
             if sig == "buy" and voters:
-                mult = self.allowance_mult(c, voters, mult)
+                mult = self.allowance_mult(k, voters, mult)
                 if mult <= 0:
                     sig = None
             if sig:
-                self.pending_detail[c] = self.why_text(c, sig, voters, who)
-                ag = (self.tourn.agree.get(c) if self.tourn and sig == "buy" and self.tourn.kind.get(c) != "add" else None)
+                self.pending_detail[k] = self.why_text(k, sig, voters, who)
+                ag = (self.tourn.agree.get(k) if self.tourn and sig == "buy" and self.tourn.kind.get(k) != "add" else None)
                 if ag and self.wild:
-                    self.pending_detail[c] += (f" {ag[0]} different strateg{'y' if ag[0] == 1 else 'ies'} agreed"
+                    self.pending_detail[k] += (f" {ag[0]} different strateg{'y' if ag[0] == 1 else 'ies'} agreed"
                                                + (f" while {ag[2] * 100:.0f}% of the votes said sell" if ag[2] else "")
                                                + f", so the size was x{ag[1]:g}.")
-                self.pending_voters[c] = [v.uid for v in voters]
+                self.pending_voters[k] = [v.uid for v in voters]
                 counts = {}
                 for n in who:
                     counts[n] = counts.get(n, 0) + 1
-                self.pending_who[c] = ", ".join(STRAT_LABELS.get(n, n) + (f" x{k}" if k > 1 else "") for n, k in counts.items())
+                self.pending_who[k] = ", ".join(STRAT_LABELS.get(n, n) + (f" x{x}" if x > 1 else "") for n, x in counts.items())
             genes = self.driver_genes(c, voters)
+            if breed == "long":
+                genes.pop("_scalp", None)  # the long-term book never makes scalps
             if sig == "buy":
-                kind = self.tourn.kind.get(c) if (self.wild and self.tourn) else None
+                kind = self.tourn.kind.get(k) if (self.wild and self.tourn) else None
                 if kind != "add":  # no adding to option positions
-                    self.buy(c, prices[c], "signal", mult, genes)
+                    self.buy(k, prices[c], "signal", mult, genes)
             elif sig == "sell":
-                self.sell_signal(c, prices[c], "signal", mult, genes)
-            if c not in self.pending:  # nothing is waiting on a live order, so drop any unused note
-                self.pending_who.pop(c, None)
-                self.pending_detail.pop(c, None)
-                self.pending_voters.pop(c, None)
+                self.sell_signal(k, prices[c], "signal", mult, genes)
+            if k not in self.pending:  # nothing is waiting on a live order, so drop any unused note
+                self.pending_who.pop(k, None)
+                self.pending_detail.pop(k, None)
+                self.pending_voters.pop(k, None)
         self.save_state(force=False)
         if self.bar_n % 60 == 0:
             self.weekly_report()
@@ -4274,8 +4323,8 @@ class App:
             self.executor.submit(cancel)
         sold = 0
         for c, q in list(self.pos.items()):
-            if q > 0 and c in self.last and c not in self.pending:
-                self.sell(c, self.last[c], "manual")
+            if q > 0 and tick_of(c) in self.last and c not in self.pending:
+                self.sell(c, self.last[tick_of(c)], "manual")
                 sold += 1
         if self.live:
             self.cfg["live_locked"] = True
@@ -7033,7 +7082,7 @@ class App:
                 if not self.running:
                     self.write(f"Expiry guard: selling {self.contract_label(c)} (expires "
                                f"{datetime.fromtimestamp(o['exp']).strftime('%a %b %d')}).", "warn")
-                self.sell(c, self.last.get(c, 0), "expiry")
+                self.sell(c, self.last.get(tick_of(c), 0), "expiry")
             if not self.live or E.sessions_left(o["exp"]) > 0:
                 continue
             # expiry day and still held: last resorts
@@ -7647,7 +7696,7 @@ class App:
         if room < 1:
             if time.time() - getattr(self, "_allow_note", 0) > 900:
                 self._allow_note = time.time()
-                self.write(f"Allowance: the bots voting to buy {c} already have their share of the account tied up, "
+                self.write(f"Allowance: the bots voting to buy {tick_of(c)} already have their share of the account tied up, "
                            f"so the buy was skipped. (Settings > Basics > Allowance per bot)", "warn")
             return 0.0
         return mult * room / want
@@ -7860,11 +7909,11 @@ class App:
                 continue
             o = self.opt.get(c)
             if o and self.near_expiry(o):
-                self.sell(c, self.last.get(c, 0), "expiry")
+                self.sell(c, self.last.get(tick_of(c), 0), "expiry")
                 continue
             sc = (o or {}).get("scalp")
             if sc and E.minutes_to_close(time.time()) <= sc.get("flatby", 15):
-                self.sell(c, self.last.get(c, 0), "scalp-flat")  # scalps are never held overnight
+                self.sell(c, self.last.get(tick_of(c), 0), "scalp-flat")  # scalps are never held overnight
                 continue
             val = self.position_price(c)
             if val <= 0:
@@ -7873,20 +7922,20 @@ class App:
             r = val / (self.cost[c] / q) - 1
             if sc:  # a scalp: the scalpers' own tight stop and target, and their time limit
                 if r <= -sc["sl"] / 100:
-                    self.sell(c, self.last.get(c, 0), "stop-loss")
+                    self.sell(c, self.last.get(tick_of(c), 0), "stop-loss")
                 elif r >= sc["tp"] / 100:
-                    self.sell(c, self.last.get(c, 0), "take-profit")
+                    self.sell(c, self.last.get(tick_of(c), 0), "take-profit")
                 elif time.time() - sc.get("at", time.time()) >= sc.get("mins", 10) * 60:
-                    self.sell(c, self.last.get(c, 0), "scalp-time")
+                    self.sell(c, self.last.get(tick_of(c), 0), "scalp-time")
                 elif trail > 0 and val <= self.high[c] * (1 - trail):
-                    self.sell(c, self.last.get(c, 0), "trailing-stop")
+                    self.sell(c, self.last.get(tick_of(c), 0), "trailing-stop")
                 continue
             if stop > 0 and r <= -stop:
-                self.sell(c, self.last.get(c, 0), "stop-loss")
+                self.sell(c, self.last.get(tick_of(c), 0), "stop-loss")
             elif take > 0 and r >= take:
-                self.sell(c, self.last.get(c, 0), "take-profit")
+                self.sell(c, self.last.get(tick_of(c), 0), "take-profit")
             elif trail > 0 and val <= self.high[c] * (1 - trail):
-                self.sell(c, self.last.get(c, 0), "trailing-stop")
+                self.sell(c, self.last.get(tick_of(c), 0), "trailing-stop")
 
     def check_daily(self):
         today, eq = date.today(), self.equity()
@@ -7906,11 +7955,13 @@ class App:
     # ---------------- trading ----------------
     def trade_size(self, c, mult=1.0):
         spend = min(self.start_cash * self.settings["trade_pct"] / 100 * mult, self.cash)
-        room = self.start_cash * self.settings["max_coin_pct"] / 100 - self.cost.get(c, 0)
+        room = self.start_cash * self.settings["max_coin_pct"] / 100 - sum(x for k, x in self.cost.items() if tick_of(k) == tick_of(c))
         return max(min(spend, room), 0)
 
     def buy(self, c, px, reason="signal", mult=1.0, genes=None):
         """A buy signal: close a put if the account holds one, otherwise buy a call (unless the bots only use puts)."""
+        if is_scalp_book(c) and not (genes or {}).get("_scalp"):
+            return
         o = self.opt.get(c)
         if o and self.pos.get(c, 0) > 0:
             if o["type"] == "put":
@@ -7924,6 +7975,8 @@ class App:
         if o and self.pos.get(c, 0) > 0:
             if o["type"] == "call":
                 self.sell(c, px, reason)
+            return
+        if is_scalp_book(c) and not (genes or {}).get("_scalp"):
             return
         self.open_option(c, "put", px, reason, mult, genes)
 
@@ -7965,22 +8018,23 @@ class App:
             ma, mb = sum(a) / n, sum(b) / n
             va, vb = sum((x - ma) ** 2 for x in a), sum((y - mb) ** 2 for y in b)
             return sum((x - ma) * (y - mb) for x, y in zip(a, b)) / (va * vb) ** 0.5 if va > 0 and vb > 0 else 0.0
-        mine = rets(c)
-        group = [k for k in self.session_coins if k != c and self.pos.get(k, 0) > 0
-                 and (self.opt.get(k) or {}).get("type") == typ and corr(mine, rets(k)) >= 0.6]
+        mine = rets(tick_of(c))
+        group = [k for k in self.pos if tick_of(k) != tick_of(c) and self.pos.get(k, 0) > 0
+                 and (self.opt.get(k) or {}).get("type") == typ and corr(mine, rets(tick_of(k))) >= 0.6]
         if not group:
             return spend
         room = self.start_cash * pct / 100 - sum(self.cost.get(k, 0) for k in group)
         if room < 1:
             if time.time() - getattr(self, "_group_note", 0) > 900:
                 self._group_note = time.time()
-                self.write(f"Skipped a {typ} on {c}: it has been moving together with {', '.join(group)}, and {typ}s on "
+                self.write(f"Skipped a {typ} on {tick_of(c)}: it has been moving together with {', '.join(dict.fromkeys(tick_of(k) for k in group))}, and {typ}s on "
                            f"that group already use {pct:g}% of your money. (Settings > Basics > Tickers that move together)", "warn")
             return 0.0
         return min(spend, room)
 
     def open_option(self, c, typ, S, reason="signal", mult=1.0, genes=None):
         g = genes or {}
+        t_ = tick_of(c)  # c is the account's book ("SPY" or "SPY~scalp"), t_ the ticker
         mode = int(g.get("omode", 3) or 3)
         if (typ == "call" and mode == 2) or (typ == "put" and mode == 1):
             return
@@ -8015,9 +8069,9 @@ class App:
         step = E.strike_step(S)
         K = round((S * (1 + otm / 100) if typ == "call" else S * (1 - otm / 100)) / step) * step
         exp = E.next_expiry(time.time(), dte)
-        o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(c, exp, typ, K))
+        o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(t_, exp, typ, K))
         T = max(0.0, exp - time.time()) / E.YEAR
-        vol = E.IV_HINT.get(c) or E.realized_vol(self.hist.get(c) or [S], (self.hx.get(c) or {}).get("t"))
+        vol = E.IV_HINT.get(t_) or E.realized_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
         prem = E.bs_price(S, K, T, vol, typ) * E.CONTRACT
         if (E.PREM_RANGE[0] or E.PREM_RANGE[1]) and not E.prem_ok(prem / E.CONTRACT):
             cheaper = 1 if typ == "call" else -1  # walk the strike into the price range
@@ -8031,15 +8085,15 @@ class App:
                     break
             if K <= 0 or not E.prem_ok(prem / E.CONTRACT):
                 return
-            o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(c, exp, typ, K))
+            o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(t_, exp, typ, K))
         fee, slip = E.cost_model(self.settings)
         half = max(slip, 0.02)
         if scalp:  # a scalp pays this ticker's real bid/ask gap, and only takes tight ones
-            half = E.half_spread(c, prem / E.CONTRACT)
+            half = E.half_spread(t_, prem / E.CONTRACT)
             if 2 * half * 100 > E.SCALP_SPREAD[0]:
                 if time.time() - getattr(self, "_spread_note", 0) > 900:
                     self._spread_note = time.time()
-                    self.write(f"Skipped a scalp {typ} on {c}: its bid/ask gap (~{2 * half * 100:.0f}%) is wider than the "
+                    self.write(f"Skipped a scalp {typ} on {t_}: its bid/ask gap (~{2 * half * 100:.0f}%) is wider than the "
                                f"scalpers' limit ({E.SCALP_SPREAD[0]:g}%). Settings > Learning", "warn")
                 return
         fill = prem * (1 + half)
@@ -8052,7 +8106,7 @@ class App:
         if qty < 1 or cost > self.cash:
             if time.time() - getattr(self, "_afford_note", 0) > 900:
                 self._afford_note = time.time()
-                self.write(f"Skipped a {typ} on {c}: one contract costs ${fill:,.0f}, more than this trade's size allows. "
+                self.write(f"Skipped a {typ} on {t_}: one contract costs ${fill:,.0f}, more than this trade's size allows. "
                            f"(Raise Trade size, or give the bots more practice money.)", "warn")
             return
         self.fees_paid += qty * fill * fee + qty * prem * half + qty * E.CONTRACT_FEE[0]
@@ -8084,7 +8138,7 @@ class App:
         value = self.position_price(c)
         expired = o and time.time() >= o.get("exp", 0)
         fee, slip = E.cost_model(self.settings)
-        half = E.half_spread(c, value / E.CONTRACT) if o.get("scalp") else max(slip, 0.02)
+        half = E.half_spread(tick_of(c), value / E.CONTRACT) if o.get("scalp") else max(slip, 0.02)
         fill = value if expired else value * (1 - half)
         proceeds = qty * fill * (1 - (0 if expired else fee)) - (0 if expired else qty * E.CONTRACT_FEE[0])
         self.fees_paid += 0 if expired else qty * value * half + qty * fill * fee + qty * E.CONTRACT_FEE[0]
@@ -8101,7 +8155,11 @@ class App:
                    side=side, coin=c, qty=round(qty, 8), price=round(px, 6), usd=round(usd, 2),
                    pl="" if pl is None else round(pl, 2), reason=reason, who=self.pending_who.pop(c, ""))
         if self.opt.get(c):
-            row["coin"] = f"{c} {self.opt[c]['K']:g}{'C' if self.opt[c]['type'] == 'call' else 'P'}"
+            row["coin"] = f"{tick_of(c)} {self.opt[c]['K']:g}{'C' if self.opt[c]['type'] == 'call' else 'P'}"
+        else:
+            row["coin"] = tick_of(c)
+        if is_scalp_book(c):
+            row["coin"] += " (scalp)"
         detail = self.pending_detail.pop(c, "")
         if not detail and reason not in ("signal", "add-on"):
             detail = {"stop-loss": "Your account's safety stop was hit.", "take-profit": "Your account locked in its profit target.",
@@ -8154,9 +8212,9 @@ class App:
         else:
             msg = f"Sold {qty:g} x {label} at ${px:,.2f} for ${usd:,.2f}, {'made' if (pl or 0) >= 0 else 'lost'} ${abs(pl or 0):,.2f} ({why})"
         self.write(("LIVE: " if self.live else "Practice: ") + msg)
-        self.notify("OBF", f"{side.upper()} {c} @ {px:,.2f} ({reason})", important=False, sound="trade")
+        self.notify("OBF", f"{side.upper()} {label} @ ${px:,.2f} ({why})", important=False, sound="trade")
         if self.live and self.settings.get("why_popup", True):
-            self.toast(f"LIVE {side.upper()} {c}: why?", (detail or why)[:400], ms=20000)
+            self.toast(f"LIVE {side.upper()} {label}: why?", (detail or why)[:400], ms=20000)
         self.alert("trades", ("LIVE " if self.live else "Practice ") + msg)
 
     def sell_all(self):
@@ -8165,8 +8223,8 @@ class App:
         if self.live and not messagebox.askyesno("Sell all", "Place REAL sell orders for all positions?"):
             return
         for c, q in list(self.pos.items()):
-            if q > 0 and c in self.last and c not in self.pending:
-                self.sell(c, self.last[c], "manual")
+            if q > 0 and tick_of(c) in self.last and c not in self.pending:
+                self.sell(c, self.last[tick_of(c)], "manual")
         self.refresh_view()
 
     # ---------------- live trading (Alpaca) ----------------
@@ -8367,18 +8425,20 @@ class App:
             now = time.time()
             d0 = datetime.fromtimestamp(now + max(1, dte - 10) * 86400).strftime("%Y-%m-%d")
             d1 = datetime.fromtimestamp(now + (dte + 21) * 86400).strftime("%Y-%m-%d")
-            chain = E.option_chain(c, d0, d1, typ, S * 0.75, S * 1.25)
+            chain = E.option_chain(tick_of(c), d0, d1, typ, S * 0.75, S * 1.25)
             try:
-                oi = E.option_oi(c, d0, d1, typ) if int(self.settings.get("min_oi", 0) or 0) else {}
+                oi = E.option_oi(tick_of(c), d0, d1, typ) if int(self.settings.get("min_oi", 0) or 0) else {}
             except Exception:
                 oi = {}
             for r_ in chain:
                 if r_["symbol"] in oi:
                     r_["oi"] = oi[r_["symbol"]]
-            E.learn_spreads(c, chain, S)
+            E.learn_spreads(tick_of(c), chain, S)
             rules = self.pick_rules()
             if c in getattr(self, "scalp_next", {}):  # a scalp: only a tight bid/ask gap will do
                 rules["max_spread_pct"] = min(rules["max_spread_pct"] or E.SCALP_SPREAD[0], E.SCALP_SPREAD[0])
+            other = (self.opt.get(tick_of(c) if is_scalp_book(c) else scalp_key(c)) or {}).get("symbol")
+            chain = [r_ for r_ in chain if r_["symbol"] != other]  # the other book's contract stays the other book's
             pick = E.pick_contract(chain, S, typ, dte, otm, now, **rules)
             if not pick:
                 rng = E.prem_range_text()
@@ -8451,17 +8511,21 @@ class App:
                 now = time.time()
                 d0 = datetime.fromtimestamp(now + max(1, dte - 10) * 86400).strftime("%Y-%m-%d")
                 d1 = datetime.fromtimestamp(now + (dte + 21) * 86400).strftime("%Y-%m-%d")
-                pick = E.pick_contract(E.option_chain(c, d0, d1, typ, S * 0.75, S * 1.25), S, typ, dte, otm, now,
-                                       **self.pick_rules())
+                other = (self.opt.get(tick_of(c) if is_scalp_book(c) else scalp_key(c)) or {}).get("symbol")
+                rules = self.pick_rules()
+                if c in getattr(self, "scalp_next", {}):
+                    rules["max_spread_pct"] = min(rules["max_spread_pct"] or E.SCALP_SPREAD[0], E.SCALP_SPREAD[0])
+                pick = E.pick_contract([r_ for r_ in E.option_chain(tick_of(c), d0, d1, typ, S * 0.75, S * 1.25)
+                                        if r_["symbol"] != other], S, typ, dte, otm, now, **rules)
             except Exception:
                 pick = None
             if pick:
                 exp, K = pick["exp"], pick["K"]
             else:
-                exp, K = E.IB.pick(c, S, typ, dte, otm)
+                exp, K = E.IB.pick(tick_of(c), S, typ, dte, otm)
                 if E.sessions_left(exp) <= int(self.settings.get("expiry_days", 2) or 2):
                     raise RuntimeError("the nearest contract expires too soon for the expiry guard")
-            bid, ask, _ = E.IB.quote(c, exp, typ, K)
+            bid, ask, _ = E.IB.quote(tick_of(c), exp, typ, K)
             if not ask and pick:
                 ask = pick["ask"]
             mx = float(self.settings.get("max_spread_pct", 0) or 0)
@@ -8474,11 +8538,11 @@ class App:
                 qty = 1
             if qty < 1:
                 raise RuntimeError(f"one contract costs ${ask * E.CONTRACT:,.0f}, more than this trade's size")
-            got, avg = E.IB.order(c, exp, typ, K, qty, "buy", limit=round(ask, 2),
+            got, avg = E.IB.order(tick_of(c), exp, typ, K, qty, "buy", limit=round(ask, 2),
                                   wait=max(5, int(self.settings.get("limit_wait", 20))))
             if got <= 0:
                 return self.q.put(("unfilled", ("buy", c, spend)))
-            o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(c, exp, typ, K), broker="ibkr")
+            o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(tick_of(c), exp, typ, K), broker="ibkr")
             self.q.put(("ofill", ("buy", c, got, avg, spend, reason, o)))
         except Exception as e:
             self.q.put(("fail", ("buy", c, spend, f"Interactive Brokers: {e}")))
@@ -8491,17 +8555,17 @@ class App:
             urgent = reason in ("stop-loss", "expiry", "manual", "trailing-stop", "scalp-flat")
             limit = None
             if not urgent:
-                bid, ask, _ = E.IB.quote(c, o["exp"], o["type"], o["K"])
+                bid, ask, _ = E.IB.quote(tick_of(c), o["exp"], o["type"], o["K"])
                 limit = round(bid, 2) if bid else None
             wait = 30 if urgent else max(5, int(self.settings.get("limit_wait", 20)))
-            held = int(max(0, E.IB.held(c, o["exp"], o["type"], o["K"])))  # IBKR's own count
+            held = int(max(0, E.IB.held(tick_of(c), o["exp"], o["type"], o["K"])))  # IBKR's own count
             qty = min(int(qty), held)
             if qty <= 0:
                 raise E.UnsafeOrder("IBKR shows none of this contract in the account, so nothing was sold "
                                     "(selling would open a short position).")
-            got, avg = E.IB.order(c, o["exp"], o["type"], o["K"], qty, "sell", limit=limit, wait=wait, held=held)
+            got, avg = E.IB.order(tick_of(c), o["exp"], o["type"], o["K"], qty, "sell", limit=limit, wait=wait, held=held)
             if got <= 0 and limit:
-                got, avg = E.IB.order(c, o["exp"], o["type"], o["K"], qty, "sell", wait=30, held=held)
+                got, avg = E.IB.order(tick_of(c), o["exp"], o["type"], o["K"], qty, "sell", wait=30, held=held)
             if got <= 0:
                 return self.q.put(("unfilled", ("sell", c, 0)))
             self.q.put(("ofill", ("sell", c, got, avg, 0, reason, dict(o))))
@@ -9456,7 +9520,9 @@ class App:
                                   font=("", 8 + k // 6, "bold"), tags="anim")
             elif just:
                 side = v.log[-1][2]
-                c.create_text(x0 + 66, y0 + 24, text="BUY!" if side == "buy" else "SELL!", tags="anim",
+                typ_ = getattr(v, "log_ct", {}).get(tuple(v.log[-1][:2]), "")
+                c.create_text(x0 + 66, y0 + 24, text=("BUY" if side == "buy" else "SELL") + (f" {typ_.upper()}" if typ_ else "") + "!",
+                              tags="anim",
                               fill=GREEN if side == "buy" else "#f59e0b", font=("", 8, "bold"))
         promos = getattr(self, "promos", {})
         if promos:
@@ -9915,6 +9981,288 @@ class App:
             self.slow_refresh()
         elif tab == "Options":
             self.opt_load(quiet=True)
+        elif tab == "Bot positions":
+            self.refresh_botpos()
+        elif "Scalp scan" in tab:
+            self.refresh_scan()
+
+    # ---------------- bot positions: every bot's open pretend contracts ----------------
+    def build_botpos_tab(self, parent):
+        bar = tk.Frame(parent, bg=CARD)
+        bar.pack(fill="x", padx=6, pady=(6, 2))
+        self.bp_farm = tk.StringVar(value="Both farms")
+        ttk.Combobox(bar, textvariable=self.bp_farm, values=("Both farms", "Bot Farm", "Slow farm"), width=12,
+                     state="readonly").pack(side="left")
+        self.bp_breed = tk.StringVar(value="All bots")
+        ttk.Combobox(bar, textvariable=self.bp_breed, values=("All bots", "Scalpers", "Long-term"), width=11,
+                     state="readonly").pack(side="left", padx=6)
+        for v_ in (self.bp_farm, self.bp_breed):
+            v_.trace_add("write", lambda *a: self.refresh_botpos())
+        self.bp_sum = tk.Label(bar, text="", bg=CARD, fg=MUTED, anchor="w", font=("", 9, "bold"))
+        self.bp_sum.pack(side="left", padx=10)
+        tk.Label(parent, bg=CARD, fg=MUTED, anchor="w", padx=8, font=("", 8),
+                 text="Each bot's own pretend contracts right now. These never touch your balance; double-click a row to see "
+                      "its ticker on the chart.").pack(fill="x")
+        box = tk.Frame(parent, bg=CARD)
+        box.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        cols = ("bot", "kind", "status", "ticker", "contract", "qty", "paid", "worth", "pl", "plpct", "held", "exits", "life")
+        heads = ("Bot", "Kind", "Status", "Ticker", "Contract", "Qty", "Paid", "Worth now", "P/L $", "P/L %", "Held",
+                 "Exits", "Bot overall")
+        t = self.bp_tree = self.make_tree(box, cols, (130, 150, 110, 60, 170, 40, 80, 80, 80, 60, 70, 230, 80), heads)
+        for c_ in ("bot", "kind", "status", "ticker", "contract", "exits", "held"):
+            t.column(c_, anchor="w")
+        t.tag_configure("up", foreground=GREEN)
+        t.tag_configure("down", foreground=RED)
+        t.bind("<Double-1>", lambda e: (lambda sel: self.show_on_chart(t.set(sel[0], "ticker")) if sel else None)(t.selection()))
+        self._bp_tick()
+
+    def _bp_tick(self):
+        """Keeps the open tab current (every few seconds, only while you're looking at it)."""
+        try:
+            if self.cur_tab() == "Bot positions" and not self.in_bg():
+                self.refresh_botpos()
+        except Exception:
+            pass
+        self.root.after(3000, self._bp_tick)
+
+    def refresh_botpos(self):
+        t = getattr(self, "bp_tree", None)
+        if t is None:
+            return
+        farms = []
+        if self.bp_farm.get() in ("Both farms", "Bot Farm") and self.tourn:
+            farms.append(("Bot Farm", self.tourn, float(self.session_bar or self.settings.get("bar_minutes", 1))))
+        sl = getattr(self, "slow", {}).get("t")
+        if self.bp_farm.get() in ("Both farms", "Slow farm") and sl:
+            farms.append(("Slow farm", sl, self.SLOW_GRAN / 60))
+        breed = self.bp_breed.get()
+        rows, paid_all, worth_all, n_bots = [], 0.0, 0.0, set()
+        for farm, tr, bar_min in farms:
+            for v in list(tr.vars):
+                sc = E.is_scalp(v.name)
+                if (breed == "Scalpers" and not sc) or (breed == "Long-term" and sc):
+                    continue
+                for c, q in list(v.sim.pos.items()):
+                    o = (getattr(v.sim, "opt", {}) or {}).get(c)
+                    if q <= 0 or not o:
+                        continue
+                    S = tr.last_px.get(c)
+                    worth = v.sim.value_of(c, S) if S else 0.0
+                    paid = v.sim.cost.get(c, 0.0)
+                    pl = worth - paid
+                    bars = max(0, tr.n - v.since.get(c, tr.n))
+                    mins = bars * bar_min
+                    held = f"{mins:.0f} min" if mins < 120 else f"{mins / 60:.1f} hr" if mins < 2880 else f"{mins / 1440:.1f} days"
+                    exits = ", ".join(x for x in (E.risk_text(v.risk),
+                                                  f"max {v.traits['maxhold'] * v.tf} bars" if v.traits.get("maxhold") else "",
+                                                  f"flat {v.traits['flatby']} min before close" if v.traits.get("flatby") else "")
+                                      if x) or "its strategy decides"
+                    st = STATUS_TEXT.get(tr.info.get(id(v), {}).get("status"), "")
+                    life = tr.life(v)["ret"] * 100
+                    rows.append(((farm, -pl), (E.bot_nickname(v.key()), STRAT_LABELS.get(v.name, v.name), st, c,
+                                 E.contract_text(dict(o, under=c)), f"{q:g}", f"${paid:,.2f}", f"${worth:,.2f}",
+                                 f"{pl:+,.2f}", f"{(pl / paid * 100) if paid else 0:+.1f}%", held, exits, f"{life:+.1f}%"),
+                                 "up" if pl >= 0 else "down"))
+                    paid_all += paid
+                    worth_all += worth
+                    n_bots.add((farm, v.uid))
+        rows.sort(key=lambda r: r[0])
+        t.delete(*t.get_children())
+        for _, vals, tag in rows:
+            t.insert("", "end", values=vals, tags=(tag,))
+        pl_all = worth_all - paid_all
+        self.bp_sum.config(text=(f"{len(n_bots)} bot{'s' if len(n_bots) != 1 else ''} holding {len(rows)} contract"
+                                 f"{'s' if len(rows) != 1 else ''}   |   paid ${paid_all:,.2f}   |   worth ${worth_all:,.2f}   |   "
+                                 f"P/L {pl_all:+,.2f} ({(pl_all / paid_all * 100) if paid_all else 0:+.1f}%)")
+                           if rows else ("No bot holds a contract right now." if farms else "The farms haven't started yet."),
+                           fg=(GREEN if pl_all >= 0 else RED) if rows else MUTED)
+
+    # ---------------- scalp scan: the scalpers roam the market during the trading day ----------------
+    SCAN_EVERY = 300  # seconds between scans while the market is open
+
+    def build_scan_tab(self, parent):
+        self.scan = dict(at=0, res=None, status="", busy=False, now=False)
+        self.scan_feed = deque(maxlen=200)
+        bar = tk.Frame(parent, bg=CARD)
+        bar.pack(fill="x", padx=6, pady=(6, 2))
+        self.scan_var = tk.BooleanVar(value=bool(self.cfg.get("scalp_scan", True)))
+        ttk.Checkbutton(bar, text="Scan the market for scalps during trading hours", variable=self.scan_var,
+                        command=lambda: (self.cfg.__setitem__("scalp_scan", bool(self.scan_var.get())),
+                                         E.save_json(CONFIG_PATH, self.cfg), self.refresh_scan())).pack(side="left")
+        ttk.Button(bar, text="Scan now", style="Plain.TButton", command=self.scan_now).pack(side="left", padx=6)
+        ttk.Button(bar, text="Add selected to my tickers", style="Plain.TButton", command=self.scan_add).pack(side="left")
+        self.scan_lbl = tk.Label(bar, text="", bg=CARD, fg=MUTED, anchor="w", font=("", 9, "bold"))
+        self.scan_lbl.pack(side="left", padx=10)
+        tk.Label(parent, bg=CARD, fg=MUTED, anchor="w", justify="left", padx=8, font=("", 8), wraplength=1100,
+                 text="Every 5 minutes while the market is open, your farm's best scalpers are tried on today's 1-minute "
+                      "prices of many tickers (yours, your watchlist and the most-traded ones) with pretend money, real "
+                      "bid/ask costs and their own exits. Scalpers that also win here get a bigger say on your farm; ones "
+                      "that only win on your own tickers get less. Nothing here trades your account.").pack(fill="x")
+        sp = tk.PanedWindow(parent, orient="vertical", bg=BG, sashwidth=5, bd=0)
+        sp.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        top, low = tk.Frame(sp, bg=CARD), tk.Frame(sp, bg=CARD)
+        sp.add(top, minsize=120, stretch="always")
+        sp.add(low, minsize=90, stretch="always")
+        tk.Label(top, text="Where scalps are paying today", bg=CARD, fg=TEXT, anchor="w", font=("", 9, "bold")).pack(fill="x", padx=4)
+        tb = tk.Frame(top, bg=CARD)
+        tb.pack(fill="both", expand=True)
+        cols = ("ticker", "move", "setups", "trades", "winrate", "pl", "plpct", "best", "now")
+        self.scan_tree = self.make_tree(tb, cols, (70, 80, 70, 60, 70, 90, 70, 170, 180),
+                                        ("Ticker", "Today", "Scalps", "Closed", "Win rate", "P/L $", "P/L %", "Best scalper here",
+                                         "Setup right now"))
+        for c_ in ("ticker", "best", "now"):
+            self.scan_tree.column(c_, anchor="w")
+        self.scan_tree.tag_configure("up", foreground=GREEN)
+        self.scan_tree.tag_configure("down", foreground=RED)
+        self.scan_tree.bind("<Double-1>", lambda e: (lambda sel: self.show_on_chart(sel[0]) if sel and sel[0] in (self.session_coins or [])
+                                                     else None)(self.scan_tree.selection()))
+        tk.Label(low, text="Setups firing (newest first)", bg=CARD, fg=TEXT, anchor="w", font=("", 9, "bold")).pack(fill="x", padx=4)
+        fb = tk.Frame(low, bg=CARD)
+        fb.pack(fill="both", expand=True)
+        self.scan_feed_tree = self.make_tree(fb, ("time", "ticker", "kind", "who", "price", "why"), (70, 70, 60, 170, 80, 420),
+                                             ("Time", "Ticker", "Call / put", "Scalper", "Stock price", "Why"))
+        for c_ in ("time", "ticker", "kind", "who", "why"):
+            self.scan_feed_tree.column(c_, anchor="w")
+        threading.Thread(target=self._scan_loop, daemon=True).start()
+        self.refresh_scan()
+
+    def scan_now(self):
+        self.scan["now"] = True
+        self.scan["status"] = "Scan requested..."
+        self.refresh_scan()
+
+    def scan_add(self):
+        sel = [x for x in self.scan_tree.selection() if E.valid_coin(x)]
+        if not sel:
+            return messagebox.showinfo("Scalp scan", "Click one or more tickers in the list first.")
+        added = self.add_coins(sel)
+        self.write(f"Added {', '.join(sel)} to your tickers" + (" (they join the farm when you next press Start)."
+                                                                 if self.running else "."), "good")
+        return added
+
+    def scan_universe(self):
+        """The tickers the scan roams: yours, your watchlist, then the most-traded ones (30 at most)."""
+        out = list(dict.fromkeys(list(self.session_coins or []) + list(self.watchlist()) + list(E.POPULAR)))
+        return [c for c in out if E.valid_coin(c)][:int(self.settings.get("scan_size", 30) or 30)]
+
+    def scan_genes(self):
+        """The scalpers sent out: the farm's best scalpers (up to 8), or the five scalp instincts when there are none yet."""
+        t = self.tourn
+        if t and t.scalpers():
+            ranked = [v for v, _ in t.ranking() if E.is_scalp(v.name)]
+            pick = (ranked + [v for v in t.scalpers() if v not in ranked])[:8]
+            return [dict(E._genes(v), uid=v.uid) for v in pick]
+        out = []
+        for i, n in enumerate(E.SCALP_STRATS):
+            tf, r, tr = E.scalp_shape(random.Random(i), 1, None, None)
+            out.append(dict(uid=0, name=n, params=dict(E.STRATS[n]["params"]), tf=tf, risk=r, traits=tr, vetoes={}, layers={}))
+        return out
+
+    def _scan_loop(self):
+        while True:
+            time.sleep(5 if self.scan.get("now") else 20)
+            try:
+                if not self.cfg.get("scalp_scan", True) and not self.scan.get("now"):
+                    self.scan["status"] = "Off"
+                    continue
+                if not self.client:
+                    self.scan["status"] = "Log in to Alpaca (Account menu): the scan needs its price data"
+                    continue
+                if not E.scalp_share(self.settings):
+                    self.scan["status"] = "Scalpers are off (Settings > Learning, and a decision speed of 5 min or faster)"
+                    continue
+                clk = E.market_clock()
+                if not clk["is_open"]:
+                    self.scan["now"] = False
+                    self.scan["status"] = ("Market closed. Scanning starts when it opens "
+                                           + datetime.fromtimestamp(clk["next_open"]).strftime("%a %I:%M %p").replace(" 0", " "))
+                    continue
+                if time.time() - self.scan["at"] < self.SCAN_EVERY and not self.scan.get("now"):
+                    left = int(self.SCAN_EVERY - (time.time() - self.scan["at"]))
+                    self.scan["status"] = f"Next scan in {left // 60}:{left % 60:02d}"
+                    continue
+                self.scan.update(now=False, busy=True)
+                self._scan_once()
+            except Exception as e:
+                self.scan["status"] = f"Scan paused: {e}"
+            finally:
+                self.scan["busy"] = False
+                self.q.put(("call", self.refresh_scan))
+
+    def _scan_once(self):
+        uni, genes = self.scan_universe(), self.scan_genes()
+        bars = {}
+        for i, sym in enumerate(uni):
+            self.scan["status"] = f"Reading today's prices: {sym} ({i + 1} of {len(uni)})"
+            try:
+                d = E.fetch_ohlcv(sym, 60, 470, self.quote)
+                if d.get("c") and len(d["c"]) == len(d.get("t") or ()):
+                    bars[sym] = dict(c=d["c"], h=d["h"], l=d["l"], v=d["v"], t=d["t"])
+            except Exception:
+                continue
+        self.scan["status"] = f"Trying {len(genes)} scalpers on {len(bars)} tickers..."
+        job = dict(bars=bars, genes=genes, day=E.ny_date(time.time()).isoformat(),
+                   spread={k: list(v) for k, v in E.SPREAD_FIT.items()}, sspread=E.SCALP_SPREAD[0])
+        try:  # its own processor core, so the window never stutters
+            import concurrent.futures as cf
+            import multiprocessing as mp
+            with cf.ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn")) as ex:
+                res = ex.submit(E.scan_scalps, job).result(timeout=600)
+        except Exception:
+            res = E.scan_scalps(job)
+        self.q.put(("call", lambda: self.scan_done(res)))
+
+    def scan_done(self, res):
+        self.scan.update(at=time.time(), res=res, status="")
+        t = self.tourn
+        if t:  # each scalper's results on the wider market count toward how much the farm trusts it
+            for v in t.vars:
+                b = res["bots"].get(v.uid)
+                if b and v.uid:
+                    v.scan = list(b)
+        stamp = datetime.now().strftime("%H:%M")
+        fresh = []
+        for x in res.get("now", []):
+            key = (x["ticker"], x["bot"], stamp)
+            if any((f["ticker"], f["bot"], f["time"]) == key for f in self.scan_feed):
+                continue
+            row = dict(x, time=stamp)
+            self.scan_feed.appendleft(row)
+            fresh.append(row)
+        if fresh:
+            self.write("Scalp scan: " + ", ".join(f"{f['ticker']} {f['kind'] or 'setup'} ({STRAT_LABELS.get(f['bot'], f['bot'])})"
+                                                  for f in fresh[:6]) + (f" and {len(fresh) - 6} more" if len(fresh) > 6 else "")
+                       + " firing right now (scan only, not traded).")
+        self.refresh_scan()
+
+    def refresh_scan(self):
+        if not hasattr(self, "scan_tree"):
+            return
+        sc = self.scan
+        res = sc.get("res")
+        when = (f"last scan {datetime.fromtimestamp(sc['at']).strftime('%I:%M %p').lstrip('0')}" if sc.get("at") else "no scan yet")
+        self.scan_lbl.config(text=f"{sc.get('status') or 'Ready'}   |   {when}")
+        if self.cur_tab().find("Scalp scan") < 0 and res is not None and getattr(self, "_scan_drawn", None) is res:
+            return
+        self._scan_drawn = res
+        t = self.scan_tree
+        t.delete(*t.get_children())
+        if res:
+            now = {}
+            for x in res.get("now", []):
+                now.setdefault(x["ticker"], []).append(f"{x['kind'] or 'setup'} ({STRAT_LABELS.get(x['bot'], x['bot'])})")
+            rows = sorted(res["tickers"].items(), key=lambda kv: -(kv[1]["pl"] / kv[1]["paid"] if kv[1]["paid"] else -1))
+            for sym, r in rows:
+                pct = r["pl"] / r["paid"] * 100 if r["paid"] else 0.0
+                t.insert("", "end", iid=sym, tags=("up" if r["pl"] >= 0 else "down",), values=(
+                    sym, f"{r.get('move', 0):+.2f}%", r["setups"], r["trades"],
+                    f"{r['wins'] / r['trades'] * 100:.0f}%" if r["trades"] else "-", f"{r['pl']:+,.0f}", f"{pct:+.1f}%",
+                    STRAT_LABELS.get(r["best"], r["best"] or "-"), "; ".join(now.get(sym, [])) or ""))
+        f = self.scan_feed_tree
+        f.delete(*f.get_children())
+        for x in self.scan_feed:
+            f.insert("", "end", values=(x["time"], x["ticker"], (x.get("kind") or "").upper(), STRAT_LABELS.get(x["bot"], x["bot"]),
+                                        fmt_px(x.get("price")), x.get("why", "")))
 
     # ---------------- watchlist ----------------
     def build_watchlist(self, parent):
@@ -10051,7 +10399,7 @@ class App:
             while True:
                 try:
                     # plain values only: Tk must never be touched from this thread
-                    coins = list(dict.fromkeys(list(self._watch_coins) + [c for c, q in list(self.pos.items()) if q > 0]))
+                    coins = list(dict.fromkeys(list(self._watch_coins) + [tick_of(c) for c, q in list(self.pos.items()) if q > 0]))
                     if self.running:  # the main feed already covers the session coins
                         coins = [c for c in coins if c not in self.session_coins]
                     prices = E.spot_many(coins, self._quote_now) if coins else {}
@@ -10120,7 +10468,7 @@ class App:
             px = self.last.get(c)
             st = self.watch_stats.get(c, {})
             base = self.watch_base.get(c)
-            q = self.pos.get(c, 0)
+            q = self.pos.get(c, 0) + self.pos.get(scalp_key(c), 0)
             a = alerts.get(c, {})
             at = " / ".join(f"{'>' if k == 'above' else '<'} {fmt_px(v)}" for k, v in a.items())
             d24 = st.get("change_24h")
@@ -10177,10 +10525,11 @@ class App:
         r = tk.Frame(box, bg=CARD, highlightthickness=1, highlightbackground=LINE)
         badge = tk.Canvas(r, width=40, height=40, bg=CARD, highlightthickness=0)
         badge.grid(row=0, column=0, rowspan=2, padx=8, pady=6)
-        draw_coin_badge(badge, 4, 4, 32, c)
-        name = tk.Label(r, text=c, bg=CARD, fg=TEXT, font=("", 11, "bold"), cursor="hand2")
+        draw_coin_badge(badge, 4, 4, 32, tick_of(c))
+        name = tk.Label(r, text=tick_of(c) + ("  · scalp" if is_scalp_book(c) else ""), bg=CARD, fg=TEXT,
+                        font=("", 11, "bold"), cursor="hand2")
         name.grid(row=0, column=1, sticky="w")
-        name.bind("<Button-1>", lambda e: self.show_on_chart(c))
+        name.bind("<Button-1>", lambda e: self.show_on_chart(tick_of(c)))
         sub = tk.Label(r, text="", bg=CARD, fg=MUTED, font=("", 8))
         sub.grid(row=1, column=1, sticky="w")
         cols = {}
@@ -10196,7 +10545,7 @@ class App:
         share.grid(row=1, column=7, padx=(14, 0))
         b = tk.Frame(r, bg=CARD)
         b.grid(row=0, column=8, rowspan=2, sticky="e", padx=8)
-        ttk.Button(b, text="Buy", width=5, command=lambda: self.trade_dialog("buy", c)).pack(side="left")
+        ttk.Button(b, text="Buy", width=5, command=lambda: self.trade_dialog("buy", tick_of(c))).pack(side="left")
         ttk.Button(b, text="Sell", width=5, command=lambda: self.trade_dialog("sell", c)).pack(side="left", padx=(4, 0))
         r.columnconfigure(7, weight=1)
         return dict(frame=r, sub=sub, share=share, **cols)
@@ -10253,8 +10602,8 @@ class App:
             w = self.pf_rows[c]
             q = self.pos.get(c, 0)
             px = self.position_price(c)  # one contract's value
-            h = self.hist.get(c, [])
-            S = self.last.get(c) or (h[-1] if h else None)
+            h = self.hist.get(tick_of(c), [])
+            S = self.last.get(tick_of(c)) or (h[-1] if h else None)
             day = f"{(h[-1] / h[-n24 - 1] - 1) * 100:+.2f}%" if len(h) > n24 else "-"
             w["day"].config(text=day, fg=(GREEN if day.startswith("+") else RED) if day != "-" else MUTED)
             if q > 0:
@@ -10289,7 +10638,7 @@ class App:
         eq = self.equity()
         if W < 50 or eq <= 0:
             return
-        parts = [(k, q * self.position_price(k)) for k, q in self.pos.items() if q > 0]
+        parts = [(tick_of(k) + (" scalp" if is_scalp_book(k) else ""), q * self.position_price(k)) for k, q in self.pos.items() if q > 0]
         parts.sort(key=lambda x: -x[1])
         parts.append(("Cash", self.cash))
         x = 0
@@ -10297,7 +10646,7 @@ class App:
             wd = W * max(v, 0) / eq
             if wd <= 0:
                 continue
-            col = LINE if name == "Cash" else coin_color(name)
+            col = LINE if name == "Cash" else coin_color(name.split(" ")[0])
             c.create_rectangle(x, 2, x + wd, 14, fill=col, outline=CARD)
             if wd > 48:
                 c.create_text(x + 4, 20, anchor="w", text=f"{name} {v / eq * 100:.0f}%", fill=MUTED, font=("", 7))
@@ -10308,9 +10657,10 @@ class App:
         o = self.opt.get(c)
         if not o or self.pos.get(c, 0) <= 0:
             return messagebox.showinfo("Contract", f"No option contract held on {c} right now.")
-        S = self.last.get(c) or (self.hist.get(c) or [0])[-1]
+        t_ = tick_of(c)
+        S = self.last.get(t_) or (self.hist.get(t_) or [0])[-1]
         T = max(0.0, o["exp"] - time.time()) / E.YEAR
-        vol = E.IV_HINT.get(c) or E.realized_vol(self.hist.get(c) or [S], (self.hx.get(c) or {}).get("t"))
+        vol = E.IV_HINT.get(t_) or E.realized_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
         d, g, th, vg = E.bs_greeks(S, o["K"], T, vol, o["type"])
         q = self.pos[c]
         val = self.position_price(c)
@@ -10350,7 +10700,7 @@ class App:
                                                + (" with a REAL order" if self.live else "") + "?"):
                 return
             self.pending_who[c] = "you (by hand)"
-            return self.sell(c, self.last.get(c, 0), "manual")
+            return self.sell(c, self.last.get(tick_of(c), 0), "manual")
         coin = coin if coin in tickers else tickers[0]
         w = tk.Toplevel(self.root)
         w.title("Buy an option")

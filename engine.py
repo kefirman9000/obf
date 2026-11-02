@@ -2976,6 +2976,7 @@ class Variant:
         self.live_n = 0          # decisions made on prices that came in after the bot was created
         self.live_eq0 = None     # its equity when it started trading live (after any replay)
         self.log = deque(maxlen=300)  # (decision number, coin, side, price) of this bot's own trades, for charts
+        self.log_ct = {}  # (decision, ticker) -> "call" / "put" of the contract traded there
         self.trade_eq = deque(maxlen=SCALP_JUDGE + 1)  # scalpers: (decision, equity) after each finished trade
 
     @property
@@ -3512,6 +3513,12 @@ class Tournament:
         made = bot_step(v, closes, n, self.coins, x)
         for c, t in made:
             v.log.append((n, c, t["side"], last[c]))
+            typ_ = (t.get("contract") or {}).get("type")
+            if typ_:  # call or put, for the chart marks and the farm's trade pop-ups
+                v.log_ct[(n, c)] = typ_
+                if len(v.log_ct) > 700:
+                    keep = {(x[0], x[1]) for x in v.log}
+                    v.log_ct = {k_: x for k_, x in v.log_ct.items() if k_ in keep}
             v.ntrades += 1
             if t["side"] == "sell":
                 if t["pl"] > 0:
@@ -3572,9 +3579,9 @@ class Tournament:
         self.n += 1
         self.xfull = extra
         self._market(closes)
-        for c in self.coins:
-            self.cool[c] = max(0, self.cool.get(c, 0) - 1)
-            self.add_cool[c] = max(0, self.add_cool.get(c, 0) - 1)
+        for k in set(self.coins) | set(self.cool) | set(self.add_cool):
+            self.cool[k] = max(0, self.cool.get(k, 0) - 1)
+            self.add_cool[k] = max(0, self.add_cool.get(k, 0) - 1)
         for v in self.vars:
             self._run(v, closes, self.n, self.mood)
         self._rate()
@@ -3725,7 +3732,10 @@ class Tournament:
             if w > 0 and v.twin is not None and v.twin <= 0:
                 w *= 0.6  # failed its twin test: probably lucky, so it counts for less
             if w > 0 and o.get("luck_check", True):
-                w *= luck_factor(v)  # a great score from a handful of trades counts for less than one from many
+                w *= luck_factor(v)
+            scn = getattr(v, "scan", None)  # scalp scan: [trades, wins, pl, paid] on other tickers today
+            if w > 0 and scn and scn[0] >= 10 and scn[3] > 0:
+                w *= 1.2 if scn[2] > 0 else 0.75  # a great score from a handful of trades counts for less than one from many
             if w > 0 and o["regime_aware"]:
                 fit = self.mood_fit(v)
                 if fit is not None:
@@ -3775,15 +3785,20 @@ class Tournament:
     def _holding(v, c):
         return v.sim.pos.get(c, 0) > 0
 
-    def vote(self, c):
+    def vote(self, c, breed=None, key=None):
         """-> (signal, size multiplier). Winners vote at full weight, shaky strategies at a
         small weight. A vote that only shaky strategies want must wait out a cooldown, so they
         trade slowly. When nobody has a fresh signal but strong winners are holding the coin,
-        the account adds to the position now and then (self.kind[c] == "add")."""
-        self.kind[c] = None
+        the account adds to the position now and then (self.kind[key] == "add").
+        breed: "scalp" = only scalpers vote, "long" = everyone else, None = the whole farm. key: where this vote's
+        cooldowns and notes are kept (the account's book for this ticker; defaults to the ticker)."""
+        key = key or c
+        keep = (lambda v: True) if breed is None else (lambda v: is_scalp(v.name) == (breed == "scalp"))
+        active, slowed = [v for v in self.active if keep(v)], [v for v in self.slowed if keep(v)]
+        self.kind[key] = None
         bw = sw = bs = ss = 0.0
         act_buy = act_sell = False
-        for v in self.active + self.slowed:
+        for v in active + slowed:
             d, s = self.info[id(v)], v.sig.get(c)
             is_act = d["status"] == "active"
             if s == "buy":
@@ -3801,23 +3816,23 @@ class Tournament:
             sig, mult, from_winner = "sell", ss / sw, act_sell
         if sig == "buy" and self.o.get("agree_sizing", True):
             # several DIFFERENT strategies agreeing = more confidence; a split farm = less
-            kinds = {v.name for v in self.active + self.slowed if v.sig.get(c) == "buy"}
+            kinds = {v.name for v in active + slowed if v.sig.get(c) == "buy"}
             split = sw / (bw + sw) if bw + sw else 0.0
             agree = min(1.3, 0.85 + 0.15 * (len(kinds) - 1)) * (1 - 0.6 * split)
-            self.agree[c] = (len(kinds), round(agree, 2), round(split, 2))
+            self.agree[key] = (len(kinds), round(agree, 2), round(split, 2))
             mult *= agree
         if sig and not from_winner:  # only shaky strategies want this: slow it down
-            if self.cool.get(c, 0) > 0:
+            if self.cool.get(key, 0) > 0:
                 return None, 1.0
-            self.cool[c] = self.o["slow_every"]
-            self.kind[c] = "slow"
-        if sig is None and self.o["trade_more"] and self.add_cool.get(c, 0) == 0:
-            holders = [v for v in self.active if self._holding(v, c) and self.info[id(v)]["cons"] >= 0.75]
+            self.cool[key] = self.o["slow_every"]
+            self.kind[key] = "slow"
+        if sig is None and self.o["trade_more"] and self.add_cool.get(key, 0) == 0:
+            holders = [v for v in active if self._holding(v, c) and self.info[id(v)]["cons"] >= 0.75]
             hw = sum(self.info[id(v)]["weight"] for v in holders)
-            tw = sum(self.info[id(v)]["weight"] for v in self.active)
+            tw = sum(self.info[id(v)]["weight"] for v in active)
             if holders and hw * 2 > tw:  # winners with most of the weight are still in this coin
-                self.add_cool[c] = self.o["add_every"]
-                self.kind[c] = "add"
+                self.add_cool[key] = self.o["add_every"]
+                self.kind[key] = "add"
                 avg = sum(self.info[id(v)]["weight"] * self.info[id(v)]["stake"] for v in holders) / hw
                 return "buy", 0.5 * avg
         return sig, mult
@@ -4746,6 +4761,86 @@ def slice_extra(extra, i):
     if not extra:
         return None
     return {c: {k: View(v, i) for k, v in d.items()} for c, d in extra.items() if d}
+
+
+# ---------------- Scalp scan: the scalpers roam the market during the trading day ----------------
+SCAN_CASH = 100000.0  # pretend money each scalper gets on each ticker it's tried on (big enough for one contract)
+
+
+def _scan_one(g, sym, bars, day_start):
+    """Replays one scalper (plain genes) over one ticker's 1-minute bars. Only trades from day_start on count;
+    earlier bars just warm up its indicators. -> dict of its day there."""
+    ly = {k: x for k, x in (g.get("layers") or {}).items() if k not in ("ctx", "lead")}  # nothing to watch here
+    vt = {k: x for k, x in (g.get("vetoes") or {}).items() if k != "mktdown"}
+    v = Variant(g["name"], dict(g["params"]), make_sim(SCAN_CASH, 0.0, 0.05), 2, g.get("tf", 1), g.get("risk"),
+                g.get("traits"), vt, ly)
+    v.sim.genes = v.traits
+    c, L = bars["c"], len(bars["c"])
+    out = dict(trades=0, wins=0, pl=0.0, paid=0.0, now=None, open=None)
+    for i in range(max(WARM, 1), L):
+        x = {sym: {k: View(bars[k], i + 1) for k in ("h", "l", "v", "t")}}
+        made = bot_step(v, {sym: View(c, i + 1)}, i, [sym], x)
+        if i < day_start:
+            continue
+        for _, t in made:
+            if t["side"] == "sell" and t.get("pl") is not None:
+                out["trades"] += 1
+                out["wins"] += t["pl"] > 0
+                out["pl"] += t["pl"]
+                out["paid"] += t["usd"] - t["pl"]
+            elif t["side"] == "buy" and i == L - 1:  # a setup firing on the newest bar: it's happening right now
+                out["now"] = dict(kind=(t.get("contract") or {}).get("type", ""), price=c[-1], why=v.why.get(sym, ""))
+    q = v.sim.pos.get(sym, 0)
+    if q > 0:  # still in a scalp: count it at today's value
+        o = v.sim.opt.get(sym) or {}
+        worth = v.sim.value_of(sym, c[-1])
+        out["open"] = dict(kind=o.get("type", ""), pl=worth - v.sim.cost.get(sym, 0), paid=v.sim.cost.get(sym, 0))
+    return out
+
+
+def scan_scalps(job):
+    """job: {'bars': {ticker: {c,h,l,v,t}}, 'genes': [{uid, name, params, ...}], 'day': New York date 'YYYY-MM-DD',
+    'spread': {ticker: [a, b, ..]}, 'sspread': %}. Every scalper is tried on every ticker over today's session so far.
+    Runs in its own process. -> {'tickers': {ticker: summary}, 'bots': {uid: [trades, wins, pl, paid]}, 'now': [...]}"""
+    SPREAD_FIT.update(job.get("spread") or {})
+    _SPREAD_LOADED[0] = True
+    if job.get("sspread"):
+        SCALP_SPREAD[0] = float(job["sspread"])
+    day0 = ny_time(job["day"], 9, 30)
+    res = dict(tickers={}, bots={}, now=[])
+    for sym, bars in job["bars"].items():
+        if len(bars.get("c") or ()) < WARM + 5:
+            continue
+        start = next((i for i, t in enumerate(bars["t"]) if t >= day0), len(bars["t"]))
+        if start >= len(bars["t"]) - 1:
+            continue
+        tk_ = dict(trades=0, wins=0, pl=0.0, paid=0.0, best=None, best_pl=None, setups=0)
+        for g in job["genes"]:
+            try:
+                r = _scan_one(g, sym, bars, start)
+            except Exception:
+                continue
+            pl = r["pl"] + (r["open"]["pl"] if r["open"] else 0.0)
+            paid = r["paid"] + (r["open"]["paid"] if r["open"] else 0.0)
+            tk_["trades"] += r["trades"]
+            tk_["wins"] += r["wins"]
+            tk_["pl"] += pl
+            tk_["paid"] += paid
+            tk_["setups"] += r["trades"] + (1 if r["open"] else 0)
+            b = res["bots"].setdefault(g.get("uid", 0), [0, 0, 0.0, 0.0])
+            b[0] += r["trades"]
+            b[1] += r["wins"]
+            b[2] += r["pl"]
+            b[3] += r["paid"]
+            if r["trades"] and (tk_["best_pl"] is None or r["pl"] > tk_["best_pl"]):
+                tk_["best"], tk_["best_pl"] = g["name"], r["pl"]
+            if r["now"]:
+                res["now"].append(dict(r["now"], ticker=sym, bot=g["name"], uid=g.get("uid", 0)))
+        o, c = bars["c"][start - 1] if start else bars["c"][0], bars["c"][-1]
+        tk_["move"] = (c / o - 1) * 100 if o else 0.0
+        tk_["last"] = c
+        res["tickers"][sym] = tk_
+    return res
 
 
 # ---------------- Bot Lab: evolve on old prices, test on newer unseen prices ----------------
