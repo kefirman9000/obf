@@ -4097,7 +4097,7 @@ class Tournament:
         hold = sum(closes[c][end - 1] / closes[c][start - 1] for c in self.coins) / len(self.coins) - 1
         v.twin = ret - hold
         self.events.append(f"Twin test for {v.label}: {'passed' if v.twin > 0 else 'failed'} "
-                           f"({v.twin * 100:+.1f}% vs holding on older prices)")
+                           f"({v.twin * 100:+.1f}% vs the market on older prices)")
         return v.twin
 
     def seasons_tick(self, closes):

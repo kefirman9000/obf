@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.16.1
+- **"Holding" is now "the market"**: everywhere the bots are compared with simply keeping your tickers, the app now says
+  "the market": "beat the market", "+12% vs the market", the VS THE MARKET tile, the grey "market" line on the charts,
+  Free roam's "Beat the market" and "Avg vs the market". It still means the same thing: your tickers bought at the
+  start and left alone (the tooltips and the guide say so). "Holding" a contract keeps its usual meaning.
+
 ## 1.16.0
 - **Farm knowledge** (Learning > Farm knowledge, or the \U0001f4d6 Knowledge button on the farm): everything a farm has
   learned in one place. Ability meters show how much of each kind it has mastered (never-rules, studies, instincts,
