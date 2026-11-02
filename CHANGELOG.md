@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.17.0
+- **Two modes, clearly named**:
+  - **PRACTICE** is everything with pretend money. Under Account, choose where practice trades go: **Stay in OBF**
+    (labelled PRACTICE: simulated inside OBF) or **My Alpaca paper account** (labelled ALPACA PAPER: the orders really
+    go to your Alpaca paper account; needs your paper key). The switch at the top then reads PRACTICE or
+    PRACTICE • ALPACA PAPER, in green.
+  - **LIVE** is real money only: blue, "LIVE • REAL MONEY". With a paper key, clicking LIVE explains how to get to
+    Alpaca paper instead (it used to open your paper account as "LIVE").
+- **Each keeps its own saved session**: PRACTICE, ALPACA PAPER and LIVE never share one. If your saved key is a paper
+  key, the session you had behind LIVE (which was your Alpaca paper account) moves to ALPACA PAPER the first time
+  this version starts.
+- The headline, the account card and the line under the tiles all name the account you're in, and the expiry warning
+  covers every saved session at your broker.
+
 ## 1.16.4
 - **Your Alpaca account's own value**: while you're logged in, a new tile at the top shows the Alpaca account itself
   (ALPACA PAPER ACCOUNT, or ALPACA ACCOUNT (LIVE)) straight from Alpaca, with its change since yesterday's close. It sits

@@ -851,7 +851,7 @@ class App:
                     self.root.after(30000, lambda: (setattr(self, "_save_pending", False), self.save_state()))
                 return
         self._saved_at = time.time()
-        E.save_json(E.state_path(self.live), dict(
+        E.save_json(E.state_path(self.sess_tag()), dict(
             start_cash=self.start_cash, cash=self.cash, pos=self.pos, cost=self.cost,
             trades=self.trades[-10000:], shadow=self.shadow_trades[-4000:], curve=self.curve[-8000:], bench_units=self.bench_units,
             coins=self.session_coins, bar_n=self.bar_n, bar=self.session_bar, quote=self.quote, high=self.high,
@@ -870,7 +870,7 @@ class App:
             return  # routine farm saves: every 20 decisions, and never more than once every 5 minutes
         self._farm_saved = time.time()
         try:
-            E.save_json(E.farm_path(self.live), dict(coins=self.session_coins, bar=self.session_bar,
+            E.save_json(E.farm_path(self.sess_tag()), dict(coins=self.session_coins, bar=self.session_bar,
                                                       saved_at=time.time(), farm=self.tourn.to_state()))
         except Exception:
             note = self._record_error("saving the farm")
@@ -879,7 +879,7 @@ class App:
 
     def load_farm(self):
         """The saved farm for this session, ready to carry on (or None)."""
-        d = E.load_json(E.farm_path(self.live))
+        d = E.load_json(E.farm_path(self.sess_tag()))
         if not isinstance(d, dict) or d.get("coins") != self.session_coins or float(d.get("bar", -1)) != float(self.session_bar):
             return None
         t = E.Tournament(self.session_coins, self.start_cash, *E.cost_model(self.settings)[:1],
@@ -895,7 +895,10 @@ class App:
         mode = self.cfg.get("last_mode", "paper")
         if mode == "live":  # OBF always opens in Practice; the saved LIVE session waits behind the LIVE tab
             if self.saved_session(True):
-                self.write("Your LIVE session is saved. OBF opens in Practice; click LIVE at the top if you want to go back to it.")
+                nm_ = {"alpaca": "ALPACA PAPER", "ibkrpaper": "IBKR PAPER"}.get(self.cfg.get("last_tag"), "LIVE")
+                self.write(f"Your {nm_} session is saved. OBF opens in Practice; "
+                           + ("choose 'Send to my Alpaca paper account' under Practice" if nm_ != "LIVE" else "click LIVE at the top")
+                           + " to go back to it.")
             mode = "paper"
         saved = self.saved_session(False)
         if not saved:
@@ -1314,11 +1317,11 @@ class App:
         self.seg_live = tk.Label(segs, text="LIVE", font=("", 10, "bold"), padx=14, pady=4, cursor="hand2")
         self.seg_paper.pack(side="left")
         self.seg_live.pack(side="left", padx=(2, 0))
-        self.seg_paper.bind("<Button-1>", lambda e: self.switch_mode("paper"))
-        self.seg_live.bind("<Button-1>", lambda e: self.switch_mode("live"))
-        Tip(self.seg_paper, "PRACTICE: pretend money on real prices. Nothing real happens. Has its own session, separate from Live.")
-        Tip(self.seg_live, "Your broker account: ALPACA PAPER with a paper key, LIVE with a real-money key. Has its own session, "
-                           "separate from PRACTICE (which is simulated inside OBF).")
+        self.seg_paper.bind("<Button-1>", lambda e: self.click_practice())
+        self.seg_live.bind("<Button-1>", lambda e: self.click_live())
+        Tip(self.seg_paper, "PRACTICE: pretend money, no real money ever. Trades stay inside OBF (PRACTICE), or go to your "
+                            "Alpaca paper account (ALPACA PAPER): choose under Account on the left.")
+        Tip(self.seg_live, "LIVE: real money, through your broker. Needs your real-money (live) Alpaca key. Has its own session.")
         self.mode_pill = tk.Label(header, text="", bg=CARD, fg=GREEN, font=("", 9, "bold"), padx=10)
         self.mode_pill.pack(side="left")
         self.kill_btn = tk.Button(header, text="\u25a0 KILL", command=self.kill_switch, relief="flat", bd=0, bg="#b91c1c",
@@ -1370,6 +1373,16 @@ class App:
         self.mode_desc = tk.Label(c, text="", bg=CARD, fg=TEXT, font=("", 10, "bold"), anchor="w", justify="left",
                                   wraplength=230)
         self.mode_desc.pack(fill="x")
+        self.dest_row = tk.Frame(c, bg=CARD)
+        self.dest_row.pack(fill="x", pady=(4, 0))
+        tk.Label(self.dest_row, text="Practice trades go to", bg=CARD, fg=MUTED).pack(anchor="w")
+        self.dest_var = tk.StringVar(value="Stay in OBF  (PRACTICE)")
+        self.dest_box = ttk.Combobox(self.dest_row, textvariable=self.dest_var, state="readonly", width=34,
+                                     values=["Stay in OBF  (PRACTICE)", "My Alpaca paper account  (ALPACA PAPER)"])
+        self.dest_box.pack(fill="x")
+        self.dest_box.bind("<<ComboboxSelected>>", lambda e: self.pick_practice_dest())
+        Tip(self.dest_box, "PRACTICE: pretend trades simulated inside OBF. ALPACA PAPER: the same pretend money, but every order "
+                           "really goes to your Alpaca paper account (needs a paper key). Each keeps its own session.")
         self.budget_lbl = tk.Label(c, text="Practice money (pretend, USD)", bg=CARD, fg=MUTED)
         self.budget_lbl.pack(anchor="w", pady=(8, 0))
         self.cash_var = tk.StringVar(value="10000")
@@ -2076,7 +2089,7 @@ class App:
                 add_rows(csv.DictReader(f))
         except (OSError, csv.Error, UnicodeError):
             pass
-        for is_live in (False, True):
+        for is_live in ("paper", "alpaca", "ibkrpaper", "live"):
             saved = E.load_json(E.state_path(is_live), {})
             if isinstance(saved, dict):
                 add_rows(saved.get("trades", []))
@@ -2371,22 +2384,35 @@ class App:
 
     def update_status(self):
         live = self.live if self.session else self.mode_var.get() == "live"
-        self.mode_pill.config(text="\u25cf  RUNNING" if self.running else "", fg=LIVE_BLUE if live else GREEN)
-        on_p, on_l = not live, live
+        acct = self.acct_name(live) if (not live or self.client) else "LIVE"
+        real = acct == "LIVE" and live  # real money: the only thing that's blue and says LIVE
+        self.mode_pill.config(text="\u25cf  RUNNING" if self.running else "", fg=LIVE_BLUE if real else GREEN)
+        on_p, on_l = not real, real
         self.seg_paper.config(bg=GREEN if on_p else LINE, fg="white" if on_p else MUTED,
-                              text="PRACTICE" + ("  \u25cf" if on_p and self.running else ""))
-        nm = self.acct_name(True) if self.client else "LIVE"  # before logging in we can't know which account the key is
-        big = "LIVE  \u2022  REAL MONEY" if nm == "LIVE" else nm
+                              text=("PRACTICE" if acct == "PRACTICE" or real else f"PRACTICE  \u2022  {acct}")
+                                   + ("  \u25cf" if on_p and self.running else ""))
         self.seg_live.config(bg=LIVE_BLUE if on_l else LINE, fg="white" if on_l else MUTED,
-                             text=big + ("  \u25cf" if on_l and self.running else "") if on_l else nm)
-        self.mode_stripe.config(bg=LIVE_BLUE if live else GREEN, height=6 if live else 4)
-        self.body.config(highlightthickness=3 if live else 0, highlightbackground=LIVE_BLUE, highlightcolor=LIVE_BLUE)
-        if live:
+                             text=("LIVE  \u2022  REAL MONEY" + ("  \u25cf" if self.running else "")) if on_l else "LIVE")
+        self.mode_stripe.config(bg=LIVE_BLUE if real else GREEN, height=6 if real else 4)
+        self.body.config(highlightthickness=3 if real else 0, highlightbackground=LIVE_BLUE, highlightcolor=LIVE_BLUE)
+        try:
+            if real:
+                self.dest_row.pack_forget()
+            else:
+                self.dest_row.pack(fill="x", pady=(4, 0), after=self.mode_desc)
+                want = "My Alpaca paper account  (ALPACA PAPER)" if live else "Stay in OBF  (PRACTICE)"
+                if self.dest_var.get() != want:
+                    self.dest_var.set(want)
+        except tk.TclError:
+            pass
+        if real:
             self.headline_lbl.config(bg="#0a1f4d" if DARK else "#eff6ff", fg="#bfdbfe" if DARK else "#0b3aa8")
         else:
             self.headline_lbl.config(bg="#052e16" if DARK else "#ecfdf5", fg="#bbf7d0" if DARK else "#065f46")
-        self.mode_desc.config(text=("LIVE: your Alpaca account (paper or real money)." if live else
-                                    "PRACTICE: pretend money on real prices."), fg=LIVE_BLUE if live else GREEN)
+        self.mode_desc.config(text={"PRACTICE": "PRACTICE: pretend money on real prices, simulated inside OBF.",
+                                    "ALPACA PAPER": "ALPACA PAPER: pretend money, orders sent to your Alpaca paper account.",
+                                    "IBKR PAPER": "IBKR PAPER: pretend money, orders sent to your IBKR paper account."}.get(
+                                        acct, "LIVE: REAL MONEY through your broker."), fg=LIVE_BLUE if real else GREEN)
         if not self.running:
             saved = None if self.session else self.saved_session(live)
             if self.session:
@@ -2424,7 +2450,7 @@ class App:
         """The saved session for a mode (cached; re-read only when the file changes), or None."""
         if live is None:
             live = self.mode_var.get() == "live"
-        path = E.state_path(live)
+        path = E.state_path(self.sess_tag(live))
         return self._cached(path, lambda: E.load_json(path)) if os.path.exists(path) else None
 
     def start_choice(self, choice):
@@ -2437,14 +2463,56 @@ class App:
         finally:
             self._choice = "continue"
 
-    def switch_mode(self, target):
+    def is_paper_key(self):
+        return bool(self.client) and self.broker() == "alpaca" and bool(E.ALPACA.get("paper", True))
+
+    def click_practice(self):
+        """PRACTICE on the switch: practice inside OBF (or stay on Alpaca paper if that's where practice already is)."""
+        live = self.live if self.session else self.mode_var.get() == "live"
+        if live and self.acct_name(True) != "LIVE":
+            return  # already practising, on the broker's paper account
+        self.switch_mode("paper")
+        self.dest_var.set("Stay in OBF  (PRACTICE)")
+
+    def click_live(self):
+        """LIVE on the switch: real money only. With a paper key, explain where paper trading lives now."""
+        if self.client and self.acct_name(True) != "LIVE":
+            return messagebox.showinfo(
+                "LIVE is real money", "LIVE trades real money and needs your live (real-money) Alpaca key. You're logged in "
+                                      "with a paper key.\n\nTo trade your Alpaca paper account, stay in PRACTICE and choose "
+                                      "'My Alpaca paper account' under Practice trades go to (Account, on the left).\n\n"
+                                      "To trade real money, log out (Account menu) and log in with your live key.")
+        self.switch_mode("live")
+
+    def pick_practice_dest(self):
+        """Practice trades go to: inside OBF (PRACTICE) or your Alpaca paper account (ALPACA PAPER)."""
+        want_paper = self.dest_var.get().startswith("My Alpaca")
+        live = self.live if self.session else self.mode_var.get() == "live"
+        if not want_paper:
+            if live:
+                self.switch_mode("paper")
+            return
+        if not self.client:
+            self.dest_var.set("Stay in OBF  (PRACTICE)")
+            if messagebox.askyesno("Alpaca paper", "Sending practice trades to Alpaca needs your Alpaca PAPER key.\n\nLog in now?"):
+                self.open_login()
+            return
+        if not self.is_paper_key():
+            self.dest_var.set("Stay in OBF  (PRACTICE)")
+            return messagebox.showinfo("Alpaca paper", "You're logged in with a real-money (live) key. Log out (Account "
+                                                       "menu) and log in with your paper key to send practice trades to "
+                                                       "your Alpaca paper account.")
+        if not live:
+            self.switch_mode("live", quiet=True)
+
+    def switch_mode(self, target, quiet=False):
         """Practice and Live are separate: each keeps its own session. Switching saves and closes the current
         one, clears the screen, then shows the other mode (press Start to resume its saved session)."""
         cur = "live" if (self.live if self.session else self.mode_var.get() == "live") else "paper"
         if target == cur:
             return
-        name = {"paper": "Practice", "live": "LIVE"}
-        if target == "live" and not messagebox.askyesno(
+        name = {"paper": "PRACTICE", "live": self.acct_name(True) if self.client else "LIVE"}
+        if target == "live" and not quiet and name["live"] == "LIVE" and not messagebox.askyesno(
                 "Switch to LIVE?", "LIVE trades your Alpaca account (real money with a live key).\n\nSwitch to LIVE mode?\n"
                                    "(No = stay in Practice. Nothing real happens until you also press Start and type LIVE.)"):
             self.write("Stayed in Practice.", "good")
@@ -2471,7 +2539,7 @@ class App:
         self.refresh_board()
         self.refresh_trades()
         self.refresh_view()
-        saved = E.load_json(E.state_path(target == "live"))
+        saved = E.load_json(E.state_path(self.sess_tag(target == "live")))
         if saved:
             self.write(f"Now in {name[target]}. A saved {name[target]} session is waiting (cash ${saved.get('cash', 0):,.2f}, "
                        f"{len(saved.get('trades', []))} trades): press Start to resume it.", "good" if target == "paper" else "warn")
@@ -2504,7 +2572,8 @@ class App:
 
     def headline(self):
         live = self.live if self.session else self.mode_var.get() == "live"
-        mode = "LIVE mode (real money)" if live else "Practice mode (pretend money)"
+        mode = {"PRACTICE": "PRACTICE (pretend money, inside OBF)", "ALPACA PAPER": "PRACTICE on your ALPACA PAPER account",
+                "IBKR PAPER": "PRACTICE on your IBKR PAPER account"}.get(self.acct_name(live), "LIVE (real money)")
         if not self.running:
             if not self.session:
                 return f"Ready. You're in {mode}. Pick your coins, then press Start."
@@ -3267,6 +3336,11 @@ class App:
         self.tile_subs["broker"].config(text=f"today {ch:+,.2f} ({ch / b['last'] * 100 if b['last'] else 0:+.2f}%)",
                                         fg=GREEN if ch > 0 else RED if ch < 0 else MUTED)
 
+    def sess_tag(self, live=None):
+        """The saved-session file for a mode: PRACTICE, ALPACA PAPER, IBKR PAPER and LIVE each keep their own."""
+        live = (self.live if self.session else self.mode_var.get() == "live") if live is None else live
+        return {"PRACTICE": "paper", "ALPACA PAPER": "alpaca", "IBKR PAPER": "ibkrpaper"}.get(self.acct_name(live), "live")
+
     def acct_name(self, live=None):
         """What the account is called on screen: PRACTICE (simulated inside OBF), ALPACA PAPER / IBKR PAPER (the broker's
         own paper account) or LIVE (real money)."""
@@ -3341,7 +3415,9 @@ class App:
                 self.write(note, "bad")
         gap = pl - hold
         if not self.session or not self.curve:
-            self.verdict_lbl.config(text="Press 'Start the bot' to begin. Practice mode uses pretend money.", fg=MUTED)
+            nm_ = self.acct_name()
+            self.verdict_lbl.config(text="Press 'Start the bot' to begin. " + (
+                "LIVE uses REAL money." if nm_ == "LIVE" else f"{nm_} uses pretend money."), fg=RED if nm_ == "LIVE" else MUTED)
         elif abs(gap) < 0.005 * self.start_cash:
             self.verdict_lbl.config(text="Doing about the same as the market so far.", fg=MUTED)
         elif gap > 0:
@@ -3445,7 +3521,7 @@ class App:
                 pl, hold = self.equity() - self.start_cash, self.bench_equity() - self.start_cash
                 self.write(f"Stopped. Profit/loss {pl:+,.2f} (the market would be {hold:+,.2f}).")
             return
-        resuming = bool(E.load_json(E.state_path(self.mode_var.get() == "live"))) and \
+        resuming = bool(E.load_json(E.state_path(self.sess_tag(self.mode_var.get() == "live")))) and \
             getattr(self, "_choice", "continue") != "new"
         if (not self.session and not resuming and self.wild_var.get() and int(self.settings.get("auto_coins", 0)) > 0
                 and not getattr(self, "_scouted", False)):
@@ -3477,7 +3553,8 @@ class App:
         if self.session and self.live and not self.client:
             return messagebox.showerror("Live mode", "Log in to Alpaca first.")
         self.running = True
-        self.cfg.update(was_running=True, last_mode="live" if self.live else "paper", last_wild=bool(self.wild_var.get()))
+        self.cfg.update(was_running=True, last_mode="live" if self.live else "paper", last_tag=self.sess_tag(),
+                        last_wild=bool(self.wild_var.get()))
         try:
             E.save_json(CONFIG_PATH, self.cfg)
         except OSError:
@@ -3491,14 +3568,14 @@ class App:
 
     def begin_session(self, coins, quiet=False):
         live = self.mode_var.get() == "live"
-        saved = E.load_json(E.state_path(live))
+        saved = E.load_json(E.state_path(self.sess_tag(live)))
         resume = False
         if saved:  # the Continue / Start new buttons decide (no pop-up)
             resume = getattr(self, "_auto_resume", False) or getattr(self, "_choice", "continue") != "new"
         if not resume:
             self._restored_farm = None
             try:
-                os.remove(E.farm_path(live))  # a new session starts a new farm
+                os.remove(E.farm_path(self.sess_tag(live)))  # a new session starts a new farm
             except OSError:
                 pass
         try:
@@ -3729,7 +3806,7 @@ class App:
                 self.toggle()
             if self.tourn:
                 self.save_farm_copy()
-            shutil.copy2(p_, E.farm_path(self.live))
+            shutil.copy2(p_, E.farm_path(self.sess_tag()))
             w.destroy()
             if self.session and d.get("coins") == self.session_coins and float(d.get("bar", -1)) == float(self.session_bar):
                 t_ = self.load_farm()
@@ -3770,7 +3847,7 @@ class App:
             self.toggle()
         for live in (self.live,):
             try:
-                os.remove(E.farm_path(live))
+                os.remove(E.farm_path(self.sess_tag(live)))
             except OSError:
                 pass
         self.tourn, self.seeded, self._restored_farm = None, False, None
@@ -3792,7 +3869,7 @@ class App:
             self.save_farm(force=True)
         self.ui_running(False)
         try:
-            os.remove(E.state_path(self.live))
+            os.remove(E.state_path(self.sess_tag()))
         except OSError:
             pass
         self.session = False
@@ -7525,22 +7602,28 @@ class App:
             self.root.after(60000, self.expiry_guard)
 
     def guard_other_mode(self):
-        """In Practice, the saved LIVE session's contracts aren't on screen, so the guard can't sell them: warn."""
-        if self.live or time.time() - getattr(self, "_other_warned", 0) < 6 * 3600:
-            return
-        try:
-            st = E.load_json(E.state_path(True), {}) or {}
-        except Exception:
+        """Sessions at the broker (ALPACA PAPER, IBKR PAPER, LIVE) that aren't on screen can't be sold by the expiry guard:
+        warn about their contracts close to expiry."""
+        if time.time() - getattr(self, "_other_warned", 0) < 6 * 3600:
             return
         days = max(1, int(self.settings.get("expiry_days", 2) or 2))
-        near = [f"  {c} {o.get('K', 0):g} {o.get('type', '')} (expires {datetime.fromtimestamp(o['exp']).strftime('%a %b %d')})"
-                for c, o in (st.get("opt") or {}).items()
-                if (st.get("pos") or {}).get(c, 0) > 0 and o.get("exp") and E.sessions_left(o["exp"]) <= days + 1]
+        near = []
+        for tag_, nm_ in (("alpaca", "ALPACA PAPER"), ("ibkrpaper", "IBKR PAPER"), ("live", "LIVE")):
+            if self.session and tag_ == self.sess_tag():
+                continue  # that one is on screen: the guard handles it
+            try:
+                st = E.load_json(E.state_path(tag_), {}) or {}
+            except Exception:
+                continue
+            near += [f"  {nm_}: {tick_of(c)} {o.get('K', 0):g} {o.get('type', '')} "
+                     f"(expires {datetime.fromtimestamp(o['exp']).strftime('%a %b %d')})"
+                     for c, o in (st.get("opt") or {}).items()
+                     if (st.get("pos") or {}).get(c, 0) > 0 and o.get("exp") and E.sessions_left(o["exp"]) <= days + 1]
         if near:
             self._other_warned = time.time()
-            msg = ("Your LIVE session holds contracts close to expiry:\n" + "\n".join(near) + "\n\nOBF is in Practice, so "
-                   "the expiry guard can't sell them. Click LIVE at the top (you can leave the bot stopped) and the guard "
-                   "sells them within a minute.")
+            msg = ("A saved session at your broker holds contracts close to expiry:\n" + "\n".join(near) + "\n\nThat session "
+                   "isn't open, so the expiry guard can't sell them. Open it (LIVE at the top, or Practice > Send to my Alpaca "
+                   "paper account; you can leave the bot stopped) and the guard sells them within a minute.")
             self.write(msg.replace("\n", " "), "bad")
             try:
                 messagebox.showwarning("LIVE contracts near expiry", msg)
@@ -8712,6 +8795,14 @@ class App:
 
     def auto_login(self):
         creds = E.load_login()
+        try:
+            if creds and E.migrate_paper_sessions(creds[2]):
+                if self.cfg.get("last_mode") == "live" and not self.cfg.get("last_tag"):
+                    self.cfg["last_tag"] = "alpaca"
+                self.write("Your saved Alpaca paper session now lives under PRACTICE > 'My Alpaca paper account' "
+                           "(it used to sit behind LIVE). LIVE is for real money only.", "good")
+        except Exception:
+            pass
         if creds and not self.client:
             self.write("Saved Alpaca login found, connecting...")
             self.start_login(*creds, remember=False)
@@ -10396,7 +10487,11 @@ class App:
         if not self.settings.get("auto_resume", True) or not self.cfg.get("was_running") or self.running:
             return
         mode = self.cfg.get("last_mode", "paper")
-        saved = E.load_json(E.state_path(mode == "live"))
+        tag_ = self.cfg.get("last_tag")
+        if not tag_ and mode == "live":  # sessions from before 1.17: a paper key's session belongs to ALPACA PAPER
+            lg = E.load_login()
+            tag_ = "alpaca" if (lg and lg[2] and os.path.exists(E.state_path("alpaca"))) else "live"
+        saved = E.load_json(E.state_path(tag_ or (mode == "live")))
         if not saved:
             return
         if mode == "live":
