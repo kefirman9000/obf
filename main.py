@@ -166,7 +166,7 @@ SETTING_GROUPS = [
     ("Learning", "What the bots are allowed to learn from. Everything is on by default; untick anything you'd rather "
                  "they didn't use. Changes apply to new eggs right away, and to the whole farm as it breeds.", [
         (None, "How bots are judged", "head"),
-        ("beat_hold", "Must beat just holding the coins to count as Winning", bool),
+        ("beat_hold", "Must beat the market (its tickers left alone) to count as Winning", bool),
         ("risk_adjusted", "Rank by steady gains (gain per unit of downside), not the biggest gain", bool),
         ("prove_live", "Must also win on fresh prices it hadn't seen (guards against luck)", bool),
         ("twin_test", "Twin test: a copy re-run on older prices; lucky winners count for less", bool),
@@ -243,7 +243,7 @@ SETTING_GROUPS = [
         ("animations", "Animations (Light uses less computer power)", "anim"),
         ("egg_colors", "Egg colours: by dragon type, or all purple (royal eggs from your own bots are always gold, "
                        "famous strategies silver)", "eggs"),
-        ("daily_recap", "Daily recap: once a day, how the bots did against just holding (in the log, and as a note on the "
+        ("daily_recap", "Daily recap: once a day, how the bots did against the market (in the log, and as a note on the "
                         "icon by the clock)", bool),
         ("auto_backup", "Weekly backup: keep a copy of your bots, farms and settings in the data folder (last 4 kept, no keys)", bool),
         ("bg_mode", "Background mode: while OBF is minimized, skip all drawing and check watchlist prices less often", bool),
@@ -1022,7 +1022,7 @@ class App:
                     live=bool(self.live))
 
     def daily_recap(self):
-        """Once a day: how the bots did yesterday against just holding (a note on the icon, and in the log)."""
+        """Once a day: how the bots did yesterday against the market (a note on the icon, and in the log)."""
         if not self.settings.get("daily_recap", True) or not (self.session and self.running):
             return
         base = self.cfg.get("recap_base")
@@ -1035,7 +1035,7 @@ class App:
             hold = (now["hold"] / base["hold"] - 1) * 100 if base.get("hold") else 0.0
             new = now["beasts"] - int(base.get("beasts", 0))
             where = "LIVE" if self.live else "practice"
-            msg = (f"Since {base['day']}: the bots made {got:+.2f}% on {where} vs {hold:+.2f}% just holding"
+            msg = (f"Since {base['day']}: the bots made {got:+.2f}% on {where} vs {hold:+.2f}% for the market"
                    + (f", {new} new BEAST{'S' if new != 1 else ''}" if new > 0 else "") + ".")
             self.write("Daily recap: " + msg, "good" if got >= hold else None)
             if self.tray is not None:
@@ -1059,18 +1059,18 @@ class App:
         top = act[0] if act else None
         if top:
             d = t.info.get(id(top), {})
-            out.append((d.get("edge") is not None and d["edge"] > 0, "The top bot beats just holding",
-                        f"{(d.get('edge') or 0) * 100:+.1f}% vs holding over its recent window."))
+            out.append((d.get("edge") is not None and d["edge"] > 0, "The top bot beats the market",
+                        f"{(d.get('edge') or 0) * 100:+.1f}% vs the market over its recent window."))
             n = len(top.sim.tbars)
             out.append((E.luck_factor(top) >= 0.75 if hasattr(E, "luck_factor") else n >= 20,
                         "The top bot's record rests on enough trades", f"{n} trades in its window (want about 20+)."))
             out.append((top.twin is not None and top.twin > 0, "The top bot passed its twin test",
-                        "Not tested yet." if top.twin is None else f"{top.twin * 100:+.1f}% vs holding on older prices."))
+                        "Not tested yet." if top.twin is None else f"{top.twin * 100:+.1f}% vs the market on older prices."))
             dd = t.drawdown(top) * 100
             out.append((dd < 10, "The top bot isn't in a deep slump", f"{dd:.1f}% below its recent best (want under 10%)."))
         pl, hold = self.equity() - self.start_cash, self.bench_equity() - self.start_cash
-        out.append((pl > 0 and pl >= hold, "The practice account is beating just holding",
-                    f"{pl:+,.2f} vs {hold:+,.2f} holding this session."))
+        out.append((pl > 0 and pl >= hold, "The practice account is beating the market",
+                    f"{pl:+,.2f} vs {hold:+,.2f} for the market this session."))
         return out
 
     def open_live_check(self):
@@ -1628,7 +1628,7 @@ class App:
         self.build_farm_strip(t2)
         self.board = self.make_tree(t2, ("strategy", "recent", "edge", "consistent", "winrate", "life", "size", "status", "trades"),
                                     (230, 70, 80, 70, 65, 70, 55, 170, 55),
-                                    ("Strategy", "Recent gain", "vs holding", "Wins lately", "Win rate", "Lifetime",
+                                    ("Strategy", "Recent gain", "vs the market", "Wins lately", "Win rate", "Lifetime",
                                      "Size", "What the bot does", "Trades"))
         self.board.bind("<Double-1>", lambda e: self.bot_detail(quiet=True) if self.on_row(self.board, e) else None)
         for btn in ("<Button-3>", "<Button-2>"):
@@ -1972,7 +1972,7 @@ class App:
                         lt = b.get("lifetime") or {}
                         fh.write(f"{n}. {E.bot_nickname(E.bot_key(b))}\n   {b['rules']}\n")
                         if lt:
-                            fh.write(f"   Results: return {lt.get('return_pct')}%, vs holding {lt.get('vs_holding_pct')}%, "
+                            fh.write(f"   Results: return {lt.get('return_pct')}%, vs the market {lt.get('vs_holding_pct')}%, "
                                      f"win rate {lt.get('win_rate_pct')}%, fees ${lt.get('fees_paid', '-')}\n")
                         fh.write("\n")
             self.write(f"Exported {len(payload['bots'])} bots to {p}" + (" (+ .txt summary)" if also_txt.get() else ""))
@@ -2568,7 +2568,7 @@ class App:
             "GETTING STARTED\n"
             "1. Log in with a free Alpaca paper key (Account > Log in to Alpaca): that's where prices come from.\n"
             "2. Tick the tickers to trade (or leave 'Bot picks' on), keep 'Let the bot choose (Wildcard)' ticked.\n"
-            "3. Pick a Risk style, then press Start. Blue line = your account, grey = just holding the stock.\n\n"
+            "3. Pick a Risk style, then press Start. Blue line = your account, grey = the market (your tickers bought at the start and left alone).\n\n"
             "LEARNING FROM THE PAST\n"
             "Tools > Learning: backtest any bot on any stretch since 2016, send a whole farm through Training camp, or "
             "switch on Free roam and let the farm study by itself (it only runs while it's switched ON).\n\n"
@@ -2580,7 +2580,7 @@ class App:
             "Practice for a good while first, then try your Alpaca or IBKR paper account, then small real amounts.\n\n"
             "HONEST WARNING\n"
             "Options can lose their whole value quickly, and no strategy wins reliably. If the blue line stays below "
-            "the grey one, the bots aren't beating simply holding."), parent=parent)
+            "the grey one, the bots aren't beating the market."), parent=parent)
 
     def show_glossary(self, parent=None):
         if parent is None:
@@ -2600,7 +2600,7 @@ class App:
             "Egg, Rising, BEAST: a bot's stage, from newborn to dominant. Hall of Fame: the champions you pick.\n"
             "Never-rule: something a bot refuses to do (like 'no new contracts before the Fed'), graded in hindsight.\n"
             "Backtest: replaying past prices to see how a bot would have done. Past results don't predict the future.\n"
-            "vs holding: how much better (or worse) a bot did than simply holding the stock.\n"
+            "vs the market: how much better (or worse) a bot did than the market, meaning its tickers bought at the start and left alone.\n"
             "Drawdown: the biggest drop from a peak, a measure of how bumpy the ride was.\n"
             "Implied volatility (IV): how big a move the market is pricing in. High IV = expensive options."), parent=parent)
 
@@ -2667,8 +2667,8 @@ class App:
     PANEL_VIEWS = ("Account value", "Profit / loss %", "Drawdown", "Cash vs invested", "Selected bot", "Hall of Fame shadow")
     PANEL_TIPS = {"Hall of Fame shadow": "Shadow Live: what your Hall of Fame bots alone would have made with pretend "
                                          "money (gold), next to your account (blue).",
-                  "Account value": "Your account's value (blue) next to what just holding would be worth (grey).",
-                  "Profit / loss %": "Profit or loss since the start, in %, for the account and for just holding.",
+                  "Account value": "Your account's value (blue) next to the market (grey): your tickers bought at the start and left alone.",
+                  "Profit / loss %": "Profit or loss since the start, in %, for the account and for the market.",
                   "Drawdown": "How far the account is below its best point so far. Closer to 0 is better.",
                   "Cash vs invested": "How much is in cash and how much is in coins over time.",
                   "Selected bot": "The equity of the bot selected on the farm or scoreboard (or the best one)."}
@@ -2711,7 +2711,7 @@ class App:
                                "On coin charts: the buys (hollow up arrows) and sells (hollow down arrows) of the "
                                "bot selected on the farm or scoreboard, or the best one if none is selected."),
                               (self.chart_marks, "My trades", "Filled arrows where your account bought and sold."),
-                              (self.chart_hold, "Holding", "The grey 'just holding' line on account charts."),
+                              (self.chart_hold, "Market", "The grey 'market' line on account charts: your tickers bought at the start and left alone."),
                               (self.chart_pct, "%", "Show change in % instead of dollars or prices.")):
             cb = ttk.Checkbutton(bar, text=txt, variable=var, style="Card.TCheckbutton", command=self.chart_opts_changed)
             cb.pack(side="right", padx=(5, 0))
@@ -2852,7 +2852,7 @@ class App:
             sc = self.start_cash or 1
             series.append(("account", [(p[2], (p[0] / sc - 1) * 100) for p in pts], ACCENT, 2))
             if self.chart_hold.get():
-                series.insert(0, ("holding", [(p[2], (p[1] / sc - 1) * 100) for p in pts], "#9ca3af", 1))
+                series.insert(0, ("market", [(p[2], (p[1] / sc - 1) * 100) for p in pts], "#9ca3af", 1))
             return series, marks, "%", None
         if view == "Drawdown":
             peak, dd = 0.0, []
@@ -2886,7 +2886,7 @@ class App:
                 pts = [(p[0], p[1], now - (len(pts) - 1 - i) * step) for i, p in enumerate(pts)]
             series.append(("account", [(p[2], p[0]) for p in pts], ACCENT, 2))
             if self.chart_hold.get():
-                series.insert(0, ("holding", [(p[2], p[1]) for p in pts], "#9ca3af", 1))
+                series.insert(0, ("market", [(p[2], p[1]) for p in pts], "#9ca3af", 1))
             if self.chart_marks.get() and pts:
                 import bisect
                 ts_list = [p[2] for p in pts]
@@ -3216,16 +3216,16 @@ class App:
         self.tiles["cash"].config(text=f"${self.cash:,.2f}")
         lead = pl - hold
         if not self.session or not self.curve:
-            self.hold_title.config(text="VS JUST HOLDING")
+            self.hold_title.config(text="VS THE MARKET")
             self.tiles["hold"].config(text="-", fg=TEXT)
         elif abs(lead) < 0.005 * self.start_cash:
-            self.hold_title.config(text="SAME AS HOLDING")
+            self.hold_title.config(text="SAME AS THE MARKET")
             self.tiles["hold"].config(text=f"{lead:+,.2f}", fg=MUTED)
         elif lead > 0:
-            self.hold_title.config(text="BETTER THAN HOLDING")
+            self.hold_title.config(text="BEATING THE MARKET")
             self.tiles["hold"].config(text=f"{lead:+,.2f}", fg=GREEN)
         else:
-            self.hold_title.config(text="BEHIND HOLDING")
+            self.hold_title.config(text="BEHIND THE MARKET")
             self.tiles["hold"].config(text=f"{lead:+,.2f}", fg=RED)
         dd = eq - self.day_eq if self.day_eq else 0.0
         self.tiles["day"].config(text=f"{dd:+,.2f}", fg=GREEN if dd >= 0 else RED)
@@ -3247,11 +3247,11 @@ class App:
         if not self.session or not self.curve:
             self.verdict_lbl.config(text="Press 'Start the bot' to begin. Practice mode uses pretend money.", fg=MUTED)
         elif abs(gap) < 0.005 * self.start_cash:
-            self.verdict_lbl.config(text="Doing about the same as just holding so far.", fg=MUTED)
+            self.verdict_lbl.config(text="Doing about the same as the market so far.", fg=MUTED)
         elif gap > 0:
-            self.verdict_lbl.config(text=f"The bot is ahead of just holding by ${gap:,.2f}.", fg=GREEN)
+            self.verdict_lbl.config(text=f"The bot is ahead of the market by ${gap:,.2f}.", fg=GREEN)
         else:
-            self.verdict_lbl.config(text=f"The bot is behind just holding by ${-gap:,.2f}. That's common, "
+            self.verdict_lbl.config(text=f"The bot is behind the market by ${-gap:,.2f}. That's common, "
                                          f"test the bots under Tools > Learning.", fg=RED)
         if self.session:
             last = self.trades[-1] if self.trades else None
@@ -3307,7 +3307,7 @@ class App:
             if r["status"] == "benched" and r.get("failing"):
                 status = "Stopped (dropped fast)"
             elif r["status"] == "slowed" and r.get("behind"):
-                status = "Shaky (not beating holding)"
+                status = "Shaky (not beating the market)"
             elif r["status"] == "slowed" and r.get("proving"):
                 status = "Proving itself (live prices)"
             lf = r["life"]
@@ -3345,7 +3345,7 @@ class App:
             self.save_state()
             if self.session:
                 pl, hold = self.equity() - self.start_cash, self.bench_equity() - self.start_cash
-                self.write(f"Stopped. Profit/loss {pl:+,.2f} (just holding would be {hold:+,.2f}).")
+                self.write(f"Stopped. Profit/loss {pl:+,.2f} (the market would be {hold:+,.2f}).")
             return
         resuming = bool(E.load_json(E.state_path(self.mode_var.get() == "live"))) and \
             getattr(self, "_choice", "continue") != "new"
@@ -4385,7 +4385,7 @@ class App:
         if (lt.get("return_pct") or 0) <= 0:
             miss.append("no lifetime profit")
         if lt.get("vs_holding_pct") is None or lt["vs_holding_pct"] <= 0:
-            miss.append("not ahead of holding")
+            miss.append("not ahead of the market")
         if (lt.get("trades") or 0) < 5:
             miss.append("fewer than 5 trades")
         bts = b.get("backtests") or []
@@ -4456,13 +4456,13 @@ class App:
         closed = (lf.get("wins") or 0) + (lf.get("losses") or 0)
         for ok, name, why in (
                 ((lf.get("ret") or 0) >= 0.10, "First 10%", "made 10% or more in its life"),
-                ((lf.get("edge") or 0) >= 0.05, "Beat the market", "5%+ ahead of just holding"),
-                ((lf.get("hold") or 0) <= -0.05 and (lf.get("ret") or 0) > 0, "Crash survivor", "made money while holding lost 5%+"),
+                ((lf.get("edge") or 0) >= 0.05, "Beat the market", "5%+ ahead of the market"),
+                ((lf.get("hold") or 0) <= -0.05 and (lf.get("ret") or 0) > 0, "Crash survivor", "made money while the market lost 5%+"),
                 ((lf.get("winrate") or 0) >= 0.7 and closed >= 10, "Sharpshooter", "70%+ wins over 10+ trades"),
                 (hrs >= 24, "Marathon", "a full day spent Winning"),
                 (v.gen >= 5, "Dynasty", "fifth generation or later"),
                 (v.twin is not None and v.twin > 0, "Twin-proven", "passed its twin test"),
-                (any(b.get("edge", 0) > 0 for b in v.backtests), "Backtested", "beat holding in a saved backtest"),
+                (any(b.get("edge", 0) > 0 for b in v.backtests), "Backtested", "beat the market in a saved backtest"),
                 (v.power >= 5, "Powerhouse", "power 5 or more")):
             if ok:
                 out.append((name, why))
@@ -4506,7 +4506,7 @@ class App:
                     rusty += rt["rusty"]
                     E.update_saved(k, lambda e, rt=rt: e.__setitem__("retest", rt), self.version)
                 self.__dict__.pop("_file_cache", None)
-                msg = f"Hall of Fame retest: {len(res) - rusty} still sharp, {rusty} rusty (losing to just holding lately)."
+                msg = f"Hall of Fame retest: {len(res) - rusty} still sharp, {rusty} rusty (losing to the market lately)."
                 self.write(msg, "good" if not rusty else "warn")
                 self.after_hof_change()
             self.q.put(("call", done))
@@ -4699,7 +4699,7 @@ class App:
         tiles = tk.Frame(w, bg=BG)
         tiles.pack(fill="x", padx=12, pady=(10, 0))
         tile_v = {}
-        for i, (key, lab) in enumerate((("ret", "RETURN"), ("hold", "JUST HOLDING"), ("edge", "VS HOLDING"),
+        for i, (key, lab) in enumerate((("ret", "RETURN"), ("hold", "THE MARKET"), ("edge", "VS THE MARKET"),
                                         ("dd", "WORST DROP"), ("trades", "TRADES / WIN RATE"), ("parts", "PARTS WON"))):
             f = tk.Frame(tiles, bg=CARD, highlightthickness=1, highlightbackground=LINE, padx=10, pady=6)
             f.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 6, 0))
@@ -4723,7 +4723,7 @@ class App:
         teach_btn.pack(side="left", padx=6)
         Tip(save_btn, "Keeps what this test learned with the bot: how each of its studies and never-rules did, which "
                       "tickers it struggles with, how it does in each market mood, and the test result. Its children inherit it.")
-        Tip(teach_btn, "Also teaches the whole farm: losing buys go into the post-trade review, and if it beat holding "
+        Tip(teach_btn, "Also teaches the whole farm: losing buys go into the post-trade review, and if it beat the market "
                        "it becomes an elder that nudges future eggs.")
         ttk.Button(btns, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
         df = tk.Frame(w, bg=BG)
@@ -4799,17 +4799,17 @@ class App:
             tile_v["trades"].config(text=f"{r['trades']}  /  " + ("-" if r["winrate"] is None else f"{r['winrate'] * 100:.0f}%"), fg=TEXT)
             tile_v["parts"].config(text=f"{passed} of {len(segs)}", fg=GREEN if passed >= max(1, len(segs) - 1) else TEXT)
             if r["edge"] > 0 and passed >= max(1, len(segs) - 1):
-                verdict.config(text="Solid: it beat just holding overall and in most parts of this stretch.", fg=GREEN)
+                verdict.config(text="Solid: it beat the market overall and in most parts of this stretch.", fg=GREEN)
             elif r["edge"] > 0:
-                verdict.config(text="Mixed: it beat just holding overall, but not in every part. Could be luck.", fg="#f59e0b")
+                verdict.config(text="Mixed: it beat the market overall, but not in every part. Could be luck.", fg="#f59e0b")
             else:
-                verdict.config(text="Weak: it did worse than just holding on this stretch.", fg=RED)
+                verdict.config(text="Weak: it did worse than the market on this stretch.", fg=RED)
             details.config(state="normal")
             details.delete("1.0", "end")
             put("STRESS TESTS\n", "h")
             put(f"Double fees and slippage: {r['fees2x'] * 100:+.2f}%   |   bad-luck drop (95% of shuffled orders): "
                 + ("-" if r["mc_dd95"] is None else f"{r['mc_dd95'] * 100:.1f}%") + f"   |   fees paid ${r['fees']:,.2f}\n")
-            put("WALK-FORWARD PARTS (the bot vs just holding, in each quarter)\n", "h")
+            put("WALK-FORWARD PARTS (the bot vs the market, in each quarter)\n", "h")
             for i, (a_, h_, e_) in enumerate(segs):
                 put(f"  Part {i + 1}: {a_ * 100:+.1f}% vs {h_ * 100:+.1f}%   ")
                 put("won\n" if e_ > 0 else "lost\n", "good" if e_ > 0 else "bad")
@@ -4857,7 +4857,7 @@ class App:
             r = state.get("r")
             W, H = cv.winfo_width(), cv.winfo_height()
             if not r:
-                cv.create_text(W // 2, H // 2, text="The bot's account (blue) and just holding (grey) appear here.", fill=MUTED)
+                cv.create_text(W // 2, H // 2, text="The bot's account (blue) and the market (grey) appear here.", fill=MUTED)
                 return
             W, H, n, lo, hi, X, Y = geom()
             eq, he, times = r["eq"], r["hold_eq"], state["times"]
@@ -4868,7 +4868,7 @@ class App:
                 if k % 2:
                     cv.create_rectangle(x0, 22, x1, H - 26, fill=BG, outline="")
                 e_ = segs[k][2]
-                cv.create_text((x0 + x1) / 2, 30, text=f"part {k + 1}: {e_ * 100:+.1f}% vs holding",
+                cv.create_text((x0 + x1) / 2, 30, text=f"part {k + 1}: {e_ * 100:+.1f}% vs the market",
                                fill=GREEN if e_ > 0 else RED, font=("", 7))
             for k in range(4):
                 yv = lo + (hi - lo) * k / 3
@@ -4897,7 +4897,7 @@ class App:
                     cv.create_polygon(*((x, y + 3, x - 4, y + 10, x + 4, y + 10) if side == "buy" else (x, y - 3, x - 4, y - 10, x + 4, y - 10)),
                                       fill=GREEN if side == "buy" else RED, outline="")
             cv.create_text(W - 12, 6, anchor="ne", fill=MUTED, font=("", 8),
-                           text="blue = the bot   grey = just holding   orange ticks = big news days")
+                           text="blue = the bot   grey = the market   orange ticks = big news days")
             hover()
 
         def hover(e=None):
@@ -4920,7 +4920,7 @@ class App:
             when = datetime.fromtimestamp(times[i]).strftime("%a %b %d %Y %H:%M") if i < len(times) else ""
             b0 = r["eq"][0] or 1
             txt = (f"{when}    bot ${r['eq'][i]:,.0f} ({(r['eq'][i] / b0 - 1) * 100:+.1f}%)    "
-                   f"holding ${r['hold_eq'][i]:,.0f} ({(r['hold_eq'][i] / (r['hold_eq'][0] or 1) - 1) * 100:+.1f}%)")
+                   f"the market ${r['hold_eq'][i]:,.0f} ({(r['hold_eq'][i] / (r['hold_eq'][0] or 1) - 1) * 100:+.1f}%)")
             cv.create_rectangle(64, 4, 64 + 7 * len(txt), 18, fill=CARD, outline="", tags="hover")
             cv.create_text(68, 11, text=txt, anchor="w", fill=TEXT, font=("", 8, "bold"), tags="hover")
 
@@ -4964,7 +4964,7 @@ class App:
         lbl.pack(side="bottom", fill="x")
         t = self.make_tree(w, ("name", "strategy", "ret", "edge", "parts", "dd", "trades", "fees2x"),
                            (150, 180, 80, 90, 80, 80, 60, 90),
-                           ("Bot", "Strategy", "Return", "vs holding", "Parts won", "Worst drop", "Trades", "2x fees"))
+                           ("Bot", "Strategy", "Return", "vs the market", "Parts won", "Worst drop", "Trades", "2x fees"))
         closes = {c: list(self.hist[c]) for c in self.session_coins}
         extra = {c: {k: list(x) for k, x in self.hx[c].items()} for c in self.session_coins} if self.hx else None
         fee, slip = E.cost_model(self.settings)
@@ -5020,7 +5020,7 @@ class App:
             "A whole farm lives through a stretch of past prices, as many times as you like: hatching, competing, breeding "
             "and learning the whole way (between passes the bots keep their genes and lessons, with fresh money). The most "
             "recent part is held back as a final exam: the best bots are frozen and tested on prices they never saw. "
-            "Only the ones that beat just holding in training AND in the exam pass.")).grid(row=1, column=0, columnspan=6,
+            "Only the ones that beat the market in training AND in the exam pass.")).grid(row=1, column=0, columnspan=6,
                                                                                            sticky="w", pady=(2, 10))
         c = self.cfg
         pf = ttk.Frame(f)
@@ -5175,7 +5175,7 @@ class App:
             gen = max((v.gen for v in t.vars), default=0)
             finish(f"Done: {res['passes_done']} pass(es) over {res['train_bars']:,} candles, {gen} generations, "
                    f"{len(t.lineage)} bots lived. " + (f"Exam on the last {res['exam_bars']:,} candles: {passed} passed "
-                                                     f"(holding did {res['exam_hold'] * 100:+.1f}%)." if res["exam_bars"] else ""))
+                                                     f"(the market did {res['exam_hold'] * 100:+.1f}%)." if res["exam_bars"] else ""))
             for i, r in enumerate(res["results"]):
                 g = r["genes"]
                 tree.insert("", "end", iid=str(i), tags=("pass" if r["passed"] else "fail",), values=(
@@ -5617,11 +5617,11 @@ class App:
             good = sum(1 for x in res if x[1] > 0)
             rec = dict(time=time.time(), kind="Self-test", start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=res,
-                       summary=f"{good} of {len(res)} beat holding")
+                       summary=f"{good} of {len(res)} beat the market")
             self._roam_finish(rec, cur)
             if False:
                 self.write(f"◇ Free roam: {len(res)} bots tested themselves on {self._when(info['start'], True)} to "
-                           f"{self._when(info['end'], True)}; {good} beat holding. Lessons saved.")
+                           f"{self._when(info['end'], True)}; {good} beat the market. Lessons saved.")
         self.q.put(("call", apply))
 
     def _roam_scalp(self, t):
@@ -5942,7 +5942,7 @@ class App:
         nb.add(t3, text="  What the results do  ")
         bots = self.make_tree(t1, ("who", "n", "wins", "avg", "best", "worst", "mode", "why"),
                               (130, 50, 90, 90, 70, 70, 90, 420),
-                              ("Bot", "Tests", "Beat holding", "Avg vs holding", "Best", "Worst", "Now", "What it means"))
+                              ("Bot", "Tests", "Beat the market", "Avg vs the market", "Best", "Worst", "Now", "What it means"))
         bots.tag_configure("good", foreground=GREEN)
         bots.tag_configure("mixed", foreground="#f59e0b")
         bots.tag_configure("bad", foreground=RED)
@@ -5955,22 +5955,22 @@ class App:
         lb = tk.Frame(t2, bg=BG)
         lb.pack(fill="both", expand=True)
         log = self.make_tree(lb, ("time", "kind", "strategy", "candles", "status", "why"), (100, 95, 230, 60, 200, 420),
-                             ("Studied", "Study", "Stretch of the past", "Candles", "Market then (holding)", "Result"))
+                             ("Studied", "Study", "Stretch of the past", "Candles", "Market then", "Result"))
         log.tag_configure("good", foreground=GREEN)
         log.tag_configure("bad", foreground=RED)
         log.tag_configure("mixed", foreground="#f59e0b")
         tk.Label(t3, bg=BG, fg=TEXT, justify="left", anchor="nw", wraplength=1100, padx=8, pady=8, font=("", 9), text=(
             "Free roam never trades your account. It works on your farm's bots and memory:\n\n"
             "SELF-TEST  A few of your bots (always including the leader) trade a stretch of the past on their own.\n"
-            "   • Beat just holding (with 4+ trades): the bot becomes an ELDER, so new eggs are more likely to copy it, and "
+            "   • Beat the market (with 4+ trades): the bot becomes an ELDER, so new eggs are more likely to copy it, and "
             "its rules gain evidence and spread to its children.\n"
-            "   • Did worse than holding: nothing is deleted, but its costly rules and the tickers it struggles with are "
+            "   • Did worse than the market: nothing is deleted, but its costly rules and the tickers it struggles with are "
             "written into its memory, so its children drop those rules, and the farm's post-trade review learns which "
             "never-rules would have stopped its losing buys.\n"
             "   • Every result is also kept in the bot's memory (its card shows its tests).\n\n"
             "PRACTICE FARM  A small farm, started from your leaders, lives through a stretch, breeding as it goes, then "
             "sits an exam on the last quarter it never trained on.\n"
-            "   • Bots that beat holding in training AND the exam pass. The best one joins your farm as a 'Free roam "
+            "   • Bots that beat the market in training AND the exam pass. The best one joins your farm as a 'Free roam "
             "graduate' (it still has to prove itself on live prices).\n"
             "   • Your farm also learns the practice farm's memory: its elders, season champions, post-trade review and "
             "which kinds of mutation made winners.\n\n"
@@ -5983,12 +5983,12 @@ class App:
             "   • A scalper with 8+ winning scalps on a day becomes an ELDER, nudging future scalp eggs.\n"
             "   • A new scalper that beats all of yours there (10+ scalps, in profit) joins your farm as a 'Free roam scalp "
             "graduate'. For scalp roams, the % shown is the scalps' profit on the premium paid.\n\n"
-            "HOW THE % IS MEASURED  The money the bot ended with compared with what just holding the same tickers would "
-            "have ended with: +20% = 20% more than holding, -50% = half as much. It can't go below -100% (losing everything). "
+            "HOW THE % IS MEASURED  The money the bot ended with compared with what the market (the same tickers bought at the start and left alone) would "
+            "have ended with: +20% = 20% more than the market, -50% = half as much. It can't go below -100% (losing everything). "
             "For scalp roams it's the scalps' profit on what they paid.\n\n"
-            "HOW TO READ THE 'BEST TO WORST' TAB  Green bots beat holding in at least half their tests and on average: "
+            "HOW TO READ THE 'BEST TO WORST' TAB  Green bots beat the market in at least half their tests and on average: "
             "they're your strongest candidates for the Hall of Fame. Orange = mixed (could be luck). Red = usually worse "
-            "than holding. 'Now' shows whether the bot is still in your farm. One good test can be luck; look for bots "
+            "than the market. 'Now' shows whether the bot is still in your farm. One good test can be luck; look for bots "
             "that win across many different stretches and market moods.")).pack(fill="both", expand=True)
 
         st = dict(n=-1, flt="", feed=0, phase=0.0, fb=None)
@@ -6021,7 +6021,7 @@ class App:
             res = [self.roam_result(r, x) for r in L_ for x in r.get("results", [])]
             grads = [r["graduate"] for r in L_ if r.get("graduate")]
             stats.config(text=(f"Studies: {getattr(self, 'roam_n', 0)}   |   past covered: {covered_days():.0f} days   |   "
-                               f"bot tests: {len(res)} ({sum(1 for x in res if x[1] > 0)} beat holding)   |   "
+                               f"bot tests: {len(res)} ({sum(1 for x in res if x[1] > 0)} beat the market)   |   "
                                f"graduates adopted: {len(grads)}   |   trades this session: {getattr(self, 'roam_trades', 0):,}"))
             if len(L_) != st["n"] or flt.get() != st["flt"]:
                 st["n"], st["flt"] = len(L_), flt.get()
@@ -6059,10 +6059,10 @@ class App:
             for a in self.roam_bots():
                 good = a["avg"] > 0 and a["wins"] * 2 >= a["n"]
                 tag = "good" if good else "bad" if a["wins"] == 0 or a["avg"] < -1 else "mixed"
-                means = ("Strong: beats holding across stretches. Elder; a Hall of Fame candidate." if good and a["n"] >= 3 else
-                         "Promising: beat holding, but needs more tests to rule out luck." if good else
+                means = ("Strong: beats the market across stretches. Elder; a Hall of Fame candidate." if good and a["n"] >= 3 else
+                         "Promising: beat the market, but needs more tests to rule out luck." if good else
                          "Mixed: wins sometimes. Its weak rules are being weeded out." if tag == "mixed" else
-                         "Usually loses to holding. Its costly rules fade in its children.")
+                         "Usually loses to the market. Its costly rules fade in its children.")
                 if a.get("grad"):
                     means = "Practice-farm graduate. " + means
                 bots.insert("", "end", tags=(tag,), values=(
@@ -6555,7 +6555,7 @@ class App:
         box.pack(fill="both", expand=True, padx=8, pady=(6, 6))
         self.slow_tree = self.make_tree(box, ("name", "strategy", "pace", "status", "recent", "edge", "life", "trades", "holds", "stops"),
                                         (130, 170, 90, 120, 70, 80, 80, 55, 90, 190),
-                                        ("Name", "Strategy", "Decides", "Status", "Recent", "vs holding", "Lifetime", "Trades",
+                                        ("Name", "Strategy", "Decides", "Status", "Recent", "vs the market", "Lifetime", "Trades",
                                          "Typical hold", "Own stop / target"))
         self.slow_tree.configure(selectmode="extended")
         for tag, col in (("win", GREEN), ("shaky", "#f59e0b"), ("stopped", MUTED), ("learning", MUTED)):
@@ -6869,7 +6869,7 @@ class App:
                    f"{max((v.gen for v in t.vars), default=0)}  |  {len(t.active)} winning  |  last candle "
                    f"{datetime.fromtimestamp(sl['last_ts']).strftime('%b %d %H:%M') if sl['last_ts'] else '-'}"
                    + (f", next in about {nxt // 60} min" if on else "")
-                   + f"  |  its wallet ${w:,.2f} ({(w / t.start_cash - 1) * 100:+.1f}%, just holding {hold * 100:+.1f}%)")
+                   + f"  |  its wallet ${w:,.2f} ({(w / t.start_cash - 1) * 100:+.1f}%, the market {hold * 100:+.1f}%)")
         self.slow_lbl.config(text=txt)
         self.slow_draw()
         tr = self.slow_tree
@@ -6953,7 +6953,7 @@ class App:
                     E.layers_text(v.layers, v.layer_stats) or "none",
                     "-" if v.twin is None else f"{v.twin * 100:+.1f}%", f"gen {v.gen}, island {v.island + 1}",
                     ", ".join(n for n, _ in self.achievements(v, lf)) or "-"]
-        rows = ["Name", "Strategy", "Settings", "Decides", "Status", "Recent", "Lifetime", "vs holding", "Win rate", "Trades",
+        rows = ["Name", "Strategy", "Settings", "Decides", "Status", "Recent", "Lifetime", "vs the market", "Win rate", "Trades",
                 "Worst drop", "Health / power", "Own stops", "Traits", "Never-rules", "Studies", "Twin test", "Family", "Badges"]
         fa, fb = facts(a), facts(b)
         for i, name in enumerate(rows):
@@ -6973,7 +6973,7 @@ class App:
         w = parent
         w.configure(bg=BG)
         tk.Label(w, text="Each row is a generation. Lines run from parent to child; bright = alive, gold = strong line "
-                         "(a living descendant beating holding). Click a living dragon to open it.", bg=BG, fg=MUTED,
+                         "(a living descendant beating the market). Click a living dragon to open it.", bg=BG, fg=MUTED,
                  padx=10, pady=6, anchor="w").pack(fill="x")
         area = tk.Frame(w, bg=BG)
         area.pack(fill="both", expand=True)
@@ -8152,10 +8152,10 @@ class App:
             lines.append(f"Elders remembered: {len(t.elders)}.")
             best = sorted((r for r in rows if r["life"]["edge"] is not None), key=lambda r: -r["life"]["edge"])[:5]
             if best:
-                lines += ["", "Top dragons (lifetime, vs just holding):"]
+                lines += ["", "Top dragons (lifetime, vs the market):"]
                 for r in best:
                     lines.append(f"  {E.bot_nickname(r['v'].key())} ({STRAT_LABELS.get(r['name'], r['name'])}): "
-                                 f"{r['life']['ret'] * 100:+.1f}%, {r['life']['edge'] * 100:+.1f}% vs holding")
+                                 f"{r['life']['ret'] * 100:+.1f}%, {r['life']['edge'] * 100:+.1f}% vs the market")
         lines += ["", f"Library: {len(E.load_collection())} bots saved, {len(E.load_hof())} in the Hall of Fame."]
         text = "\n".join(lines)
         try:
@@ -8203,7 +8203,7 @@ class App:
                 lf = self.tourn.life(v)
                 where = "the Hall of Fame" if to_hof else "your Bot Library (promote it to the Hall of Fame if you trust it)"
                 msg = (f"Long-term winner: {E.bot_nickname(v.key())} ({friendly_label(v.name, v.params, v.tf, self.session_bar)}) "
-                       f"made {lf['ret'] * 100:+.1f}% ({pct_txt(lf['edge'])} vs holding). Saved to {where}.")
+                       f"made {lf['ret'] * 100:+.1f}% ({pct_txt(lf['edge'])} vs the market). Saved to {where}.")
                 self.write(msg, "good")
                 self.alert("hof", msg)
             self.notify("OBF", f"{len(cands)} long-term winner{'s' if len(cands) != 1 else ''} saved"
@@ -9273,7 +9273,7 @@ class App:
     SECTION_TIPS = {
         "Eggs": "New bots still learning. They hatch once they've seen enough prices and made a few trades.",
         "Rising": "Hatched bots doing OK: shaky, on standby, or winning but not dominant yet. Resting ones are at the end.",
-        "BEASTS": "The dominant ones: winning, steady (3 of the last 4 stretches or more) and ahead of holding. "
+        "BEASTS": "The dominant ones: winning, steady (3 of the last 4 stretches or more) and ahead of the market. "
                   "The account follows these the most.",
         "Hall of Fame": "The bots YOU picked as champions. Only you add or remove them (right-click any bot). "
                         "'Bots trading: Hall of Fame only' trades with just these.",
@@ -9454,7 +9454,7 @@ class App:
                 self.grid_list_box = box
                 self.grid_list = self.make_tree(box, ("tier", "name", "strategy", "status", "recent", "edge", "winrate", "trades", "saved"),
                                                 (80, 140, 190, 140, 70, 75, 65, 55, 110),
-                                                ("Section", "Name", "Strategy", "Status", "Recent", "vs holding", "Win rate",
+                                                ("Section", "Name", "Strategy", "Status", "Recent", "vs the market", "Win rate",
                                                  "Trades", "Saved"))
                 self.grid_list.bind("<Double-1>", lambda e: self.bot_detail(self._list_variant(), quiet=True)
                                     if self.on_row(self.grid_list, e) else None)
@@ -9572,7 +9572,7 @@ class App:
             if t == "beast" and k not in self.beasts_seen and self.running and self.seeded:
                 self.beasts_seen.add(k)
                 msg = (f"{E.bot_nickname(k)} became a BEAST! ({friendly_label(r['name'], r['params'], r.get('tf', 1), self.session_bar)}, "
-                       f"{pct_txt(r['score'])} recently, {pct_txt(r.get('edge'))} vs holding)")
+                       f"{pct_txt(r['score'])} recently, {pct_txt(r.get('edge'))} vs the market)")
                 self.write("\u265b " + msg, "good")
                 self.notify("OBF", msg, sound="hof")
         q = self.grid_search.get().strip().lower() if hasattr(self, "grid_search") else ""
@@ -9686,7 +9686,7 @@ class App:
                                    f"\u265b {gc['BEASTS']} BEASTS   \u2605 {gc['Hall of Fame']} in the Hall of Fame"
                                    + (f"   |   generation {max(v.gen for v in self.tourn.vars)}" if self.tourn and self.tourn.vars else "")
                                    + ("" if awake or not self.tourn else "   |   the farm is asleep (press Start)")
-                                   + "   |   goal: make money after fees, and more than just holding"))
+                                   + "   |   goal: make money after fees, and more than the market"))
         try:
             self.pulse_lbl.config(text=self.pulse_text())
         except Exception:
@@ -9704,7 +9704,7 @@ class App:
         if not items:
             msgs = {"Eggs": "No eggs right now. New bots appear here while they learn.",
                     "Rising": "Nobody in the middle right now.",
-                    "BEASTS": "No BEASTS yet. A bot becomes one when it keeps winning steadily and beats just holding.\n"
+                    "BEASTS": "No BEASTS yet. A bot becomes one when it keeps winning steadily and beats the market.\n"
                               "It can take a while, and that's the point: they have to earn it.",
                     "Hall of Fame": "The Hall of Fame is empty so far. Bots that stay winners for hours are saved here.",
                     "Caught": "None of the bots on the farm are in your collection yet. Select some and press Catch!"}
@@ -9841,7 +9841,7 @@ class App:
             v = lt.get(k)
             return "-" if v is None else f"{v:+.1f}%"
         c.create_text(x + 10, y + 92, anchor="w", fill=TEXT, font=("", 8), tags="card",
-                      text=f"Lifetime {p('return_pct')}   vs holding {p('vs_holding_pct')}")
+                      text=f"Lifetime {p('return_pct')}   vs the market {p('vs_holding_pct')}")
         hrs = lt.get("hours_winning")
         c.create_text(x + 10, y + 108, anchor="w", fill=MUTED, font=("", 8), tags="card",
                       text=(f"won for {hrs:.1f} h" if hrs is not None else lt.get("source", "")) +
@@ -11979,7 +11979,7 @@ class App:
         self.col_head.pack(anchor="w")
         ttk.Label(top, foreground=MUTED, wraplength=980, text=(
             "Catch bots from the farm, Training camp or the Hall of Fame. Rarity comes from how much they beat "
-            "holding, their win rate and how long they kept winning; catching a bot again levels it up. Pick a team "
+            "the market, their win rate and how long they kept winning; catching a bot again levels it up. Pick a team "
             f"of up to {E.TEAM_MAX} and tick 'Trade with my team' to run Wildcard with just them.")).pack(anchor="w", pady=(2, 6))
         bar = ttk.Frame(top)
         bar.pack(fill="x")
@@ -11990,7 +11990,7 @@ class App:
         cb.pack(side="left", padx=(4, 12))
         ttk.Label(bar, text="Sort by").pack(side="left")
         self.col_sort = tk.StringVar(value="Rarity")
-        sb = ttk.Combobox(bar, textvariable=self.col_sort, values=["Rarity", "Level", "vs holding", "Newest", "Name"],
+        sb = ttk.Combobox(bar, textvariable=self.col_sort, values=["Rarity", "Level", "vs the market", "Newest", "Name"],
                           state="readonly", width=10)
         sb.pack(side="left", padx=4)
         for box in (cb, sb):
@@ -12065,7 +12065,7 @@ class App:
             bots.sort(key=lambda b: (-rk.get(b.get("rarity"), 0), -int(b.get("level") or 1)))
         elif srt == "Level":
             bots.sort(key=lambda b: -int(b.get("level") or 1))
-        elif srt == "vs holding":
+        elif srt == "vs the market":
             bots.sort(key=lambda b: -float((b.get("lifetime") or {}).get("vs_holding_pct") or -999))
         elif srt == "Newest":
             bots.sort(key=lambda b: str(b.get("caught_at", "")), reverse=True)
@@ -12098,7 +12098,7 @@ class App:
                 return "-" if v is None else f"{v:+.1f}%"
             lines = [f"{STRAT_LABELS.get(b['name'], b['name'])}",
                      f"{b.get('rarity', 'Common')}  |  XP {b.get('xp', 0)}",
-                     f"vs holding {p('vs_holding_pct')}",
+                     f"vs the market {p('vs_holding_pct')}",
                      f"win rate {'-' if lt.get('win_rate_pct') is None else str(round(lt['win_rate_pct'])) + '%'}",
                      (E.risk_text(b.get("risk")) or "no own stops")
                      + (f" +{len(b.get('traits') or {})} traits" if b.get("traits") else "")]
@@ -12273,7 +12273,7 @@ class App:
         stats = ttk.Frame(f)
         stats.pack(fill="x")
         info_lbls = {}
-        for i, key in enumerate(("Status", "Recent gain", "vs holding (recent)", "Lifetime return", "Lifetime vs holding",
+        for i, key in enumerate(("Status", "Recent gain", "vs the market (recent)", "Lifetime return", "Lifetime vs the market",
                                  "Win rate", "Trades", "Worst drop", "Time winning", "Best market", "Own stops",
                                  "Family", "Traits", "Fees paid", "Health / power", "Never-rules", "Twin test", "Skips coins",
                                  "Badges", "Island", "Backtests")):
@@ -12311,8 +12311,8 @@ class App:
             parents = self.tourn.lineage.get(v.uid, {}).get("parents", [])
             fam = {"starter": "starter bot", "classic": f"famous strategy: {v.classic}", "bred": f"bred from #{' and #'.join(map(str, parents))}",
                    "tweaked": f"tweaked copy of #{parents[0]}" if parents else "tweaked copy"}.get(v.origin, v.origin or "-")
-            vals = {"Status": st, "Recent gain": pct_txt(d.get("score")), "vs holding (recent)": pct_txt(d.get("edge")),
-                    "Lifetime return": pct_txt(lf["ret"]), "Lifetime vs holding": pct_txt(lf["edge"]),
+            vals = {"Status": st, "Recent gain": pct_txt(d.get("score")), "vs the market (recent)": pct_txt(d.get("edge")),
+                    "Lifetime return": pct_txt(lf["ret"]), "Lifetime vs the market": pct_txt(lf["edge"]),
                     "Win rate": "-" if lf["winrate"] is None else f"{lf['winrate'] * 100:.0f}% ({lf['wins']}W/{lf['losses']}L)",
                     "Trades": str(lf["trades"]), "Worst drop": f"{lf['maxdd'] * 100:.1f}%",
                     "Time winning": f"{hrs:.1f} h" if hrs >= 1 else f"{hrs * 60:.0f} min",
@@ -12321,7 +12321,7 @@ class App:
                     "Health / power": f"{self.tourn.health(v) * 100:.0f}% health, power {v.power:.1f} / 10",
                     "Never-rules": E.vetoes_text(v.vetoes, v.veto_stats) or "none",
                     "Twin test": "not run yet" if v.twin is None else
-                    (f"passed ({v.twin * 100:+.1f}% vs holding on older prices)" if v.twin > 0 else
+                    (f"passed ({v.twin * 100:+.1f}% vs the market on older prices)" if v.twin > 0 else
                      f"failed ({v.twin * 100:+.1f}%): maybe just lucky, counts for less"),
                     "Skips coins": ", ".join(c_ for c_, x in v.coin_pl.items() if x[0] >= 3 and x[1] < -1.5) or "none",
                     "Badges": ", ".join(f"{n}" for n, _ in self.achievements(v, lf)) or "none yet",
@@ -12487,7 +12487,7 @@ class App:
         mid.pack(fill="both", expand=True)
         t = self.make_tree(mid, ("strategy", "edge", "ret", "win", "hours", "best", "stops", "when"),
                            (250, 85, 80, 70, 70, 110, 120, 120),
-                           ("Strategy", "vs holding", "Return", "Win rate", "Hrs winning", "Best market", "Own stops", "Added"))
+                           ("Strategy", "vs the market", "Return", "Win rate", "Hrs winning", "Best market", "Own stops", "Added"))
         t.configure(selectmode="extended")
         state = {"bots": []}
 
