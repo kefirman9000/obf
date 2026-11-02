@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.16.2
+- **The numbers at the top are easier to read**: PROFIT / LOSS now says whose money it counts ("your practice account"
+  or "your LIVE account"), and VS THE MARKET shows its working underneath ("you -52.00 | market -752.00"), so a loss on
+  your account next to "+700 vs the market" makes sense: the account lost much less than your tickers did.
+- **The market figure can't be thrown off by a missing price**: if a ticker had no price for a moment, the market used
+  to count that ticker as worth $0, which made the account look far ahead. It now uses the last known price.
+- **Your account and the farm's tests are kept apart**: the Trades list says PRACTICE ACCOUNT, LIVE ACCOUNT or FARM TEST
+  (instead of PAPER / LIVE / BOT), and the farm's pretend test trades are hidden unless you tick "Also show the farm's
+  test trades". The line under the tiles says which trades the tiles count.
+
 ## 1.16.1
 - **"Holding" is now "the market"**: everywhere the bots are compared with simply keeping your tickers, the app now says
   "the market": "beat the market", "+12% vs the market", the VS THE MARKET tile, the grey "market" line on the charts,
