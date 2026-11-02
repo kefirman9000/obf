@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.17.1
+- **Practice in both places at once**: under Account > "Practice trades go to", choose **Both: OBF and my Alpaca paper
+  account**. The PRACTICE session runs inside OBF as usual, and every practice trade is also copied to your Alpaca paper
+  account: the listed contract closest to the practice one (same type, nearest expiry and strike), same number of
+  contracts, sold when the practice trade is sold. The copies show as ALPACA PAPER in the Trades list and the log, and
+  never change the PRACTICE numbers. The switch reads PRACTICE + ALPACA PAPER. Copies are only ever placed with a paper
+  key; with a real-money key nothing is copied.
+- ALPACA PAPER trades now keep their label in the trades file too (they could show as LIVE after a restart), and they
+  count toward the day-trade guard and the weekly report under their own name.
+
 ## 1.17.0
 - **Two modes, clearly named**:
   - **PRACTICE** is everything with pretend money. Under Account, choose where practice trades go: **Stay in OBF**
