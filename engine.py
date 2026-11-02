@@ -1607,8 +1607,8 @@ def is_scalp(name):
 # it: a fast pace, a tight stop AND target on the premium, a hard time limit, near-the-money contracts with little
 # time left, and flat before the close (scalpers never hold overnight).
 SCALP_TF = (1, 2)
-SCALP_RISK = {"sl": (5.0, 40.0), "tp": (6.0, 60.0)}
-SCALP_TRAITS = {"maxhold": (2, 30), "flatby": (5, 45), "odte": (1, 7), "otm": (0.25, 1.0), "cool": (1, 10),
+SCALP_RISK = {"sl": (5.0, 60.0), "tp": (6.0, 300.0)}  # from quick 6% nips to 300% home runs on cheap contracts
+SCALP_TRAITS = {"maxhold": (2, 60), "flatby": (5, 45), "odte": (1, 7), "otm": (0.25, 4.0), "cool": (1, 10),
                 "minhold": (2, 5)}
 SCALP_NEEDS = {"maxhold": (3, 20), "flatby": (10, 30), "odte": (1, 5)}  # always carried (random start when missing)
 
@@ -1620,7 +1620,8 @@ def scalp_shape(rng, tf, risk, traits):
         tf = rng.choice((1, 1, 2))
     r = dict(clean_risk(risk))
     for k, (lo, hi) in SCALP_RISK.items():
-        val = float(r.get(k) or 0) or rng.uniform(lo, lo + (hi - lo) * 0.5)
+        # new ones start anywhere on a log scale, so small and big targets are tried about equally often
+        val = float(r.get(k) or 0) or math.exp(rng.uniform(math.log(lo), math.log(hi)))
         r[k] = round(min(max(val, lo), hi), 2)
     t = dict(clean_traits(traits))
     t.pop("oexit", None)  # replaced by flatby: a scalper is out the same day
@@ -1633,6 +1634,55 @@ def scalp_shape(rng, tf, risk, traits):
     if t.get("minhold", 0) >= t["maxhold"]:
         t.pop("minhold")
     return tf, r, clean_traits(t)
+
+
+# ---- what a scalper really pays to get in and out: the bid/ask gap, learned from live option quotes ----
+SPREAD_FIT = {}            # ticker -> [a, b]: a full bid/ask gap of about $a + b x the price, per share
+SPREAD_DEFAULT = (0.02, 0.03)
+SCALP_SPREAD = [8.0]       # scalpers skip contracts whose bid/ask gap is wider than this % of the price
+_SPREAD_LOADED = [False]
+
+
+def _spreads_path():
+    return os.path.join(HOME_DIR, "cache", "spreads.json")
+
+
+def learn_spreads(c, rows, S=None):
+    """Fits the bid/ask gap of one ticker's option chain as $a + b x price (contracts near the money, with real
+    quotes) and saves it. Scalpers in Practice then pay that gap instead of a flat guess."""
+    pts = [((r["bid"] + r["ask"]) / 2, r["ask"] - r["bid"]) for r in rows
+           if r.get("bid", 0) > 0 and r.get("ask", 0) > r["bid"] and (not S or abs(r["K"] / S - 1) < 0.1)]
+    if len(pts) < 8:
+        return None
+    n = len(pts)
+    mx, my = sum(x for x, _ in pts) / n, sum(y for _, y in pts) / n
+    vx = sum((x - mx) ** 2 for x, _ in pts)
+    b = max(0.0, sum((x - mx) * (y - my) for x, y in pts) / vx) if vx > 0 else 0.0
+    a = max(0.01, my - b * mx)
+    _load_spreads()
+    SPREAD_FIT[c] = [round(a, 4), round(min(b, 0.5), 4), time.time()]
+    try:
+        save_json(_spreads_path(), SPREAD_FIT)
+    except Exception:
+        pass
+    return SPREAD_FIT[c]
+
+
+def _load_spreads():
+    if not _SPREAD_LOADED[0]:
+        _SPREAD_LOADED[0] = True
+        for k, v in (load_json(_spreads_path(), {}) or {}).items():
+            if isinstance(v, list) and len(v) >= 2 and k not in SPREAD_FIT:
+                SPREAD_FIT[k] = v
+
+
+def half_spread(c, prem_share):
+    """Half the bid/ask gap as a fraction of a contract's price (what one fill costs), 0..0.5."""
+    if prem_share <= 0:
+        return 0.5
+    _load_spreads()
+    a, b = (SPREAD_FIT.get(c) or SPREAD_DEFAULT)[:2]
+    return min(0.5, (a + b * prem_share) / 2 / prem_share)
 
 
 def minutes_to_close(ts):
@@ -1721,7 +1771,8 @@ DEFAULT_SETTINGS = {
     "luck_check": True,          # a bot's score counts for less when it rests on only a few trades
     "long_holds": True,          # include slow, longer-holding bots from the start
     "scalpers": True,            # the scalp breed: fast in-and-out bots (tight stop + target, time limit, flat by the close)
-    "scalp_share": 25,           # % of the fast farm kept for scalpers (they can win up to twice that; needs 5-min bars or faster)
+    "scalp_share": 25,
+    "scalp_spread": 8.0,         # scalpers skip contracts whose bid/ask gap is wider than this % of the price           # % of the fast farm kept for scalpers (they can win up to twice that; needs 5-min bars or faster)
     "min_hold_min": 0.0,         # account: minutes to hold before a strategy signal may sell (stops still sell)
     "fee_aware": True,           # don't sell for a profit smaller than the round-trip fees (losses and stops still sell)
     "max_trades_hour": 30,       # brake: most signal trades the account may make in an hour (0 = no limit)
@@ -2092,7 +2143,13 @@ class OptionSim(Sim):
         if prem <= 0.5:
             self.opt.pop(c, None)
             return False
-        fill = prem * (1 + self.slip)
+        slip = self.slip
+        if g.get("flatby"):  # scalper: the real bid/ask gap for this contract, and only tight ones
+            slip = half_spread(c, prem / CONTRACT)
+            if 2 * slip * 100 > SCALP_SPREAD[0]:
+                self.opt.pop(c, None)
+                return False
+        fill = prem * (1 + slip)
         spend = min(self.start * self.pct * mult, self.cash)
         qty = int(spend // fill)
         if qty < 1 and fill <= min(self.cash * 0.3, spend * 2.5):
@@ -2105,7 +2162,7 @@ class OptionSim(Sim):
             self.opt.pop(c, None)
             return False
         self.cash -= cost
-        self.fees += qty * fill * self.fee + qty * prem * self.slip + qty * CONTRACT_FEE[0]
+        self.fees += qty * fill * self.fee + qty * prem * slip + qty * CONTRACT_FEE[0]
         self.pos[c] = qty
         self.cost[c] = cost
         self.tbars.append(n)
@@ -2134,9 +2191,10 @@ class OptionSim(Sim):
         o = dict(self.opt.get(c) or {})
         prem = self.mark_one(c, px)
         expired = o and self.now >= o["exp"]
-        fill = prem if expired else prem * (1 - self.slip)
+        slip = half_spread(c, prem / CONTRACT) if (self.genes or {}).get("flatby") else self.slip
+        fill = prem if expired else prem * (1 - slip)
         proceeds = q * fill * (1 - (0 if expired else self.fee)) - (0 if expired else q * CONTRACT_FEE[0])
-        self.fees += 0 if expired else q * prem * self.slip + q * fill * self.fee + q * CONTRACT_FEE[0]
+        self.fees += 0 if expired else q * prem * slip + q * fill * self.fee + q * CONTRACT_FEE[0]
         self.cash += proceeds
         self.last = dict(side="sell", coin=c, qty=q, price=fill, usd=proceeds, pl=proceeds - self.cost.get(c, 0), contract=o)
         self.pos[c], self.cost[c] = 0, 0
@@ -2222,7 +2280,7 @@ def tournament_opts(settings):
                 post_review=bool(settings.get("post_review", True)), learn_losses=bool(settings.get("learn_losses", True)),
                 time_habits=bool(settings.get("time_habits", True)), agree_sizing=bool(settings.get("agree_sizing", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
-                prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0])
+                prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0], sspread=_set_scalp_spread(settings))
 
 
 def scalp_share(settings):
@@ -2234,6 +2292,14 @@ def scalp_share(settings):
         return min(0.6, max(0.0, float(settings.get("scalp_share", 25) or 0) / 100))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _set_scalp_spread(settings):
+    try:
+        SCALP_SPREAD[0] = max(1.0, float(settings.get("scalp_spread", 8.0) or 8.0))
+    except (TypeError, ValueError):
+        SCALP_SPREAD[0] = 8.0
+    return SCALP_SPREAD[0]
 
 
 def opts_for_bars(opts, gran_seconds):
@@ -2413,10 +2479,21 @@ def _veto(v, k, x, c, closes, n, extra, coins):
     return False
 
 
+SCALP_JUDGE = 30   # a scalper is judged on its last this-many finished trades
+SCALP_MIN = 8      # ...once it has at least this many
+
+
+def scalp_record(v):
+    """A scalper's (decision, equity) after each of its recent finished trades, when it has enough of them."""
+    te = getattr(v, "trade_eq", None)
+    return te if te is not None and len(te) > SCALP_MIN else None
+
+
 def luck_factor(v):
     """0..1: how much to trust a bot's score given how many trades it rests on. 3 trades = mostly luck,
     40 trades = mostly skill. Slow bots trade rarely by design, so they need fewer."""
-    n = len(v.sim.tbars)
+    te = scalp_record(v)
+    n = len(te) - 1 if te else len(v.sim.tbars)
     k = 6 if v.tf < 10 else 2
     return n / (n + k) if n else 0.0
 
@@ -2899,6 +2976,7 @@ class Variant:
         self.live_n = 0          # decisions made on prices that came in after the bot was created
         self.live_eq0 = None     # its equity when it started trading live (after any replay)
         self.log = deque(maxlen=300)  # (decision number, coin, side, price) of this bot's own trades, for charts
+        self.trade_eq = deque(maxlen=SCALP_JUDGE + 1)  # scalpers: (decision, equity) after each finished trade
 
     @property
     def label(self):
@@ -2962,6 +3040,8 @@ class Tournament:
             set_prem_range(*self.o["prem"])
         if self.o.get("cfee") is not None:
             CONTRACT_FEE[0] = float(self.o["cfee"])
+        if self.o.get("sspread"):  # worker processes get the scalpers' spread limit this way
+            SCALP_SPREAD[0] = float(self.o["sspread"])
         self.slowed, self.cool, self.add_cool, self.kind = [], {}, {}, {}
         self.agree = {}  # coin -> (different strategies agreeing, size factor, how split the farm was)
         self.rng = rng or random.Random()
@@ -3429,7 +3509,8 @@ class Tournament:
             v.born_px = dict(last)
         prev_eq = v.eq[-1] if v.eq else None
         x = extra if extra is not None else self.xfull
-        for c, t in bot_step(v, closes, n, self.coins, x):
+        made = bot_step(v, closes, n, self.coins, x)
+        for c, t in made:
             v.log.append((n, c, t["side"], last[c]))
             v.ntrades += 1
             if t["side"] == "sell":
@@ -3450,6 +3531,8 @@ class Tournament:
                 except Exception:
                     pass
         e = v.sim.equity(last)
+        if is_scalp(v.name) and (not v.trade_eq or any(t_["side"] == "sell" for _, t_ in made)):
+            v.trade_eq.append((n, e))  # scalpers are judged trade by trade (the first entry is the starting point)
         if not self.replaying:
             if v.live_eq0 is None:
                 v.live_eq0 = prev_eq if prev_eq else v.sim.start
@@ -3514,13 +3597,21 @@ class Tournament:
                 progress(i - start, L - start)
 
     def score(self, v):
+        te = scalp_record(v)
+        if te:  # a scalper: its gain over its last trades, however long it waited between them
+            return te[-1][1] / te[0][1] - 1 if te[0][1] > 0 else None
         need = self.min_trades if v.tf < 10 else 1  # slow, long-holding bots trade rarely by design
         if len(v.eq) < v.eq.maxlen or len(v.sim.tbars) < need or v.eq[0] <= 0:
             return None
         return v.eq[-1] / v.eq[0] - 1
 
     def consistency(self, v):
-        """Share of the 4 recent sub-periods in which the variant made money (0..1)."""
+        """Share of the 4 recent sub-periods in which the variant made money (0..1). Scalpers: 4 blocks of trades."""
+        te = scalp_record(v)
+        if te:
+            eq = [x for _, x in te]
+            size = (len(eq) - 1) // 4
+            return sum(1 for k in range(4) if eq[(k + 1) * size] > eq[k * size]) / 4 if size >= 1 else 0.0
         eq = list(v.eq)
         size = (len(eq) - 1) // 4
         if len(eq) < v.eq.maxlen or size < 1:
@@ -3608,11 +3699,15 @@ class Tournament:
                                    edge=None, behind=False)
                 continue
             cons = self.consistency(v)
-            hold = self.hold_over(len(v.eq) - 1) if hasattr(self, "hold_curve") else self.hold_ret
+            te = scalp_record(v)
+            span = (self.n - te[0][0]) if te else len(v.eq) - 1  # scalpers: holding over the stretch of their trades
+            if hasattr(self, "hold_curve"):
+                span = max(1, min(span, len(self.hold_curve) - 1))
+            hold = self.hold_over(span) if hasattr(self, "hold_curve") else self.hold_ret
             edge = None if hold is None else sc - hold
             behind = bool(o["beat_hold"] and edge is not None and edge <= 0)
             failing = (o["fail_drop"] > 0 and self.drawdown(v) * 100 > o["fail_drop"]) or self.health(v) < 0.1
-            self.update_power(v, None if self.hold_ret is None else sc - (self.hold_over(len(v.eq) - 1)
+            self.update_power(v, None if self.hold_ret is None else sc - (self.hold_over(span)
                                                                           if hasattr(self, "hold_curve") else self.hold_ret))
             base = edge if (o["beat_hold"] and edge is not None and edge > 0) else sc
             proving = bool(o.get("prove_live", True)) and (

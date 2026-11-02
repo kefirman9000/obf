@@ -178,9 +178,12 @@ SETTING_GROUPS = [
         ("classics", "Famous strategies hatch from silver eggs (golden cross, turtle, RSI-2...)", bool),
         ("classic_rate", "...% of new eggs that are a famous strategy", float),
         ("long_holds", "Slow, longer-holding bots from the start", bool),
-        ("scalpers", "Scalp breed (wind dragons): fast in-and-out bots with a tight stop and target, a time limit, and "
-                     "flat before the close. Needs a decision speed of 5 min or faster", bool),
+        ("scalpers", "Scalp breed (wind dragons): fast in-and-out bots with their own stop and target (from quick 6% "
+                     "nips up to 300% runs), a time limit, and flat before the close. Needs a decision speed of 5 min "
+                     "or faster", bool),
         ("scalp_share", "...% of the farm kept for scalpers (they can win up to twice that, never over 60%)", int),
+        ("scalp_spread", "...scalpers skip contracts whose bid/ask gap is wider than this % of the price (Practice uses "
+                         "the real gaps it reads from each ticker's live option quotes)", float),
         (None, "Rules a bot can grow", "head"),
         ("layers", "Studies: several reasons to buy, several reasons not to, exit studies and sizing", bool),
         ("htf_studies", "Bigger-trend study: a slower timeframe must agree before buying", bool),
@@ -4087,8 +4090,37 @@ class App:
         self.check_daily()
         self.refresh_view()
 
+    def learn_spreads_daily(self):
+        """Once a day, read each traded ticker's option quotes so scalpers pay real bid/ask gaps in Practice."""
+        if not self.client or not E.scalp_share(self.settings):
+            return
+        due = [c for c in self.session_coins if time.time() - (E.SPREAD_FIT.get(c) or [0, 0, 0])[-1] > 86400]
+        if not due or getattr(self, "_spread_busy", False):
+            return
+        self._spread_busy = True
+
+        def work():
+            try:
+                today = datetime.now()
+                for c in due:
+                    try:
+                        S = self.last.get(c)
+                        rows = E.option_chain(c, today.strftime("%Y-%m-%d"), (today + timedelta(days=10)).strftime("%Y-%m-%d"),
+                                              None, S * 0.9 if S else None, S * 1.1 if S else None)
+                        E.learn_spreads(c, rows, S)
+                    except Exception:
+                        pass
+            finally:
+                self._spread_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
     def on_bar(self, prices):
         self.bar_n += 1
+        if self.bar_n % 30 == 1:
+            try:
+                self.learn_spreads_daily()
+            except Exception:
+                pass
         keep = min(8000, max(2400, int(1440 / self.session_bar) + 20))
         for c in self.session_coins:
             h = self.hist.setdefault(c, [])
@@ -5855,6 +5887,7 @@ class App:
             self.opt_exp.set(labels[near])
         # the live implied volatility (near the money, a week or more out) is what Practice prices use from now on
         if S:
+            E.learn_spreads(c, rows, S)
             cand = [r for r in rows if r.get("iv") and r["exp"] - time.time() > 6 * 86400 and abs(r["K"] / S - 1) < 0.03]
             if cand:
                 first = min(r["exp"] for r in cand)
@@ -8000,7 +8033,16 @@ class App:
                 return
             o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(c, exp, typ, K))
         fee, slip = E.cost_model(self.settings)
-        fill = prem * (1 + max(slip, 0.02))
+        half = max(slip, 0.02)
+        if scalp:  # a scalp pays this ticker's real bid/ask gap, and only takes tight ones
+            half = E.half_spread(c, prem / E.CONTRACT)
+            if 2 * half * 100 > E.SCALP_SPREAD[0]:
+                if time.time() - getattr(self, "_spread_note", 0) > 900:
+                    self._spread_note = time.time()
+                    self.write(f"Skipped a scalp {typ} on {c}: its bid/ask gap (~{2 * half * 100:.0f}%) is wider than the "
+                               f"scalpers' limit ({E.SCALP_SPREAD[0]:g}%). Settings > Learning", "warn")
+                return
+        fill = prem * (1 + half)
         if fill <= 1:
             return
         qty = int(spend // fill)
@@ -8013,7 +8055,7 @@ class App:
                 self.write(f"Skipped a {typ} on {c}: one contract costs ${fill:,.0f}, more than this trade's size allows. "
                            f"(Raise Trade size, or give the bots more practice money.)", "warn")
             return
-        self.fees_paid += qty * fill * fee + qty * prem * max(slip, 0.02) + qty * E.CONTRACT_FEE[0]
+        self.fees_paid += qty * fill * fee + qty * prem * half + qty * E.CONTRACT_FEE[0]
         self.cash -= cost
         if scalp:
             o = dict(o, scalp=dict(scalp, at=time.time()))
@@ -8042,9 +8084,10 @@ class App:
         value = self.position_price(c)
         expired = o and time.time() >= o.get("exp", 0)
         fee, slip = E.cost_model(self.settings)
-        fill = value if expired else value * (1 - max(slip, 0.02))
+        half = E.half_spread(c, value / E.CONTRACT) if o.get("scalp") else max(slip, 0.02)
+        fill = value if expired else value * (1 - half)
         proceeds = qty * fill * (1 - (0 if expired else fee)) - (0 if expired else qty * E.CONTRACT_FEE[0])
-        self.fees_paid += 0 if expired else qty * value * max(slip, 0.02) + qty * fill * fee + qty * E.CONTRACT_FEE[0]
+        self.fees_paid += 0 if expired else qty * value * half + qty * fill * fee + qty * E.CONTRACT_FEE[0]
         pl = proceeds - self.cost.get(c, 0)
         self.cash += proceeds
         label = self.contract_label(c)
@@ -8332,7 +8375,11 @@ class App:
             for r_ in chain:
                 if r_["symbol"] in oi:
                     r_["oi"] = oi[r_["symbol"]]
-            pick = E.pick_contract(chain, S, typ, dte, otm, now, **self.pick_rules())
+            E.learn_spreads(c, chain, S)
+            rules = self.pick_rules()
+            if c in getattr(self, "scalp_next", {}):  # a scalp: only a tight bid/ask gap will do
+                rules["max_spread_pct"] = min(rules["max_spread_pct"] or E.SCALP_SPREAD[0], E.SCALP_SPREAD[0])
+            pick = E.pick_contract(chain, S, typ, dte, otm, now, **rules)
             if not pick:
                 rng = E.prem_range_text()
                 raise RuntimeError(f"no {typ} contracts with prices near what the bots want"

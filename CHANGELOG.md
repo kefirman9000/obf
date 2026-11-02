@@ -11,7 +11,14 @@
 - **The account trades scalps like scalps**: when scalpers carry a vote, that contract uses the scalpers' own stop,
   target and time limit, opens only during the trading day, and is sold before the bell. Long-term trades keep the
   stops they had (scalpers' tight stops no longer count toward "Let the winning bots set stops").
-- Settings > Learning > "Scalp breed" and "...% of the farm kept for scalpers".
+- **Small nips to big runs**: a scalper's target can be anything from 6% to 300% (stops 5% to 60%), and it can pick
+  cheaper strikes up to 4% out of the money, so the farm can learn which kind of scalp actually pays.
+- **Scalpers pay the real bid/ask gap**: OBF reads each ticker's live option quotes once a day and learns its typical
+  gap; scalpers in Practice pay exactly that instead of a flat guess, and skip contracts with a gap wider than 8%
+  (adjustable). LIVE scalps use the same limit when picking a contract.
+- **Judged by their trades, not the clock**: a scalper is rated on its last 30 finished trades, so one that waits
+  patiently for its setup isn't culled as "idle" between them.
+- Settings > Learning > "Scalp breed", "...% of the farm kept for scalpers" and the scalpers' bid/ask limit.
 - If you saw "The syntax of the command is incorrect." in a command window after updating to 1.10.1: that was the old
   launcher being replaced while it was still open. It's harmless and won't happen again with the new launcher.
 
