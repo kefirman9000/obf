@@ -3,10 +3,14 @@
 ## 1.13.0
 - **Scalpers read volatility (VIX)**: every scalper now carries a volatility gate, chosen and evolved by the farm:
   only calm markets, only when volatility is rising, only spikes, never a spike, or ignore it. Some also widen their
-  stop and target when volatility jumps. Volatility is read from VIXY (the stand-in for the VIX) and from how fast SPY
-  is swinging compared with its last couple of hours, which reacts within minutes. Every trade a gate blocks is graded
-  in hindsight, so the farm keeps the gates that pay.
-- **The Scalp scan sees the market too**: VIXY and SPY are lined up with every ticker it tries, so volatility gates and
+  stop and target when volatility jumps. Every trade a gate blocks is graded in hindsight, so the farm keeps the gates
+  that pay.
+- **Intraday VIX, minute by minute**: while the market is open, OBF reads SPY's ~30-day at-the-money implied volatility
+  from its live option quotes about once a minute. That's what the VIX itself measures, so the gates see it move within
+  the minute: up 2% in 15 minutes (say 16.0 to 16.3) counts as rising, up 5% as a spike. VIXY (the VIX fund) and how
+  fast SPY is swinging vs its last two hours count too. With scalpers on, VIXY and SPY are always watched, and the Scalp
+  scan tab shows what the gates are reading right now. The day's readings are kept, so a restart doesn't lose them.
+- **The Scalp scan sees the market too**: today's live implied-volatility readings, VIXY and SPY are lined up with every ticker it tries, so volatility gates and
   market studies work there as they do on your farm. A new Volatility column shows each ticker's state (calm, normal,
   rising, spiking).
 - **Practice prices follow the market during the day**: while the market is open, OBF reads each traded ticker's live

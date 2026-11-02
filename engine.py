@@ -1643,41 +1643,92 @@ def scalp_shape(rng, tf, risk, traits):
 VIX_MODES = {1: "only scalps calm markets", 2: "only scalps when volatility is rising", 3: "only scalps volatility spikes",
              4: "never scalps a volatility spike", 5: "ignores volatility (VIX)"}
 _REG_CACHE = {}
+IVX_KEY = "IVX"          # live implied volatility of SPY's ~30-day at-the-money options: what the VIX itself measures
+IVX_LIVE = deque(maxlen=1200)  # (time, implied vol) readings, about one a minute while the market is open
+
+
+def _ivx_path(day):
+    return os.path.join(HOME_DIR, "cache", f"ivx-{day}.json")
+
+
+def ivx_add(ts, iv):
+    """Records one live reading and keeps today's path on disk (so a restart or the Scalp scan can use it)."""
+    IVX_LIVE.append((ts, iv))
+    try:
+        day = ny_date(ts).isoformat()
+        save_json(_ivx_path(day), [x for x in IVX_LIVE if ny_date(x[0]).isoformat() == day])
+    except Exception:
+        pass
+
+
+def ivx_today(now=None):
+    """Today's (time, implied vol) readings, oldest first."""
+    day = ny_date(now or time.time()).isoformat()
+    have = [x for x in IVX_LIVE if ny_date(x[0]).isoformat() == day]
+    if not have:
+        for t, iv in load_json(_ivx_path(day), []) or []:
+            IVX_LIVE.append((t, iv))
+        have = [x for x in IVX_LIVE if ny_date(x[0]).isoformat() == day]
+    return have
+
+
+def ivx_now(max_age=300):
+    """The latest reading if it's fresh, else None."""
+    return IVX_LIVE[-1][1] if IVX_LIVE and time.time() - IVX_LIVE[-1][0] <= max_age else None
+
+
+def ivx_from_chain(rows, S, now=None):
+    """SPY's ~30-day at-the-money implied volatility from an option chain (the expiry closest to 30 days, the strikes
+    closest to the price, calls and puts averaged), the same idea as the VIX. None when the chain can't say."""
+    now = now or time.time()
+    rows = [r for r in rows if r.get("iv") and r["exp"] - now > 7 * 86400]
+    if not rows or not S:
+        return None
+    exp = min({r["exp"] for r in rows}, key=lambda e: abs((e - now) / 86400 - 30))
+    near = sorted((r for r in rows if r["exp"] == exp), key=lambda r: abs(r["K"] - S))[:4]
+    ivs = [float(r["iv"]) for r in near if 0.01 < float(r["iv"]) < 3]
+    return sum(ivs) / len(ivs) if ivs else None
 
 
 def vol_regime(closes, extra, c):
-    """-> (regime, VIXY % move over the last 15 bars or None, swing ratio or None). regime: 'calm', 'normal', 'rising'
-    or 'spiking'. VIXY (the stand-in for the VIX) is a slow fund, so how fast SPY itself is swinging compared with its
-    last couple of hours also counts: that reacts within minutes. Shared by every bot on the same bar."""
+    """-> (regime, VIXY % move over the last 15 bars, swing ratio, live implied-vol % change over 15 bars; each None
+    when unknown). regime: 'calm', 'normal', 'rising' or 'spiking'. Three intraday readings, newest bar included:
+    SPY's live ~30-day implied volatility (what the VIX measures, read from its options about once a minute), VIXY
+    (a VIX fund that trades, but follows the VIX slowly), and how fast SPY itself is swinging vs its last two hours
+    (reacts within minutes). Shared by every bot on the same bar."""
     ctx = (extra or {}).get(CTX_KEY) or {}
     q = ctx.get("VIXY")
+    iq = ctx.get(IVX_KEY)
     ref = closes.get("SPY") if "SPY" in closes else ctx.get("SPY")
     if ref is None or len(ref) < 131:
         ref = closes[c]
-    key = (id(ref), len(ref), ref[-1] if len(ref) else None, id(q) if q is not None else 0, len(q) if q is not None else 0)
+    key = (id(ref), len(ref), ref[-1] if len(ref) else None, id(q) if q is not None else 0, len(q) if q is not None else 0,
+           id(iq) if iq is not None else 0, len(iq) if iq is not None else 0)
     hit = _REG_CACHE.get(key)
     if hit is not None:
         return hit
     if len(_REG_CACHE) > 2048:
         _REG_CACHE.clear()
-    vm = sr = None
+    vm = sr = im = None
     if q is not None and len(q) > 16 and q[-16]:
         vm = (q[-1] / q[-16] - 1) * 100
+    if iq is not None and len(iq) > 16 and iq[-16] and iq[-1]:
+        im = (iq[-1] / iq[-16] - 1) * 100  # e.g. 16.0 -> 16.8 = +5%
     if len(ref) > 131:
         seg = ref[-131:]
         moves = [abs(seg[i] / seg[i - 1] - 1) for i in range(1, len(seg)) if seg[i - 1]]
         if len(moves) == 130:
             base = sum(moves[:120]) / 120
             sr = (sum(moves[120:]) / 10) / base if base > 0 else None
-    if (vm is not None and vm >= 3.0) or (sr is not None and sr >= 2.2):
+    if (im is not None and im >= 5.0) or (vm is not None and vm >= 3.0) or (sr is not None and sr >= 2.2):
         reg = "spiking"
-    elif (vm is not None and vm >= 1.0) or (sr is not None and sr >= 1.4):
+    elif (im is not None and im >= 2.0) or (vm is not None and vm >= 1.0) or (sr is not None and sr >= 1.4):
         reg = "rising"
-    elif (vm is None or vm <= 0.3) and sr is not None and sr < 0.9:
+    elif (im is None or im <= 0.5) and (vm is None or vm <= 0.3) and sr is not None and sr < 0.9:
         reg = "calm"
     else:
         reg = "normal"
-    out = _REG_CACHE[key] = (reg, vm, sr)
+    out = _REG_CACHE[key] = (reg, vm, sr, im)
     return out
 
 

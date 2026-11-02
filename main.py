@@ -3144,7 +3144,10 @@ class App:
     def ctx_list(self, coins=None):
         """The market-context tickers the bots watch (minus any they trade)."""
         coins = coins if coins is not None else self.session_coins
-        return [c for c in (self.settings.get("ctx_tickers") or []) if E.valid_coin(c) and c not in coins]
+        out = [c for c in (self.settings.get("ctx_tickers") or []) if E.valid_coin(c) and c not in coins]
+        if E.scalp_share(self.settings):  # scalpers' volatility gates always read VIXY and SPY
+            out += [c for c in ("VIXY", "SPY") if c not in out and c not in coins]
+        return out
 
     def extra_now(self):
         """The extra data for a farm step: highs/lows/volumes/times per traded ticker, plus the context tickers."""
@@ -4196,7 +4199,18 @@ class App:
             del h[:-keep]
             for k in ("h", "l", "v", "t"):
                 del x[k][:-keep]
+        L0 = len(self.hist[self.session_coins[0]]) if self.session_coins else 0
+        iv = E.ivx_now()
+        if iv and L0:  # SPY's live implied volatility (the VIX idea), lined up with the bars like any watched ticker
+            q = self.ctx_hist.get(E.IVX_KEY)
+            if q is None:
+                self.ctx_hist[E.IVX_KEY] = [iv] * (L0 - 1)  # no reading before now: flat, so no move is read into it
+                q = self.ctx_hist[E.IVX_KEY]
+            q.append(iv)
+            del q[:-L0]
         for sym in list(self.ctx_hist):  # the watched tickers move along with every bar
+            if sym == E.IVX_KEY:
+                continue
             q = self.ctx_hist[sym]
             px = prices.get(sym) or self.last.get(sym) or (q[-1] if q else None)
             if px:
@@ -10136,6 +10150,27 @@ class App:
         threading.Thread(target=self._scan_loop, daemon=True).start()
         self.refresh_scan()
 
+    def vol_text(self):
+        """What the scalpers' volatility gates are reading right now, in one line."""
+        parts = []
+        try:
+            if self.session_coins and self.hist.get(self.session_coins[0]):
+                closes = {c: self.hist[c] for c in self.session_coins if self.hist.get(c)}
+                reg, vm, sr, im = E.vol_regime(closes, self.extra_now(), self.session_coins[0])
+                parts.append(f"Volatility now: {reg}")
+                if vm is not None:
+                    parts.append(f"VIXY {vm:+.2f}% in 15 bars")
+                if sr is not None:
+                    parts.append(f"SPY swinging {sr:.1f}x its usual")
+            iv = E.ivx_now()
+            if iv:
+                path = E.ivx_today()
+                old = next((x[1] for x in reversed(path) if x[0] <= time.time() - 900), None)
+                parts.append(f"SPY implied vol {iv * 100:.1f}%" + (f" ({(iv / old - 1) * 100:+.1f}% in 15 min)" if old else ""))
+        except Exception:
+            pass
+        return "   ".join(parts) or "Volatility: waiting for live prices"
+
     def scan_now(self):
         self.scan["now"] = True
         self.scan["status"] = "Scan requested..."
@@ -10168,9 +10203,31 @@ class App:
             out.append(dict(uid=0, name=n, params=dict(E.STRATS[n]["params"]), tf=tf, risk=r, traits=tr, vetoes={}, layers={}))
         return out
 
+    def ivx_tick(self):
+        """About once a minute while the market is open: SPY's ~30-day at-the-money implied volatility from its live
+        option quotes. It moves with the VIX itself, minute by minute (VIXY, the VIX fund, follows it slowly)."""
+        if not self.client or time.time() - getattr(self, "_ivx_at", 0) < 55 or not E.scalp_share(self.settings):
+            return
+        if not (0 < E.minutes_to_close(time.time()) <= 390) or datetime.now().weekday() >= 5:
+            return
+        self._ivx_at = time.time()
+        S = self.last.get("SPY") or (E.spot_many(["SPY"]) or {}).get("SPY")
+        if not S:
+            return
+        now = datetime.now()
+        rows = E.option_chain("SPY", (now + timedelta(days=20)).strftime("%Y-%m-%d"), (now + timedelta(days=45)).strftime("%Y-%m-%d"),
+                              None, S * 0.98, S * 1.02)
+        iv = E.ivx_from_chain(rows, S)
+        if iv:
+            E.ivx_add(time.time(), iv)
+
     def _scan_loop(self):
         while True:
             time.sleep(5 if self.scan.get("now") else 20)
+            try:
+                self.ivx_tick()
+            except Exception:
+                pass
             try:
                 if not self.cfg.get("scalp_scan", True) and not self.scan.get("now"):
                     self.scan["status"] = "Off"
@@ -10221,7 +10278,8 @@ class App:
         self.scan["status"] = f"Trying {len(genes)} scalpers on {len(bars)} tickers..."
         job = dict(bars=bars, genes=genes, day=E.ny_date(time.time()).isoformat(),
                    spread={k: list(v) for k, v in E.SPREAD_FIT.items()}, sspread=E.SCALP_SPREAD[0],
-                   iv=dict(E.IV_HINT), ctx=ctx)
+                   iv=dict(E.IV_HINT), ctx=dict(ctx, **({E.IVX_KEY: dict(c=[x[1] for x in E.ivx_today()], t=[x[0] for x in E.ivx_today()])}
+                                                         if E.ivx_today() else {})))
         try:  # its own processor core, so the window never stutters
             import concurrent.futures as cf
             import multiprocessing as mp
@@ -10268,7 +10326,7 @@ class App:
         sc = self.scan
         res = sc.get("res")
         when = (f"last scan {datetime.fromtimestamp(sc['at']).strftime('%I:%M %p').lstrip('0')}" if sc.get("at") else "no scan yet")
-        self.scan_lbl.config(text=f"{sc.get('status') or 'Ready'}   |   {when}")
+        self.scan_lbl.config(text=f"{sc.get('status') or 'Ready'}   |   {when}   |   {self.vol_text()}")
         if self.cur_tab().find("Scalp scan") < 0 and res is not None and getattr(self, "_scan_drawn", None) is res:
             return
         self._scan_drawn = res
