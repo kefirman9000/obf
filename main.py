@@ -178,6 +178,12 @@ SETTING_GROUPS = [
         ("classics", "Famous strategies hatch from silver eggs (golden cross, turtle, RSI-2...)", bool),
         ("classic_rate", "...% of new eggs that are a famous strategy", float),
         ("long_holds", "Slow, longer-holding bots from the start", bool),
+        ("scalpers", "Scalp breed (wind dragons): fast in-and-out bots with their own stop and target (from quick 6% "
+                     "nips up to 300% runs), a time limit, and flat before the close. Needs a decision speed of 5 min "
+                     "or faster", bool),
+        ("scalp_share", "...% of the farm kept for scalpers (they can win up to twice that, never over 60%)", int),
+        ("scalp_spread", "...scalpers skip contracts whose bid/ask gap is wider than this % of the price (Practice uses "
+                         "the real gaps it reads from each ticker's live option quotes)", float),
         (None, "Rules a bot can grow", "head"),
         ("layers", "Studies: several reasons to buy, several reasons not to, exit studies and sizing", bool),
         ("htf_studies", "Bigger-trend study: a slower timeframe must agree before buying", bool),
@@ -291,6 +297,8 @@ STRAT_LABELS = {
     "Supertrend": "Supertrend", "Ichimoku cross": "Cloud cross (Ichimoku)", "Rate of change": "Speed shift (ROC)",
     "MA ribbon": "Trend ribbon",
     "Volume breakout": "Volume breakout", "VWAP snap-back": "VWAP snap-back", "ATR channel": "Range channel (ATR)",
+    "Micro pullback": "Scalp: micro pullback", "Volume burst": "Scalp: volume burst", "VWAP reclaim": "Scalp: VWAP reclaim",
+    "Range scalp": "Scalp: range edges", "Quick flip": "Scalp: quick flip",
 }
 STRAT_TIPS = {
     "SMA crossover": "Buys when the short-term price trend crosses above the long-term trend, sells when it crosses below.",
@@ -319,15 +327,27 @@ STRAT_TIPS = {
                  "drops below the middle one.",
     "ATR channel": "Buys a push above the average plus a few typical bar ranges (from highs and lows), sells a drop "
                    "below it.",
+    "Micro pullback": "Scalper. In a short-term trend, waits for a brief pause that holds the trend, then jumps in when "
+                      "the price pushes past the last bar. Out within minutes, flat before the close.",
+    "Volume burst": "Scalper. Rides the first push when one bar suddenly trades several times its usual volume and "
+                    "closes strong. Out within minutes, flat before the close.",
+    "VWAP reclaim": "Scalper. Trades the moment the price crosses back over its volume-weighted average on busy "
+                    "volume. Out within minutes, flat before the close.",
+    "Range scalp": "Scalper. When the price is stuck in a tight box, buys a turn up at the bottom edge and sells a turn "
+                   "down at the top edge. Out within minutes, flat before the close.",
+    "Quick flip": "Scalper. Jumps on a short run of closes all in one direction. Out within minutes, flat before the close.",
 }
 PARAM_NAMES = {"fast": "short average", "slow": "long average", "period": "lookback", "lo": "buy below",
                "hi": "sell above", "n": "lookback", "thr": "move needed %", "k": "band width", "every": "buy every N decisions",
                "signal": "signal smoothing", "min_gap": "smallest gap %", "trend": "trend lookback",
-               "vmult": "volume x normal", "m": "range multiple", "mid": "middle average", "smooth": "smoothing"}
+               "vmult": "volume x normal", "m": "range multiple", "mid": "middle average", "smooth": "smoothing",
+               "pull": "pullback bars", "vmin": "volume needed x normal", "edge": "edge of the box",
+               "maxw": "widest box %", "run": "closes in a row"}
 REASON_TEXT = {"bot-test": "bot's own test trade", "signal": "strategy signal", "stop-loss": "safety stop", "take-profit": "locked in profit",
                "manual": "you sold by hand", "add-on": "adding to a winning strategy's position",
                "trailing-stop": "trailing stop (fell from its high)", "manual buy": "you bought by hand",
-               "expiry": "close to expiry", "slow farm": "slow farm's winners agreed"}
+               "expiry": "close to expiry", "slow farm": "slow farm's winners agreed",
+               "scalp-time": "scalp held as long as the scalpers allow", "scalp-flat": "scalp closed before the bell"}
 MOOD_TEXT = {"trending up": "Trending up", "trending down": "Trending down", "choppy": "Choppy (back and forth)",
              "quiet": "Quiet", "unknown": "-"}
 
@@ -551,6 +571,7 @@ THEMES = {  # themed dragons: palette per type
     "ice": dict(body="#7dd3fc", belly="#f0f9ff", horn="#e0f2fe", wing="#0ea5e9", eye="#0c4a6e"),
     "lightning": dict(body="#facc15", belly="#fef9c3", horn="#1e3a8a", wing="#2563eb", eye="#1e3a8a"),
     "space": dict(body="#3730a3", belly="#a78bfa", horn="#e9d5ff", wing="#1e1b4b", eye="#f0abfc"),
+    "wind": dict(body="#2dd4bf", belly="#ccfbf1", horn="#134e4a", wing="#0d9488", eye="#f8fafc"),
     "skeleton": dict(body="#1f2937", belly="#1f2937", horn="#e7e5e4", wing="#374151", eye="#4ade80", outline="#e7e5e4"),
 }
 FAMILY_THEME = {  # strategy family -> dragon type
@@ -559,9 +580,11 @@ FAMILY_THEME = {  # strategy family -> dragon type
     "Breakout": "lightning", "Volume breakout": "lightning", "ATR channel": "lightning",
     "Trend + dip": "space", "Dollar-cost averaging": "space",
     "Supertrend": "lightning", "Ichimoku cross": "space", "Rate of change": "fire", "MA ribbon": "fire",
+    "Micro pullback": "wind", "Volume burst": "wind", "VWAP reclaim": "wind", "Range scalp": "wind", "Quick flip": "wind",
 }
 THEME_NAMES = {"fire": "Fire dragon (trend follower)", "ice": "Ice dragon (buys dips)",
                "lightning": "Lightning dragon (breakouts)", "space": "Space dragon (dips in an uptrend)",
+               "wind": "Wind dragon (scalper: in and out within minutes)",
                "skeleton": "Skeleton dragon (resting: not winning right now)"}
 CHARACTER_MODE = {"mode": "Themed dragons"}  # or "Classic dragons" (coloured by status)
 
@@ -606,6 +629,12 @@ def draw_creature(c, strat, x, y, size, color, status=None, **kw):
             c.create_line(*P(4, -4, 1, 2, 5, 2, 2, 8), fill="#fde047", width=max(1, 1.5 * k), tags=tags)
         if awake and phase % 6 == 3:
             c.create_line(*P(27, -2, 24, 3, 28, 3, 25, 9), fill="#93c5fd", width=max(1, 1.5 * k), tags=tags)
+    elif th == "wind":  # the scalp breed: speed streaks rushing past
+        n_ = 3 if awake else 1
+        for n in range(n_):
+            t = (phase * 3 + n * 5) % 6
+            yy = 8 + n * 6
+            c.create_line(*P(1 - t, yy, 7 - t, yy), fill="#99f6e4", width=max(1, 1.2 * k), tags=tags)
     elif th == "space":  # twinkling stars and a tiny orbiting moon
         for n, (sx, sy) in enumerate(((2, 2), (25, 18), (3, 24))):
             if (phase + n * 3) % 8 < 5:
@@ -4061,8 +4090,37 @@ class App:
         self.check_daily()
         self.refresh_view()
 
+    def learn_spreads_daily(self):
+        """Once a day, read each traded ticker's option quotes so scalpers pay real bid/ask gaps in Practice."""
+        if not self.client or not E.scalp_share(self.settings):
+            return
+        due = [c for c in self.session_coins if time.time() - (E.SPREAD_FIT.get(c) or [0, 0, 0])[-1] > 86400]
+        if not due or getattr(self, "_spread_busy", False):
+            return
+        self._spread_busy = True
+
+        def work():
+            try:
+                today = datetime.now()
+                for c in due:
+                    try:
+                        S = self.last.get(c)
+                        rows = E.option_chain(c, today.strftime("%Y-%m-%d"), (today + timedelta(days=10)).strftime("%Y-%m-%d"),
+                                              None, S * 0.9 if S else None, S * 1.1 if S else None)
+                        E.learn_spreads(c, rows, S)
+                    except Exception:
+                        pass
+            finally:
+                self._spread_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
     def on_bar(self, prices):
         self.bar_n += 1
+        if self.bar_n % 30 == 1:
+            try:
+                self.learn_spreads_daily()
+            except Exception:
+                pass
         keep = min(8000, max(2400, int(1440 / self.session_bar) + 20))
         for c in self.session_coins:
             h = self.hist.setdefault(c, [])
@@ -4978,7 +5036,7 @@ class App:
                 seeds = [dict(b) for b in self.hof()]
             elif start.get() == "Library":
                 seeds = [dict(b) for b in self.library()]
-            opts = E.tournament_opts(self.settings)
+            opts = E.opts_for_bars(E.tournament_opts(self.settings), gran)
             fee, slip = E.cost_model(self.settings)
             pct, cash, quote = self.settings["trade_pct"] / 100, self.start_cash, self.quote
             evolve, params = int(self.settings["evolve_every"]), self.settings["params"]
@@ -5321,7 +5379,8 @@ class App:
         def on_trade(v, c, tr, ts):
             nm = names.get(id(v)) or names.setdefault(id(v), E.bot_nickname(v.key()))
             self._roam_feed(nm, c, tr, ts, "farm")
-        res = E.train_farm(closes, extra, E.tournament_opts(self.settings), cap=20, passes=1, exam_frac=0.25,
+        res = E.train_farm(closes, extra, E.opts_for_bars(E.tournament_opts(self.settings), info["gran"]), cap=20,
+                           passes=1, exam_frac=0.25,
                            seed_genes=seeds, start_cash=self.start_cash, fee=fee, pct=self.settings["trade_pct"] / 100,
                            evolve=int(self.settings["evolve_every"]), params=self.settings["params"], progress=prog,
                            stop=lambda: self.tourn is not t or not self.cfg.get("roam_on"), on_trade=on_trade)
@@ -5828,6 +5887,7 @@ class App:
             self.opt_exp.set(labels[near])
         # the live implied volatility (near the money, a week or more out) is what Practice prices use from now on
         if S:
+            E.learn_spreads(c, rows, S)
             cand = [r for r in rows if r.get("iv") and r["exp"] - time.time() > 6 * 86400 and abs(r["K"] / S - 1) < 0.03]
             if cand:
                 first = min(r["exp"] for r in cand)
@@ -6101,7 +6161,7 @@ class App:
         quote = self.cur_quote()
         fee, slip = E.cost_model(self.settings)
         pct, cash = self.settings["trade_pct"] / 100, self.start_cash or 1000.0
-        opts = dict(E.tournament_opts(self.settings), risk_caps=dict(E.SLOW_RISK), window=72)
+        opts = dict(E.tournament_opts(self.settings), risk_caps=dict(E.SLOW_RISK), window=72, scalp_share=0.0)
         cap = int(self.settings.get("slow_size", 30))
 
         def make():
@@ -6319,7 +6379,8 @@ class App:
 
         def work():
             try:
-                res = E.train_farm(hist, hx, dict(E.tournament_opts(self.settings), risk_caps=dict(E.SLOW_RISK), window=72),
+                res = E.train_farm(hist, hx, dict(E.tournament_opts(self.settings), risk_caps=dict(E.SLOW_RISK), window=72,
+                                                  scalp_share=0.0),
                                    cap=len(t.vars), passes=2, exam_frac=0.2,
                                    seed_genes=seeds, start_cash=t.start_cash, fee=fee, pct=t.pct, evolve=24,
                                    params=self.settings["params"], retire_steps=24 * 14, progress=prog)
@@ -6891,7 +6952,7 @@ class App:
         return out
 
     # ---------------- expiry guard and day-trade guard ----------------
-    SAFETY_EXITS = ("stop-loss", "trailing-stop", "expiry", "manual", "kill switch", "daily-loss")
+    SAFETY_EXITS = ("stop-loss", "trailing-stop", "expiry", "manual", "kill switch", "daily-loss", "scalp-flat")
 
     def near_expiry(self, o):
         return E.sessions_left(o["exp"]) <= max(1, int(self.settings.get("expiry_days", 2) or 2))
@@ -7774,10 +7835,11 @@ class App:
         stop, take = self.settings["stop_loss"] / 100, self.settings["take_profit"] / 100
         src = ["you", "you"]
         t = self.tourn
-        if self.settings.get("bot_stops", True) and self.wild and t and t.active:
-            tot = sum(t.info[id(v)]["weight"] for v in t.active) or 0
+        longs = [v for v in (t.active if t else []) if not E.is_scalp(v.name)]  # scalps carry their own exits
+        if self.settings.get("bot_stops", True) and self.wild and t and longs:
+            tot = sum(t.info[id(v)]["weight"] for v in longs) or 0
             for i, k in enumerate(("sl", "tp")):
-                using = [(t.info[id(v)]["weight"], v.risk[k]) for v in t.active if v.risk.get(k)]
+                using = [(t.info[id(v)]["weight"], v.risk[k]) for v in longs if v.risk.get(k)]
                 w = sum(x for x, _ in using)
                 if tot > 0 and w * 2 >= tot:
                     val = sum(x * r for x, r in using) / w / 100
@@ -7800,11 +7862,25 @@ class App:
             if o and self.near_expiry(o):
                 self.sell(c, self.last.get(c, 0), "expiry")
                 continue
+            sc = (o or {}).get("scalp")
+            if sc and E.minutes_to_close(time.time()) <= sc.get("flatby", 15):
+                self.sell(c, self.last.get(c, 0), "scalp-flat")  # scalps are never held overnight
+                continue
             val = self.position_price(c)
             if val <= 0:
                 continue
             self.high[c] = max(self.high.get(c, val), val)
             r = val / (self.cost[c] / q) - 1
+            if sc:  # a scalp: the scalpers' own tight stop and target, and their time limit
+                if r <= -sc["sl"] / 100:
+                    self.sell(c, self.last.get(c, 0), "stop-loss")
+                elif r >= sc["tp"] / 100:
+                    self.sell(c, self.last.get(c, 0), "take-profit")
+                elif time.time() - sc.get("at", time.time()) >= sc.get("mins", 10) * 60:
+                    self.sell(c, self.last.get(c, 0), "scalp-time")
+                elif trail > 0 and val <= self.high[c] * (1 - trail):
+                    self.sell(c, self.last.get(c, 0), "trailing-stop")
+                continue
             if stop > 0 and r <= -stop:
                 self.sell(c, self.last.get(c, 0), "stop-loss")
             elif take > 0 and r >= take:
@@ -7855,8 +7931,20 @@ class App:
         """The option choices (calls/puts, days to expiry, how far out of the money) of the strongest bot voting."""
         if not voters or not self.tourn:
             return {}
-        top = max(voters, key=lambda v: self.tourn.info.get(id(v), {}).get("weight", 0))
-        return dict(top.traits)
+        wt = lambda v: self.tourn.info.get(id(v), {}).get("weight", 0) or 1e-9
+        sc = [v for v in voters if E.is_scalp(v.name)]
+        tot, sw = sum(wt(v) for v in voters), sum(wt(v) for v in sc)
+        if sc and sw * 2 > tot:  # scalpers carry this vote: the contract is a scalp with the scalpers' own exits
+            top = max(sc, key=wt)
+            bar = float(getattr(self, "session_bar", 0) or self.settings.get("bar_minutes", 1))
+            g = dict(top.traits)
+            g["_scalp"] = dict(sl=sum(wt(v) * v.risk["sl"] for v in sc) / sw,
+                               tp=sum(wt(v) * v.risk["tp"] for v in sc) / sw,
+                               mins=max(1.0, sum(wt(v) * v.traits.get("maxhold", 10) * v.tf for v in sc) / sw * bar),
+                               flatby=max(v.traits.get("flatby", 15) for v in sc))
+            return g
+        top = max(voters, key=wt)
+        return {k: x for k, x in top.traits.items() if k != "flatby"}
 
     def group_room(self, c, typ, spend):
         """Tickers that move together: the account never puts more than max_group_pct of its money into calls (or puts)
@@ -7900,6 +7988,11 @@ class App:
         if spend <= 0:
             return
         dte, otm = int(g.get("odte", 14) or 14), float(g.get("otm", 1.0) or 1.0)
+        scalp = g.get("_scalp")
+        if scalp and not (scalp["flatby"] < E.minutes_to_close(time.time()) <= 390):
+            return  # scalps only open during the trading day, never in the scalpers' last minutes
+        if scalp:
+            dte = max(dte, int(self.settings.get("expiry_days", 2) or 2) + 1)  # the expiry guard still decides the soonest contract
         if self.live:
             if spend < MIN_LIVE_ORDER:
                 return
@@ -7911,6 +8004,12 @@ class App:
                 return
             self.cash -= spend  # reserved until the fill comes back
             self.pending.add(c)
+            if not hasattr(self, "scalp_next"):
+                self.scalp_next = {}
+            if scalp:
+                self.scalp_next[c] = dict(scalp)
+            else:
+                self.scalp_next.pop(c, None)
             self.executor.submit(self.live_open, c, typ, S, spend, dte, otm, reason)
             return
         step = E.strike_step(S)
@@ -7934,7 +8033,16 @@ class App:
                 return
             o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(c, exp, typ, K))
         fee, slip = E.cost_model(self.settings)
-        fill = prem * (1 + max(slip, 0.02))
+        half = max(slip, 0.02)
+        if scalp:  # a scalp pays this ticker's real bid/ask gap, and only takes tight ones
+            half = E.half_spread(c, prem / E.CONTRACT)
+            if 2 * half * 100 > E.SCALP_SPREAD[0]:
+                if time.time() - getattr(self, "_spread_note", 0) > 900:
+                    self._spread_note = time.time()
+                    self.write(f"Skipped a scalp {typ} on {c}: its bid/ask gap (~{2 * half * 100:.0f}%) is wider than the "
+                               f"scalpers' limit ({E.SCALP_SPREAD[0]:g}%). Settings > Learning", "warn")
+                return
+        fill = prem * (1 + half)
         if fill <= 1:
             return
         qty = int(spend // fill)
@@ -7947,8 +8055,10 @@ class App:
                 self.write(f"Skipped a {typ} on {c}: one contract costs ${fill:,.0f}, more than this trade's size allows. "
                            f"(Raise Trade size, or give the bots more practice money.)", "warn")
             return
-        self.fees_paid += qty * fill * fee + qty * prem * max(slip, 0.02) + qty * E.CONTRACT_FEE[0]
+        self.fees_paid += qty * fill * fee + qty * prem * half + qty * E.CONTRACT_FEE[0]
         self.cash -= cost
+        if scalp:
+            o = dict(o, scalp=dict(scalp, at=time.time()))
         self.opt[c] = o
         self.pos[c] = qty
         self.cost[c] = cost
@@ -7974,9 +8084,10 @@ class App:
         value = self.position_price(c)
         expired = o and time.time() >= o.get("exp", 0)
         fee, slip = E.cost_model(self.settings)
-        fill = value if expired else value * (1 - max(slip, 0.02))
+        half = E.half_spread(c, value / E.CONTRACT) if o.get("scalp") else max(slip, 0.02)
+        fill = value if expired else value * (1 - half)
         proceeds = qty * fill * (1 - (0 if expired else fee)) - (0 if expired else qty * E.CONTRACT_FEE[0])
-        self.fees_paid += 0 if expired else qty * value * max(slip, 0.02) + qty * fill * fee + qty * E.CONTRACT_FEE[0]
+        self.fees_paid += 0 if expired else qty * value * half + qty * fill * fee + qty * E.CONTRACT_FEE[0]
         pl = proceeds - self.cost.get(c, 0)
         self.cash += proceeds
         label = self.contract_label(c)
@@ -8264,7 +8375,11 @@ class App:
             for r_ in chain:
                 if r_["symbol"] in oi:
                     r_["oi"] = oi[r_["symbol"]]
-            pick = E.pick_contract(chain, S, typ, dte, otm, now, **self.pick_rules())
+            E.learn_spreads(c, chain, S)
+            rules = self.pick_rules()
+            if c in getattr(self, "scalp_next", {}):  # a scalp: only a tight bid/ask gap will do
+                rules["max_spread_pct"] = min(rules["max_spread_pct"] or E.SCALP_SPREAD[0], E.SCALP_SPREAD[0])
+            pick = E.pick_contract(chain, S, typ, dte, otm, now, **rules)
             if not pick:
                 rng = E.prem_range_text()
                 raise RuntimeError(f"no {typ} contracts with prices near what the bots want"
@@ -8293,7 +8408,7 @@ class App:
             sym = o.get("symbol")
             if not sym:
                 raise RuntimeError("no contract on record for this ticker")
-            urgent = reason in ("stop-loss", "expiry", "manual", "trailing-stop")
+            urgent = reason in ("stop-loss", "expiry", "manual", "trailing-stop", "scalp-flat")
             limit = None
             if not urgent:
                 q = E.option_quotes([sym]).get(sym)
@@ -8373,7 +8488,7 @@ class App:
             o = self.opt.get(c) or {}
             if not o:
                 raise RuntimeError("no contract on record for this ticker")
-            urgent = reason in ("stop-loss", "expiry", "manual", "trailing-stop")
+            urgent = reason in ("stop-loss", "expiry", "manual", "trailing-stop", "scalp-flat")
             limit = None
             if not urgent:
                 bid, ask, _ = E.IB.quote(c, o["exp"], o["type"], o["K"])
@@ -8515,6 +8630,9 @@ class App:
         amount = qty * avg * E.CONTRACT
         if side == "buy":
             self.cash += reserved - amount
+            sc_ = getattr(self, "scalp_next", {}).pop(c, None)
+            if sc_:
+                o = dict(o, scalp=dict(sc_, at=time.time()))
             self.opt[c] = o
             self.pos[c] = self.pos.get(c, 0) + qty
             self.cost[c] = self.cost.get(c, 0) + amount
@@ -8535,6 +8653,8 @@ class App:
     def on_unfilled(self, side, c, reserved):
         """A limit order that found no taker in time and had no market fallback: not an error."""
         self.pending.discard(c)
+        if side == "buy":
+            getattr(self, "scalp_next", {}).pop(c, None)
         self.pending_who.pop(c, None)
         self.cash += reserved
         self.write(f"Limit {side} for {c} didn't fill in time, so nothing was traded "
@@ -8593,6 +8713,8 @@ class App:
 
     def on_fail(self, side, c, reserved, err):
         self.pending.discard(c)
+        if side == "buy":
+            getattr(self, "scalp_next", {}).pop(c, None)
         self.pending_who.pop(c, None)
         self.cash += reserved
         self.fails += 1

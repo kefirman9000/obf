@@ -47,10 +47,17 @@ their own wallet, and never mix with the fast farm.
 
 <p align="center"><img src="docs/screenshots/slow.png" alt="The Slow farm" width="100%"></p>
 
+## The scalp breed
+**Wind dragons** are the farm's scalpers: they live on the fast farm, think in seconds to minutes, and go after the
+quick moves the patient breeds let pass: a sudden burst of volume, a crossing of VWAP, a short pullback in a trend, the
+edges of a tight range. Every scalper carries a tight stop and target, a time limit, and is always flat before the
+close. A share of the farm is kept for them, they breed among themselves, and when they carry a vote your account
+trades that contract the scalper way. Switch them on or off, and set their share, on the **Learning** page.
+
 ## A dragon's genes
 Every gene is inherited, mutated and crossbred, and every dragon carries a different mix:
 
-- **A main instinct**: more than twenty breeds, from patient trend riders to pouncers and breakout jumpers
+- **A main instinct**: more than twenty breeds, including five scalp instincts, from patient trend riders to pouncers and breakout jumpers
 - **Positive studies**: extra signals that vote *for* acting. **Negative studies**: signals that vote *against*
 - **A bigger-picture study** that has to agree first, and an optional **follow-the-leader** study
 - **Never-rules**: things it refuses to do, each one graded in hindsight; useful rules spread, costly ones fade
