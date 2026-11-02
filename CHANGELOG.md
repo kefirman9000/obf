@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.16.4
+- **Your Alpaca account's own value**: while you're logged in, a new tile at the top shows the Alpaca account itself
+  (ALPACA PAPER ACCOUNT, or ALPACA ACCOUNT (LIVE)) straight from Alpaca, with its change since yesterday's close. It sits
+  next to the PRACTICE numbers, which run on OBF's own pretend money, so it's clear which is which. Updated every minute,
+  in Practice too. Settings > Basics to turn it off.
+- **Filter the Trades list by account**: "Show" All accounts, PRACTICE, ALPACA PAPER, IBKR PAPER, LIVE or FARM TEST.
+
 ## 1.16.3
 - **The account is named for what it really is**: PRACTICE when trades are simulated inside OBF, ALPACA PAPER when
   orders go to your Alpaca paper account (a paper key), IBKR PAPER for Interactive Brokers' paper port, and LIVE only

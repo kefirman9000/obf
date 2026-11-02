@@ -1870,6 +1870,7 @@ DEFAULT_SETTINGS = {
     "risk_adjusted": True,       # rank winners by gain per unit of downside swing, not raw gain
     "luck_check": True,          # a bot's score counts for less when it rests on only a few trades
     "long_holds": True,          # include slow, longer-holding bots from the start
+    "show_broker_value": True,   # a tile with your Alpaca account's own value (logged in)
     "scalpers": True,            # the scalp breed: fast in-and-out bots (tight stop + target, time limit, flat by the close)
     "scalp_share": 25,
     "scalp_spread": 8.0,         # scalpers skip contracts whose bid/ask gap is wider than this % of the price           # % of the fast farm kept for scalpers (they can win up to twice that; needs 5-min bars or faster)

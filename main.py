@@ -120,6 +120,8 @@ SETTING_GROUPS = [
                "a Risk style on the main screen (Cautious, Balanced, Adventurous): it fills in the first five for you. "
                "In Wildcard, 'Let the winning bots set stops' (Orders tab) lets the winners' learned Safety stop and "
                "Lock in profit take over; these numbers are then the fallback. Fees are always counted.", [
+        ("show_broker_value", "Show your Alpaca account's own value in a tile at the top (while you're logged in), next to "
+                              "the PRACTICE numbers", bool),
         ("trade_pct", "Trade size: each buy spends this % of your starting money. Example: 10 with $1,000 = $100 per buy "
                       "(winning bots can scale this up to their trade-size multiplier)", float),
         ("max_group_pct", "Tickers that move together: never have more than this % of your starting money in calls (or puts) "
@@ -1508,8 +1510,11 @@ class App:
         tiles = tk.Frame(right, bg=BG)
         tiles.pack(fill="x")
         self.tiles = {}
-        for i, (key, title) in enumerate((("equity", "TOTAL VALUE"), ("pl", "PROFIT / LOSS"), ("day", "TODAY"), ("cash", "CASH LEFT"), ("hold", "VS THE MARKET"))):
+        self.tile_frames = {}
+        for i, (key, title) in enumerate((("equity", "TOTAL VALUE"), ("pl", "PROFIT / LOSS"), ("day", "TODAY"), ("cash", "CASH LEFT"),
+                                          ("hold", "VS THE MARKET"), ("broker", "ALPACA ACCOUNT"))):
             f, c = self.card(tiles, title)
+            self.tile_frames[key] = f
             f.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0))
             tiles.columnconfigure(i, weight=1)
             if key == "hold":
@@ -1518,7 +1523,7 @@ class App:
             lbl = tk.Label(c, text="-", bg=CARD, fg=TEXT, font=("", 15, "bold"))
             lbl.pack(anchor="w")
             self.tiles[key] = lbl
-            if key in ("pl", "hold"):
+            if key in ("pl", "hold", "broker"):
                 sub = tk.Label(c, text="", bg=CARD, fg=MUTED, font=("", 7))
                 sub.pack(anchor="w")
                 self.__dict__.setdefault("tile_subs", {})[key] = sub
@@ -1533,7 +1538,13 @@ class App:
                       "cash": "Money not currently invested in a coin.",
                       "hold": "Your account's profit/loss minus the market's: the market = your starting money split across "
                               "your tickers at the start and left alone. Positive = your account did better (or lost less).",
-                      "day": "How much your total value has changed since today began."}[key])
+                      "day": "How much your total value has changed since today began.",
+                      "broker": "Your Alpaca account's own value, straight from Alpaca (paper or real money), with its change "
+                                "since yesterday's close. PRACTICE runs on its own pretend money inside OBF, so these numbers "
+                                "differ. Turn this tile off in Settings > Basics."}[key])
+        self.tile_frames["broker"].grid_remove()  # shown once there's an Alpaca account to read
+        tiles.columnconfigure(5, weight=0)
+        threading.Thread(target=self._broker_loop, daemon=True).start()
         self.root.after(50, self.apply_compact)
         self.verdict_lbl = tk.Label(right, text="", bg=BG, fg=MUTED, anchor="w", font=("", 10, "bold"))
         self.verdict_lbl.pack(fill="x", pady=(6, 0))
@@ -1658,6 +1669,12 @@ class App:
         self.trade_count_lbl.pack(side="left")
         ttk.Button(trade_bar, text="Refresh", style="Plain.TButton",
                    command=self.refresh_trades).pack(side="right")
+        self.trade_acct = tk.StringVar(value="All accounts")
+        acb = ttk.Combobox(trade_bar, textvariable=self.trade_acct, state="readonly", width=14,
+                           values=["All accounts", "PRACTICE", "ALPACA PAPER", "IBKR PAPER", "LIVE", "FARM TEST"])
+        acb.pack(side="right", padx=(8, 0))
+        acb.bind("<<ComboboxSelected>>", lambda e: self.refresh_trades())
+        ttk.Label(trade_bar, text="Show").pack(side="right")
         self.show_bots_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(trade_bar, text="Also show the farm's test trades (pretend, never your balance)", variable=self.show_bots_var,
                         command=self.refresh_trades).pack(side="right", padx=8)
@@ -2069,8 +2086,15 @@ class App:
             show_bots = bool(self.show_bots_var.get())
         except Exception:
             pass
-        if show_bots:
+        want = getattr(self, "trade_acct", None).get() if hasattr(self, "trade_acct") else "All accounts"
+        if show_bots or want == "FARM TEST":
             add_rows(self.shadow_trades)
+
+        def acct_of(r):
+            m = str(r.get("mode", "")).lower()
+            return str(r.get("acct") or "LIVE") if m == "live" else {"paper": "PRACTICE", "bot": "FARM TEST"}.get(m, m.upper())
+        if want != "All accounts":
+            rows[:] = [r for r in rows if acct_of(r) == want]
 
         def number(value, default=0.0):
             try:
@@ -3210,6 +3234,38 @@ class App:
     def equity(self):
         # Total value is always cash plus the marked-to-market value of open positions.
         return self.cash + sum(q * self.position_price(c) for c, q in self.pos.items())
+
+    def _broker_loop(self):
+        """Once a minute while you're logged in: your Alpaca account's own value, for its tile."""
+        while True:
+            try:
+                if self.client and self.settings.get("show_broker_value", True) and self.broker() == "alpaca":
+                    a = E.alp_account() or {}
+                    eq, last = float(a.get("equity") or 0), float(a.get("last_equity") or 0)
+                    self.broker_acct = dict(equity=eq, last=last, paper=bool(E.ALPACA.get("paper", True)), at=time.time())
+                else:
+                    self.broker_acct = None
+                self.q.put(("call", self.refresh_broker_tile))
+            except Exception:
+                pass
+            time.sleep(60)
+
+    def refresh_broker_tile(self):
+        f = getattr(self, "tile_frames", {}).get("broker")
+        b = getattr(self, "broker_acct", None)
+        if f is None:
+            return
+        if not b or not self.client or not self.settings.get("show_broker_value", True):
+            f.grid_remove()
+            f.master.columnconfigure(5, weight=0)  # no empty gap where it was
+            return
+        f.grid()
+        f.master.columnconfigure(5, weight=1)
+        self.tile_titles["broker"].config(text="ALPACA PAPER ACCOUNT" if b["paper"] else "ALPACA ACCOUNT (LIVE)")
+        self.tiles["broker"].config(text=f"${b['equity']:,.2f}", fg=TEXT)
+        ch = b["equity"] - b["last"] if b["last"] else 0.0
+        self.tile_subs["broker"].config(text=f"today {ch:+,.2f} ({ch / b['last'] * 100 if b['last'] else 0:+.2f}%)",
+                                        fg=GREEN if ch > 0 else RED if ch < 0 else MUTED)
 
     def acct_name(self, live=None):
         """What the account is called on screen: PRACTICE (simulated inside OBF), ALPACA PAPER / IBKR PAPER (the broker's
