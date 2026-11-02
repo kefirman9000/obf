@@ -1559,7 +1559,7 @@ class App:
         nb.add(t8, text="  Options  ")
         nb.add(t1, text="  Portfolio  ")
         nb.add(tb, text="  Bot positions  ")
-        nb.add(ts, text="  \u26a1 Scalp scan  ")
+        nb.add(ts, text="  \u26a1 Scalpers  ")
         nb.add(tm, text="  Markets  ")
         nb.add(tt, text="  Trades  ")
         # Markets = watchlist + live prices; Trades = trades + what the bot did + the strategy scoreboard
@@ -1583,7 +1583,15 @@ class App:
         self.build_options_tab(t8)
         self.build_portfolio(t1)
         self.build_botpos_tab(tb)
-        self.build_scan_tab(ts)
+        sn_ = ttk.Notebook(ts)  # Scalpers = the live scalp lab + the market scan
+        sn_.pack(fill="both", expand=True, pady=(4, 0))
+        sn_.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
+        self.subnb[nb.tab(ts, "text").strip()] = sn_
+        f_lab, f_scan = ttk.Frame(sn_), ttk.Frame(sn_)
+        sn_.add(f_lab, text="  Scalp lab  ")
+        sn_.add(f_scan, text="  Scalp scan  ")
+        self.build_lab_tab(f_lab)
+        self.build_scan_tab(f_scan)
         self.build_watchlist(t6)
         tk.Label(t2, bg=CARD, fg=MUTED, justify="left", anchor="w", padx=8, pady=4, wraplength=700,
                  text="The bot tests every strategy with pretend trades. Winning = copied with bigger trades. "
@@ -10153,6 +10161,8 @@ class App:
             self.refresh_botpos()
         elif "Scalp scan" in tab:
             self.refresh_scan()
+        elif tab == "Scalp lab":
+            self.refresh_lab()
 
     # ---------------- bot positions: every bot's open pretend contracts ----------------
     def build_botpos_tab(self, parent):
@@ -10244,6 +10254,390 @@ class App:
                                  f"P/L {pl_all:+,.2f} ({(pl_all / paid_all * 100) if paid_all else 0:+.1f}%)")
                            if rows else ("No bot holds a contract right now." if farms else "The farms haven't started yet."),
                            fg=(GREEN if pl_all >= 0 else RED) if rows else MUTED)
+
+    # ---------------- live scalp lab: a farm of scalpers that learns on its own from live 1-minute prices ----------------
+    LAB_CAP = 24          # scalpers in the lab
+    LAB_TICKERS = 8       # tickers it learns on each day
+    LAB_GRAD_EVERY = 30   # minutes between graduations to your farm
+
+    def lab_path(self):
+        return os.path.join(E.HOME_DIR, "scalp-lab.json")
+
+    def build_lab_tab(self, parent):
+        saved = E.load_json(self.lab_path(), {}) or {}
+        self.lab = dict(t=None, day=None, coins=[], status="", last_t=0, bars=0, grads=list(saved.get("grads") or [])[-200:],
+                        sent=set(saved.get("sent") or []), best=list(saved.get("best") or []), trades=0, busy=False,
+                        days=int(saved.get("days", 0)), last_grad=0)
+        self.lab_feed = deque(maxlen=400)
+        self.lab_log = deque(list(saved.get("log") or [])[-300:], maxlen=300)
+        w = parent
+        top = tk.Frame(w, bg=BG, padx=8, pady=6)
+        top.pack(fill="x")
+        tk.Label(top, text="\u26a1 Scalp lab", bg=BG, fg=TEXT, font=("", 13, "bold")).pack(side="left")
+        self.lab_tog = tk.Button(top, relief="flat", bd=0, padx=14, pady=4, cursor="hand2", font=("", 9, "bold"), fg="white",
+                                 activeforeground="white", command=self.toggle_lab)
+        self.lab_tog.pack(side="left", padx=12)
+        self.lab_state = tk.Label(top, text="", bg=BG, fg=MUTED, font=("", 9), anchor="w", justify="left")
+        self.lab_state.pack(side="left", fill="x", expand=True)
+        b = tk.Frame(top, bg=BG)
+        b.pack(side="right")
+        ttk.Button(b, text="Send selected to my farm", style="Plain.TButton", command=self.lab_send).pack(side="left")
+        self.lab_stats = tk.Label(w, text="", bg=BG, fg=TEXT, anchor="w", padx=10, font=("", 9))
+        self.lab_stats.pack(fill="x")
+        mid = tk.PanedWindow(w, orient="horizontal", bg=BG, sashwidth=5, bd=0)
+        mid.pack(fill="both", expand=True, padx=6, pady=(4, 0))
+        left, right = tk.Frame(mid, bg=CARD), tk.Frame(mid, bg=CARD)
+        mid.add(left, minsize=300, stretch="always")
+        mid.add(right, minsize=300, stretch="always")
+        tk.Label(left, text="SCALPERS: BEST TO WORST (live, pretend money)", bg=CARD, fg=ACCENT, font=("", 8, "bold"),
+                 anchor="w").pack(fill="x", padx=4)
+        lf = tk.Frame(left, bg=CARD)
+        lf.pack(fill="both", expand=True)
+        cols = ("who", "kind", "status", "score", "trades", "winrate", "gate", "gen", "origin")
+        self.lab_tree = self.make_tree(lf, cols, (120, 140, 110, 70, 55, 65, 170, 40, 110),
+                                       ("Scalper", "Instinct", "Status", "Last scalps", "Scalps", "Win rate", "Volatility gate",
+                                        "Gen", "Born"))
+        for c_ in ("who", "kind", "status", "gate", "origin"):
+            self.lab_tree.column(c_, anchor="w")
+        self.lab_tree.tag_configure("up", foreground=GREEN)
+        self.lab_tree.tag_configure("down", foreground=RED)
+        tk.Label(right, text="LIVE TRADES", bg=CARD, fg=ACCENT, font=("", 8, "bold"), anchor="w").pack(fill="x", padx=4)
+        rf = tk.Frame(right, bg=CARD)
+        rf.pack(fill="both", expand=True)
+        self.lab_feed_tree = self.make_tree(rf, ("when", "who", "what", "res"), (60, 110, 190, 70),
+                                            ("Time", "Scalper", "Trade", "Result"))
+        for c_ in ("when", "who", "what"):
+            self.lab_feed_tree.column(c_, anchor="w")
+        self.lab_feed_tree.tag_configure("win", foreground=GREEN)
+        self.lab_feed_tree.tag_configure("loss", foreground=RED)
+        lo = ttk.Notebook(w, height=96)
+        lo.pack(side="bottom", fill="x", padx=6, pady=(4, 6), before=mid)  # always visible under the live lists
+        l1, l2, l3 = tk.Frame(lo, bg=BG), tk.Frame(lo, bg=BG), tk.Frame(lo, bg=BG)
+        lo.add(l1, text="  Tickers it's learning on  ")
+        lo.add(l2, text="  Lab log  ")
+        lo.add(l3, text="  How it works  ")
+        self.lab_tk_tree = self.make_tree(l1, ("ticker", "price", "move", "vol"), (80, 90, 80, 120),
+                                          ("Ticker", "Price", "Today", "Volatility"))
+        self.lab_tk_tree.column("vol", anchor="w")
+        self.lab_log_tree = self.make_tree(l2, ("time", "what"), (110, 900), ("Time", "What happened"))
+        self.lab_log_tree.column("what", anchor="w")
+        for t_ in (self.lab_tk_tree, self.lab_log_tree):
+            t_.configure(height=3)
+        tk.Label(l3, bg=BG, fg=TEXT, justify="left", anchor="nw", wraplength=1100, padx=8, pady=8, font=("", 9), text=(
+            "The Scalp lab is a farm of scalpers only, learning on its own from LIVE prices while the market is open. It "
+            "never trades your account.\n\n"
+            "EACH MORNING it picks up to 8 tickers (yours, then the busiest ones and the ones the Scalp scan found paying), "
+            "starts from yesterday's best scalpers plus new ones, and warms up on the day so far.\n"
+            "EVERY MINUTE a new 1-minute bar arrives and every scalper decides: in, out, or wait, with real bid/ask costs, "
+            "its own stop, target and time limit, and its volatility gate reading VIXY, SPY and the live VIX-like reading.\n"
+            "EVERY 15 MINUTES the lab evolves: scalpers that keep losing retire, winners lay eggs (tweaked copies), two winners "
+            "can crossbreed, and brand new scalpers are tried, all judged on their last 30 scalps.\n"
+            "EVERY 30 MINUTES its best proven scalper (15+ scalps, in profit, winning) graduates to your farm as a "
+            "'Scalp lab graduate', where it still has to prove itself. 'Send selected to my farm' does it by hand.\n"
+            "AT THE CLOSE its 12 best scalpers are kept, so tomorrow's lab starts from them.")).pack(fill="both", expand=True)
+        threading.Thread(target=self._lab_loop, daemon=True).start()
+        self.refresh_lab()
+        self._lab_tick()
+
+    def toggle_lab(self):
+        on = not self.cfg.get("lab_on", False)
+        self.cfg["lab_on"] = on
+        E.save_json(CONFIG_PATH, self.cfg)
+        self.write("\u26a1 Scalp lab ON: scalpers learn on their own from live prices while the market is open." if on else
+                   "\u26a1 Scalp lab OFF: nothing learns in the background (its best scalpers are kept for next time).",
+                   "good" if on else None)
+        if not on:
+            self.lab_save()
+        self.refresh_lab()
+
+    def _lab_tick(self):
+        try:
+            if self.cur_tab() == "Scalp lab" and not self.in_bg():
+                self.refresh_lab()
+        except Exception:
+            pass
+        self.root.after(2000, self._lab_tick)
+
+    def lab_note(self, text):
+        self.lab_log.appendleft((time.time(), text))
+
+    def lab_pick(self):
+        """Today's tickers: yours, the ones the Scalp scan found paying, then the busiest ones."""
+        res = (getattr(self, "scan", None) or {}).get("res") or {}
+        hot = [k for k, v in sorted((res.get("tickers") or {}).items(), key=lambda kv: -(kv[1]["pl"] / kv[1]["paid"] if kv[1]["paid"] else -1))
+               if v.get("trades", 0) >= 5 and v["pl"] > 0]
+        busy = ["SPY", "QQQ", "NVDA", "TSLA", "AAPL", "AMD", "META", "AMZN", "MSFT", "IWM"]
+        return [c for c in dict.fromkeys(list(self.session_coins or []) + hot[:4] + busy) if E.valid_coin(c)][:self.LAB_TICKERS]
+
+    def _lab_bars(self, coins):
+        """Finished 1-minute bars for the lab's tickers, lined up on SPY's minutes. -> (closes, extra) or None"""
+        raw = {}
+        for sym in list(dict.fromkeys(coins + ["SPY", "VIXY"])):
+            try:
+                d = E.fetch_ohlcv(sym, 60, 470, self.quote)
+            except Exception:
+                continue
+            keep = [i for i, tt in enumerate(d.get("t") or []) if tt + 60 <= time.time()]  # finished bars only
+            if len(keep) > 40:
+                raw[sym] = {k: [d[k][i] for i in keep] for k in ("c", "h", "l", "v", "t")}
+        if "SPY" not in raw:
+            return None
+        clock = raw["SPY"]["t"]  # SPY trades every minute: the lab's clock
+        closes, extra = {}, {}
+        for c in coins:
+            r = raw.get(c)
+            if not r:
+                continue
+            vol = dict(zip(r["t"], r["v"]))
+            closes[c] = E.align_ctx(clock, r["t"], r["c"])
+            extra[c] = dict(h=E.align_ctx(clock, r["t"], r["h"]), l=E.align_ctx(clock, r["t"], r["l"]),
+                            v=[vol.get(tt, 0.0) for tt in clock], t=list(clock))
+        ctx = {"SPY": list(raw["SPY"]["c"])}
+        if "VIXY" in raw:
+            ctx["VIXY"] = E.align_ctx(clock, raw["VIXY"]["t"], raw["VIXY"]["c"])
+        iv = E.ivx_today()
+        if iv:
+            ctx[E.IVX_KEY] = E.align_ctx(clock, [x[0] for x in iv], [x[1] for x in iv])
+        extra[E.CTX_KEY] = ctx
+        return closes, extra
+
+    def _lab_start(self, day):
+        coins = self.lab_pick()
+        self.lab["status"] = f"Starting today's lab on {', '.join(coins)}: reading the day so far..."
+        got = self._lab_bars(coins)
+        if not got:
+            raise RuntimeError("no live 1-minute prices yet")
+        closes, extra = got
+        coins = [c for c in coins if c in closes]
+        if len(coins) < 2:
+            raise RuntimeError("too few tickers with live prices")
+        opts = dict(E.tournament_opts(self.settings), scalp_share=1.0, scalp_only=True, islands=1, classics=False, window=60)
+        t = E.Tournament(coins, E.SCAN_CASH, 0.0, 0.05, 15, opts=opts, cap=self.LAB_CAP, retire_after=4, retire_steps=120)
+        for g in self.lab["best"][:12]:  # yesterday's best scalpers come back
+            try:
+                if len(t.vars) >= t.cap:
+                    t._remove(t.vars[-1], "made room for yesterday's best")
+                t.add_variant(g["name"], g["params"], None, note="Back from yesterday:", tf=g.get("tf", 1), origin="lab: yesterday",
+                              risk=g.get("risk"), traits=g.get("traits"), vetoes=g.get("vetoes"), layers=g.get("layers"))
+            except Exception:
+                continue
+        L = len(next(iter(closes.values())))
+        self.lab["status"] = f"Warming up on today's {L} minutes so far..."
+        t.replaying = True
+        t.warmup(closes, start=min(E.WARM, max(1, L - 2)), extra=extra)
+        t.replaying = False
+        t.pop_events()
+        t.on_trade = lambda v, c, tr, ts: self._lab_trade(v, c, tr, ts)  # from here on: live trades only
+        self.lab.update(t=t, day=day, coins=coins, last_t=extra[coins[0]]["t"][-1], bars=L, trades=0, last_grad=time.time())
+        self._lab_tk({c: closes[c] for c in coins}, extra)
+        self.lab["days"] += 1
+        self.lab_note(f"Started the lab for {day}: {len(t.vars)} scalpers on {', '.join(coins)}"
+                      + (f" ({min(12, len(self.lab['best']))} back from yesterday)" if self.lab["best"] else "") + ".")
+
+    def _lab_tk(self, closes, extra):
+        """Price, move since today's open and volatility state of each lab ticker (for its list)."""
+        day0 = E.ny_time(E.ny_date(time.time()).isoformat(), 9, 30)
+        out = {}
+        for c, p in closes.items():
+            tt = extra[c]["t"]
+            i0 = next((i for i, x in enumerate(tt) if x >= day0), 0)
+            out[c] = dict(px=p[-1], move=(p[-1] / p[i0] - 1) * 100 if p[i0] else 0.0,
+                          reg=E.vol_regime(closes, extra, c)[0])
+        self.lab["tk"] = out
+
+    def _lab_trade(self, v, c, tr, ts):
+        self.lab["trades"] += 1
+        o = tr.get("contract")
+        self.lab_feed.appendleft(dict(t=ts or time.time(), who=E.bot_nickname(v.key()), side=tr["side"], pl=tr.get("pl"),
+                                      usd=tr.get("usd"), what=E.contract_text(dict(o, under=c)) if o else c))
+
+    def _lab_step(self):
+        lab, t = self.lab, self.lab["t"]
+        got = self._lab_bars(lab["coins"])
+        if not got:
+            return
+        closes, extra = got
+        times = extra[lab["coins"][0]]["t"]
+        new = [i for i, tt in enumerate(times) if tt > lab["last_t"]]
+        for i in new:  # usually one new minute (more after a hiccup)
+            t.step({c: E.View(closes[c], i + 1) for c in lab["coins"]}, E.slice_extra(extra, i + 1))
+            lab["last_t"] = times[i]
+            lab["bars"] += 1
+        if new:
+            self._lab_tk({c: closes[c] for c in lab["coins"]}, extra)
+        for e in t.pop_events():
+            if not e.startswith(("Spawned", "Dropped", "Bred", "Random new")):
+                self.lab_note(e)
+        if new and time.time() - lab["last_grad"] >= self.LAB_GRAD_EVERY * 60:
+            lab["last_grad"] = time.time()
+            self.q.put(("call", self.lab_graduate))
+
+    def _lab_loop(self):
+        while True:
+            time.sleep(5)
+            lab = self.lab
+            try:
+                if not self.cfg.get("lab_on", False):
+                    lab["status"] = "Off. Nothing learns in the background: the lab only learns while this is ON."
+                    continue
+                if not self.client:
+                    lab["status"] = "Log in to Alpaca (Account menu): the lab learns from live prices."
+                    continue
+                clk = E.market_clock()
+                if not clk["is_open"]:
+                    if lab["t"] is not None:
+                        self.lab_save(close=True)
+                    lab["status"] = ("Market closed. The lab wakes up at the open, "
+                                     + datetime.fromtimestamp(clk["next_open"]).strftime("%a %I:%M %p").replace(" 0", " ")
+                                     + ". (Free roam's scalp roams can keep learning from past days.)")
+                    continue
+                day = E.ny_date(time.time()).isoformat()
+                if lab["t"] is None or lab["day"] != day:
+                    if lab["t"] is not None:
+                        self.lab_save(close=True)
+                    self._lab_start(day)
+                    continue
+                if time.time() - lab["last_t"] < 120:  # the next minute isn't finished yet
+                    left = int(lab["last_t"] + 120 - time.time())
+                    lab["status"] = (f"Learning live on {len(lab['coins'])} tickers   |   minute {lab['bars']}   |   "
+                                     f"next bar in {max(0, left)} s")
+                    continue
+                self._lab_step()
+                if lab["bars"] % 10 == 0:
+                    self.lab_save()
+            except Exception as e:
+                lab["status"] = f"The lab hit a problem and tries again in a minute: {str(e)[:120]}"
+                self._record_error("scalp lab")
+                time.sleep(55)
+
+    def lab_best(self, n=12):
+        t = self.lab.get("t")
+        if not t:
+            return []
+        ranked = [v for v, _ in t.ranking() if E.scalp_record(v)] or [v for v, _ in t.ranking()]
+        return ranked[:n]
+
+    def lab_save(self, close=False):
+        """Keeps the lab's best scalpers (tomorrow starts from them), its log and its graduates."""
+        lab = self.lab
+        best = [E._genes(v) for v in self.lab_best()] or lab["best"]
+        lab["best"] = best
+        if close and lab.get("t") is not None:
+            self.lab_note(f"Closed the lab for {lab['day']}: {lab['trades']} scalps; kept its {len(best)} best scalpers for next time.")
+            lab["t"] = None
+        try:
+            E.save_json(self.lab_path(), dict(best=best, grads=lab["grads"][-200:], sent=sorted(lab["sent"])[-500:],
+                                              log=list(self.lab_log)[:300], days=lab["days"]))
+        except Exception:
+            pass
+
+    def lab_graduate(self, v=None, by_hand=False):
+        """The lab's best proven scalper joins your farm (main thread)."""
+        lab, t, main = self.lab, self.lab.get("t"), self.tourn
+        if not t:
+            return
+        if v is None:
+            cands = [x for x in self.lab_best(6) if x in t.active and (E.scalp_record(x) or ())
+                     and len(E.scalp_record(x)) > 15 and (t.score(x) or 0) > 0]
+            v = next((x for x in cands if E.bot_nickname(x.key()) not in lab["sent"]), None)
+            if v is None:
+                return
+        nm = E.bot_nickname(v.key())
+        if not main or not self.seeded:
+            if by_hand:
+                messagebox.showinfo("Scalp lab", "Start your farm first (press Start once), then send scalpers to it.")
+            return
+        if not main.scalpers() and not by_hand:
+            return  # your farm has scalpers switched off
+        g = E._genes(v)
+        nv = main.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
+                              note="Scalp lab graduate:", tf=g["tf"], origin="scalp lab", risk=g["risk"], traits=g["traits"],
+                              vetoes=g["vetoes"], layers=g["layers"])
+        if nv:
+            lab["sent"].add(nm)
+            te = E.scalp_record(v) or []
+            sc = t.score(v)
+            lab["grads"].append(dict(time=time.time(), name=nm, kind=v.name, score=sc))
+            self.lab_note(f"{nm} ({STRAT_LABELS.get(v.name, v.name)}) graduated to your farm"
+                          + (" (sent by you)" if by_hand else "")
+                          + (f": {sc * 100:+.1f}% over its last {len(te) - 1} scalps." if sc is not None and te else "."))
+            self.write(f"\u26a1 Scalp lab: {nm} graduated to your farm. It still has to prove itself there.", "good")
+            self.refresh_board()
+            self.lab_save()
+
+    def lab_send(self):
+        t = self.lab.get("t")
+        sel = self.lab_tree.selection() if hasattr(self, "lab_tree") else ()
+        if not t or not sel:
+            return messagebox.showinfo("Scalp lab", "Click a scalper in the list first (the lab must be running).")
+        by_name = {E.bot_nickname(v.key()): v for v in t.vars}
+        v = by_name.get(sel[0])
+        if v:
+            self.lab_graduate(v, by_hand=True)
+            self.refresh_lab()
+
+    def refresh_lab(self):
+        if not hasattr(self, "lab_tree"):
+            return
+        lab, t = self.lab, self.lab.get("t")
+        on = bool(self.cfg.get("lab_on", False))
+        self.lab_tog.config(text="ON  —  click to stop" if on else "OFF  —  click to start", bg=GREEN if on else "#4b5563",
+                            activebackground=GREEN if on else "#4b5563")
+        self.lab_state.config(text=lab.get("status") or "")
+        if t:
+            sc = t.scalpers()
+            win = sum(1 for v in sc if t.info.get(id(v), {}).get("status") == "active")
+            self.lab_stats.config(text=(f"{len(sc)} scalpers ({win} winning)   |   generations: {t.evolves}   |   "
+                                        f"born today: {len(t.births)}   retired: {len(t.deaths)}   |   scalps today: {lab['trades']:,}   |   "
+                                        f"graduated to your farm: {len(lab['grads'])}   |   days learned: {lab['days']}   |   "
+                                        f"{self.vol_text()}"))
+        else:
+            self.lab_stats.config(text=f"Graduated to your farm so far: {len(lab['grads'])}   |   days learned: {lab['days']}   |   "
+                                       f"best scalpers kept for next time: {len(lab['best'])}")
+        tr = self.lab_tree
+        sel = tr.selection()
+        try:  # the lab thread may be mid-step: a list that changed underneath just waits for the next refresh
+            rows_ = ([v for v, _ in t.ranking()] + [v for v in list(t.vars) if t.score(v) is None]) if t else []
+        except (RuntimeError, ValueError, KeyError):
+            return
+        tr.delete(*tr.get_children())
+        if t:
+            for v in rows_:
+                d = t.info.get(id(v), {})
+                te = E.scalp_record(v)
+                sc = t.score(v)
+                nm = E.bot_nickname(v.key())
+                if tr.exists(nm):
+                    continue
+                tr.insert("", "end", iid=nm, tags=("up" if (sc or 0) > 0 else "down" if sc is not None else "",), values=(
+                    nm, STRAT_LABELS.get(v.name, v.name), STATUS_TEXT.get(d.get("status"), ""),
+                    f"{sc * 100:+.1f}%" if sc is not None else "-", v.wins + v.losses,
+                    f"{v.wins / (v.wins + v.losses) * 100:.0f}%" if v.wins + v.losses else "-",
+                    E.VIX_MODES.get(int(v.traits.get("vixmode", 5)), ""), v.gen,
+                    {"scalp hatch": "egg", "random scalper": "new", "tweaked": "egg", "bred": "crossbred",
+                     "lab: yesterday": "yesterday"}.get(v.origin, v.origin)))
+            for x in sel:
+                if tr.exists(x):
+                    tr.selection_add(x)
+        f = self.lab_feed_tree
+        f.delete(*f.get_children())
+        for x in list(self.lab_feed)[:150]:
+            if x["side"] == "buy":
+                res_, tag = "opened", ""
+            else:
+                paid = (x.get("usd") or 0) - (x.get("pl") or 0)
+                res_ = f"{(x['pl'] / paid * 100 if paid > 0 and x.get('pl') is not None else 0):+.0f}%"
+                tag = "win" if (x.get("pl") or 0) > 0 else "loss"
+            f.insert("", "end", tags=(tag,), values=(datetime.fromtimestamp(x["t"]).strftime("%H:%M"), x["who"],
+                                                     ("buy " if x["side"] == "buy" else "sell ") + x["what"], res_))
+        k = self.lab_tk_tree
+        k.delete(*k.get_children())
+        for c, x in (lab.get("tk") or {}).items():
+            k.insert("", "end", values=(c, fmt_px(x["px"]), f"{x['move']:+.2f}%", x["reg"]))
+        g = self.lab_log_tree
+        g.delete(*g.get_children())
+        for ts, text in list(self.lab_log)[:200]:
+            g.insert("", "end", values=(datetime.fromtimestamp(ts).strftime("%b %d %H:%M"), text))
 
     # ---------------- scalp scan: the scalpers roam the market during the trading day ----------------
     SCAN_EVERY = 300  # seconds between scans while the market is open

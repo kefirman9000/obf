@@ -54,7 +54,8 @@ edges of a tight range. Every scalper carries a tight stop and target, a time li
 close. A share of the farm is kept for them, they breed among themselves, and when they carry a vote your account
 trades that contract the scalper way, in its own scalp book so scalps and long-term trades on the same ticker never
 get in each other's way. During market hours the **Scalp scan** sends your best scalpers roaming across the most-traded
-tickers and shows where scalps are paying today. Switch them on or off, and set their share, on the **Learning** page.
+tickers and shows where scalps are paying today, and the **Scalp lab** lets a farm of scalpers learn on its own from
+live prices, minute by minute, graduating its best into your farm. Switch them on or off, and set their share, on the **Learning** page.
 
 ## A dragon's genes
 Every gene is inherited, mutated and crossbred, and every dragon carries a different mix:
