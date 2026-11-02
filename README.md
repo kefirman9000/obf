@@ -52,7 +52,9 @@ their own wallet, and never mix with the fast farm.
 quick moves the patient breeds let pass: a sudden burst of volume, a crossing of VWAP, a short pullback in a trend, the
 edges of a tight range. Every scalper carries a tight stop and target, a time limit, and is always flat before the
 close. A share of the farm is kept for them, they breed among themselves, and when they carry a vote your account
-trades that contract the scalper way. Switch them on or off, and set their share, on the **Learning** page.
+trades that contract the scalper way, in its own scalp book so scalps and long-term trades on the same ticker never
+get in each other's way. During market hours the **Scalp scan** sends your best scalpers roaming across the most-traded
+tickers and shows where scalps are paying today. Switch them on or off, and set their share, on the **Learning** page.
 
 ## A dragon's genes
 Every gene is inherited, mutated and crossbred, and every dragon carries a different mix:
