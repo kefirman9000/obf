@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.16.0
+- **Farm knowledge** (Learning > Farm knowledge, or the \U0001f4d6 Knowledge button on the farm): everything a farm has
+  learned in one place. Ability meters show how much of each kind it has mastered (never-rules, studies, instincts,
+  volatility gates, seasons, elders, breeding lessons, proven dragons), and a grid lists every lesson with the evidence
+  behind it. Save it as a named **book**, keep as many books as you like, and pick any lessons to add to the Bot Farm,
+  the Slow farm or the Scalp lab: proven rules make new eggs favour them, proven dragons hatch there, elders and
+  season champions move across, and mutation memory merges.
+- **Free roam's numbers are fair now**: "Avg / Best / Worst vs holding" compare the money a bot ended with to what just
+  holding would have ended with, so they can never read below -100%. Before, the two returns were subtracted, so a bot
+  that made +20% while holding rallied +400% over a long stretch showed -380%, which looked like an impossible loss.
+  Older study results are converted the same way.
+- New look for the GitHub page.
+
 ## 1.15.0
 - **Scalp lab** (new, under the "\u26a1 Scalpers" tab): a farm of scalpers only that learns on its own from LIVE prices
   while the market is open, like Free roam but in real time. Switch it on and it:

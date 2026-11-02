@@ -4633,6 +4633,15 @@ def backtest_bot(g, closes, extra=None, start_cash=1000.0, fee=0.006, pct=0.1, s
         bars=L - start, fees=b.sim.fees)
 
 
+def rel_edge(ret, hold):
+    """How the bot did compared with just holding, as money: (1 + its return) / (1 + holding's return) - 1.
+    -50% = it ended with half as much money as holding would have; it can never be below -100%. (Simply subtracting the
+    two returns can show -300% when holding rallied 400% over a long stretch, which reads like an impossible loss.)"""
+    if hold is None or hold <= -1:
+        return ret
+    return (1 + ret) / (1 + hold) - 1
+
+
 def backtest_simple(g, closes, extra, a, z, start_cash, fee, pct, slip):
     """Return of bot genes g traded from bar a to bar z (exclusive)."""
     coins = list(closes)
@@ -4879,6 +4888,250 @@ def slice_extra(extra, i):
     if not extra:
         return None
     return {c: {k: View(v, i) for k, v in d.items()} for c, d in extra.items() if d}
+
+
+# ---------------- Farm knowledge: everything a farm has learned, as items you can save, view and add elsewhere ----------------
+KNOW_KINDS = ("Never-rule", "Study", "Instinct", "Volatility gate", "Season champion", "Elder", "Mutation lesson",
+              "Proven bot", "Ticker habit")
+KNOW_FORMAT = "obf-knowledge"
+
+
+def _med(xs):
+    xs = sorted(xs)
+    return xs[len(xs) // 2] if xs else None
+
+
+def farm_knowledge(t):
+    """Everything this farm has learned, as a list of items: {id, kind, title, detail, evidence, score, strong, data}.
+    score is how much the item is worth by its own evidence (%), strong = proven by enough evidence to trust."""
+    items = []
+    ranked = [v for v, sc in t.ranking() if sc is not None]
+    sc_of = {id(v): t.score(v) for v in t.vars}
+
+    def best_with(pred):
+        return next((v for v in ranked if pred(v)), None)
+    # never-rules: the evidence of every bot that carries (or carried) them
+    agg = {}
+    for v in t.vars:
+        for k, st in (v.veto_stats or {}).items():
+            a = agg.setdefault(k, dict(n=0.0, saved=0.0, vals=[], bots=0))
+            a["n"] += st[0]
+            a["saved"] += st[1]
+        for k, x in (v.vetoes or {}).items():
+            a = agg.setdefault(k, dict(n=0.0, saved=0.0, vals=[], bots=0))
+            a["vals"].append(x)
+            a["bots"] += 1
+    for k, a in agg.items():
+        if k not in VETOES or (a["n"] < 1 and not a["bots"]):
+            continue
+        avg = a["saved"] / a["n"] if a["n"] else 0.0
+        x = _med(a["vals"]) or (VETOES[k]["lo"] + VETOES[k]["hi"]) / 2
+        rv = t.review.get(k, [0, 0])
+        items.append(dict(id=f"rule:{k}", kind="Never-rule", title=VETOES[k]["name"], detail=VETOES[k]["text"](x),
+                          evidence=f"{a['n']:.0f} trades blocked, {avg:+.2f}% saved each; {a['bots']} bots carry it"
+                                   + (f"; would have stopped {rv[0]} losing buys" if rv[0] else ""),
+                          score=round(avg, 3), strong=a["n"] >= 5 and avg > 0,
+                          data=dict(key=k, value=x, n=a["n"], saved=a["saved"], review=list(rv))))
+    # studies (extra reasons to buy or not, bigger trend, market leader, context tickers, volatility gate)
+    names = {"plus": "Buy studies (extra reasons to buy)", "minus": "No-buy studies (reasons not to buy)",
+             "confirm": "Confirmation", "htf": "Bigger-trend study", "lead": "Follow the market leader",
+             "vix": "Volatility gate (scalpers)", "coin": "Skipping tickers it's bad at"}
+    lagg = {}
+    for v in t.vars:
+        for k, st in (v.layer_stats or {}).items():
+            a = lagg.setdefault(k, [0.0, 0.0])
+            a[0] += st[0]
+            a[1] += st[1]
+    for k, (n, saved) in lagg.items():
+        if n < 1:
+            continue
+        avg = saved / n
+        title = names.get(k) or (f"Watching {k[4:]}" if k.startswith("ctx:") else k)
+        carrier = (best_with(lambda v, k=k: k in (v.layer_stats or {}) and (sc_of.get(id(v)) or 0) > 0)
+                   or best_with(lambda v, k=k: k in (v.layer_stats or {}))
+                   or next((v for v in t.vars if k in (v.layer_stats or {})), None))
+        items.append(dict(id=f"study:{k}", kind="Volatility gate" if k == "vix" else "Study", title=title,
+                          detail="graded every time it changed a decision", evidence=f"{n:.0f} decisions, {avg:+.2f}% each",
+                          score=round(avg, 3), strong=n >= 5 and avg > 0,
+                          data=dict(key=k, n=n, saved=saved, genes=_genes(carrier) if carrier else None)))
+    # instincts: how each main strategy is doing here, with its best bot
+    by = {}
+    for v in t.vars:
+        by.setdefault(v.name, []).append(v)
+    for nm, vs in by.items():
+        scored = [(sc_of.get(id(v)), v) for v in vs if sc_of.get(id(v)) is not None]
+        best = max(scored, key=lambda x: x[0]) if scored else (None, vs[0])
+        win = sum(1 for v in vs if t.info.get(id(v), {}).get("status") == "active")
+        items.append(dict(id=f"instinct:{nm}", kind="Instinct", title=nm + (" (scalper)" if is_scalp(nm) else ""),
+                          detail=f"best: {best[1].label}"[:160],
+                          evidence=f"{len(vs)} bots, {win} winning" + (f"; best {best[0] * 100:+.1f}%" if best[0] is not None else ""),
+                          score=round((best[0] or 0) * 100, 3), strong=bool(win),
+                          data=dict(name=nm, genes=_genes(best[1]))))
+    # scalpers' volatility gates: which gate the winning scalpers use
+    gates = {}
+    for v in t.vars:
+        if is_scalp(v.name):
+            g = int(v.traits.get("vixmode", 5) or 5)
+            a = gates.setdefault(g, [0, 0, None])
+            a[0] += 1
+            a[1] += t.info.get(id(v), {}).get("status") == "active"
+            if (sc_of.get(id(v)) or -9) > ((sc_of.get(id(a[2])) or -9) if a[2] else -10):
+                a[2] = v
+    for g, (n, win, v) in gates.items():
+        items.append(dict(id=f"gate:{g}", kind="Volatility gate", title=VIX_MODES.get(g, ""), detail="scalpers' choice",
+                          evidence=f"{n} scalpers, {win} winning", score=float(win), strong=win > 0,
+                          data=dict(mode=g, genes=_genes(v) if v else None)))
+    # season champions, elders, mutation memory
+    for m, ch in (t.champions or {}).items():
+        items.append(dict(id=f"season:{m}", kind="Season champion", title=f"Champion of '{m}' markets",
+                          detail=(ch.get("label") or ch.get("name", ""))[:160], evidence=f"gained {ch.get('fit', 0) * 100:+.3f}% a decision",
+                          score=round(ch.get("fit", 0) * 100, 4), strong=True, data=dict(mood=m, champion=ch)))
+    for i, e in enumerate(sorted(t.elders or [], key=lambda e: -(e.get("edge") or 0))[:12]):
+        items.append(dict(id=f"elder:{e['name']}:{i}", kind="Elder", title=f"Elder {e['name']}",
+                          detail=", ".join(f"{k}={x}" for k, x in (e.get("params") or {}).items())[:160],
+                          evidence=f"edge {(e.get('edge') or 0) * 100:+.1f}%", score=round((e.get("edge") or 0) * 100, 3),
+                          strong=(e.get("edge") or 0) > 0, data=dict(elder=e)))
+    tb = sum(x[0] for x in (t.mut_stats or {}).values()) or 1
+    tw = sum(x[1] for x in (t.mut_stats or {}).values())
+    for k, (born, won) in (t.mut_stats or {}).items():
+        if born < 3:
+            continue
+        rate, base = won / born, tw / tb
+        items.append(dict(id=f"mut:{k}", kind="Mutation lesson", title=f"Changing its {k}",
+                          detail=f"makes winners {rate / base:.1f}x as often as other changes" if base else "",
+                          evidence=f"{born} children, {won} became winners", score=round((rate - base) * 100, 2),
+                          strong=born >= 8, data=dict(key=k, stats=[born, won])))
+    # the farm's best bots, and the tickers it has learned to skip
+    for v in ranked[:8]:
+        if (sc_of.get(id(v)) or 0) <= 0:
+            continue
+        items.append(dict(id=f"bot:{bot_nickname(v.key())}", kind="Proven bot", title=bot_nickname(v.key()),
+                          detail=v.label[:160], evidence=f"{sc_of[id(v)] * 100:+.1f}% recently; {v.wins} wins, {v.losses} losses",
+                          score=round(sc_of[id(v)] * 100, 3), strong=t.info.get(id(v), {}).get("status") == "active",
+                          data=dict(genes=_genes(v))))
+    bad = {}
+    for v in t.vars:
+        for c, x in (v.coin_pl or {}).items():
+            if x[0] >= 3 and x[1] < -1.5:
+                bad[c] = bad.get(c, 0) + 1
+    for c, n in bad.items():
+        items.append(dict(id=f"ticker:{c}", kind="Ticker habit", title=f"Hard to trade: {c}", detail="bots skip it after repeated losses",
+                          evidence=f"{n} bots learned this", score=-float(n), strong=n >= 3, data=dict(ticker=c, info_only=True)))
+    order = {k: i for i, k in enumerate(KNOW_KINDS)}
+    items.sort(key=lambda x: (order.get(x["kind"], 99), -x["score"]))
+    return items
+
+
+def knowledge_levels(items):
+    """Ability levels for the knowledge screen: kind -> (items, strong items, level 0..10)."""
+    out = {}
+    for k in KNOW_KINDS:
+        xs = [x for x in items if x["kind"] == k]
+        strong = sum(1 for x in xs if x.get("strong"))
+        out[k] = (len(xs), strong, min(10, round(strong * 10 / max(4, len(xs))) + (1 if strong else 0)))
+    return out
+
+
+def apply_knowledge(t, items, closes=None):
+    """Adds the chosen knowledge to farm t. -> list of plain-English notes, one per item."""
+    notes = []
+    for it in items:
+        k, d = it["kind"], it.get("data") or {}
+        try:
+            if k == "Never-rule":
+                rv = t.review.setdefault(d["key"], [0, 0])
+                if d.get("saved", 0) > 0:  # new eggs are more likely to grow this rule
+                    rv[0] += max(3, int(d.get("n", 0) // 2))
+                g = None
+                best = next((v for v, sc in t.ranking() if (sc or 0) > 0 and d["key"] not in v.vetoes
+                             and len(v.vetoes) < MAX_VETOES and t.rule_allowed(d["key"])), None)
+                if best:  # and one egg of your best bot hatches with it
+                    g = _genes(best)
+                    g["vetoes"] = dict(g["vetoes"], **{d["key"]: d["value"]})
+                    _know_hatch(t, g, closes, "Knowledge egg (never-rule):")
+                notes.append(f"{it['title']}: new eggs favour it" + (", and an egg of your best bot carries it" if g else ""))
+            elif k in ("Study", "Instinct", "Proven bot", "Volatility gate"):
+                g = d.get("genes")
+                if not g:
+                    notes.append(f"{it['title']}: nothing to hatch (no bot carries it)")
+                elif is_scalp(g["name"]) and not (t.scalpers() or t.scalp_target()):
+                    notes.append(f"{it['title']}: skipped (this farm has no scalpers)")
+                else:
+                    n0 = len(t.vars)
+                    keys0 = {x.key() for x in t.vars}
+                    v = _know_hatch(t, g, closes, f"Knowledge egg ({k.lower()}):")
+                    notes.append(f"{it['title']}: couldn't hatch" if not v else
+                                 f"{it['title']}: {bot_nickname(v.key())} already carries it here" if v.key() in keys0 and len(t.vars) <= n0
+                                 else f"{it['title']}: hatched {bot_nickname(v.key())}")
+            elif k == "Season champion":
+                ch, m = d["champion"], d["mood"]
+                if ch.get("fit", 0) > (t.champions.get(m) or {}).get("fit", -1e9):
+                    t.champions[m] = dict(ch, uid=-1)
+                    notes.append(f"{it['title']}: now this farm's champion for that season")
+                else:
+                    notes.append(f"{it['title']}: this farm's own champion is stronger, kept it")
+            elif k == "Elder":
+                e = d["elder"]
+                if not any(x.get("name") == e["name"] and x.get("params") == e.get("params") for x in t.elders):
+                    t.elders.append(dict(e))
+                    del t.elders[:-40]
+                notes.append(f"{it['title']}: nudges this farm's future eggs")
+            elif k == "Mutation lesson":
+                st = t.mut_stats.setdefault(d["key"], [0, 0])
+                st[0] += d["stats"][0]
+                st[1] += d["stats"][1]
+                notes.append(f"{it['title']}: mutation memory updated")
+            else:
+                notes.append(f"{it['title']}: for reference only")
+        except Exception as e:
+            notes.append(f"{it['title']}: couldn't add ({e})")
+    t._rate()
+    return notes
+
+
+def _know_hatch(t, g, closes, note):
+    key = bot_key(g)
+    have = next((v for v in t.vars if v.key() == key), None)
+    if have is not None:  # already on this farm (another item pointed at the same bot)
+        return have
+    if len(t.vars) >= t.cap:
+        cands = [v for v, _ in reversed(t.ranking()) if v not in t.active] or [v for v in t.vars if v not in t.active]
+        if cands:
+            t._remove(cands[0], "made room for a knowledge egg")
+    return t.add_variant(g["name"], g["params"], closes, 1.0, note=note, tf=g.get("tf", 1), origin="knowledge",
+                         risk=g.get("risk"), traits=g.get("traits"), vetoes=g.get("vetoes"), layers=g.get("layers"))
+
+
+def knowledge_dir():
+    return os.path.join(HOME_DIR, "knowledge")
+
+
+def save_knowledge(name, items, source=""):
+    os.makedirs(knowledge_dir(), exist_ok=True)
+    safe = re.sub(r"[^\w .-]", "", name).strip() or "knowledge"
+    path = os.path.join(knowledge_dir(), f"{safe}.json")
+    save_json(path, dict(format=KNOW_FORMAT, version=1, name=name, source=source, saved=time.time(), items=items))
+    return path
+
+
+def list_knowledge():
+    """Saved knowledge books, newest first: [dict(name, source, saved, n, path)]."""
+    out = []
+    try:
+        for f in os.listdir(knowledge_dir()):
+            if f.endswith(".json"):
+                d = load_json(os.path.join(knowledge_dir(), f), {}) or {}
+                if d.get("format") == KNOW_FORMAT:
+                    out.append(dict(name=d.get("name", f[:-5]), source=d.get("source", ""), saved=d.get("saved", 0),
+                                    n=len(d.get("items") or []), path=os.path.join(knowledge_dir(), f)))
+    except OSError:
+        pass
+    return sorted(out, key=lambda x: -x["saved"])
+
+
+def load_knowledge(path):
+    d = load_json(path, {}) or {}
+    return list(d.get("items") or []) if d.get("format") == KNOW_FORMAT else []
 
 
 # ---------------- Scalp scan: the scalpers roam the market during the trading day ----------------
