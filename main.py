@@ -6857,15 +6857,6 @@ class App:
         messagebox.showinfo("Restore", f"Restored. OBF will now restart to load it.\n(Safety copy: {safety})")
         self.restart_app()
 
-    def restart_app(self):
-        try:
-            self._quitting = True
-            self.on_close()
-        except Exception:
-            pass
-        self.release_lock()
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
     def release_lock(self):
         if self.tray is not None:
             self.tray.stop()
@@ -12062,10 +12053,11 @@ class App:
         def work():
             try:
                 base = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
-                remote = E.http_get(f"{base}/VERSION", 10, retries=1).decode().strip()
+                fresh = f"?t={int(time.time())}"  # GitHub's file cache can serve the old number for minutes after a release
+                remote = E.http_get(f"{base}/VERSION{fresh}", 10, retries=1).decode().strip()
                 notes = ""
                 try:
-                    notes = E.changelog_since(E.http_get(f"{base}/CHANGELOG.md", 10).decode("utf-8", "replace"), self.version)
+                    notes = E.changelog_since(E.http_get(f"{base}/CHANGELOG.md{fresh}", 10).decode("utf-8", "replace"), self.version)
                 except Exception:
                     pass
                 self.q.put(("update", ("found" if E.version_tuple(remote) > E.version_tuple(self.version) else "none",
@@ -12189,7 +12181,13 @@ class App:
         except Exception:
             pass
         self.release_lock()
-        os.execv(sys.executable, [sys.executable, os.path.join(HERE, "main.py")])
+        # a fresh process (not os.execv: on Windows that doesn't quote paths, so a space in a folder name broke restarts)
+        args = [sys.executable, os.path.join(HERE, "main.py")] + [a for a in sys.argv[1:] if a == "--tray"]
+        try:
+            subprocess.Popen(args, cwd=HERE, close_fds=True)
+        except Exception:
+            os.execv(sys.executable, [f'"{a}"' if " " in a and sys.platform.startswith("win") else a for a in args])
+        os._exit(0)
 
 
 def _report_crash():
