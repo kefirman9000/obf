@@ -2,7 +2,7 @@
 
 <p align="center"><b>Hatch a farm of little dragons. Let them compete, breed and evolve. Keep the legends.</b></p>
 
-<p align="center"><img src="docs/breeds.png" alt="The breeds" width="100%"></p>
+<p align="center"><img src="docs/screenshots/farm.png" alt="The farm" width="100%"></p>
 
 ## Getting started
 - **Windows:** download the latest release zip, extract the whole folder, double-click **Run OBF.bat** (or **OBF.pyw**)
@@ -27,10 +27,17 @@ Eggs crack open when they hatch and new BEASTS let out a roar. Every dragon has 
 **badges** along the way. A pulse strip above the farm shows births, retirements, the current season and the dragon
 of the hour.
 
+<p align="center"><img src="docs/screenshots/beasts.png" alt="The BEASTS den" width="100%"></p>
+<p align="center"><img src="docs/screenshots/eggs.png" alt="The Eggs den" width="100%"></p>
+
 ## The breeds
 More than twenty instincts, each with its own look: **fire** dragons ride long trends, **ice** dragons wait calmly for
 their moment, **lightning** dragons pounce, **space** dragons think in seasons, and **wind** dragons are the quick,
-restless breed that darts in and out. Every dragon also carries its own mix of genes:
+restless breed that darts in and out.
+
+<p align="center"><img src="docs/breeds.png" alt="The breeds" width="100%"></p>
+
+Every dragon also carries its own mix of genes:
 
 - **Studies** that vote for or against acting, and a **bigger-picture** sense that has to agree first
 - **Never-rules**: things it refuses to do, each one graded in hindsight; useful rules spread, costly ones fade
@@ -65,12 +72,16 @@ Open **Farm knowledge** to see it all at a glance: ability meters for the rules,
 breeding lessons your farm has mastered, and a grid of every lesson with the evidence behind it. Save it as a
 **book**, keep as many books as you like, and pick any lessons to teach another farm.
 
+<p align="center"><img src="docs/screenshots/knowledge.png" alt="Farm knowledge" width="100%"></p>
+
 ## See and edit what they learned
 Open any dragon's card to see its rules with the evidence behind each one, change whatever you like, and hatch your
 edit as its child. Or design an egg from scratch.
 
 ## Collect them all
 Press **Catch!** on any dragon to keep it in your **Library**, or drag it straight onto the Library or Hall of Fame.
+
+<p align="center"><img src="docs/screenshots/library.png" alt="The Library" width="100%"></p>
 
 - Every caught dragon gets a name, a rarity from **Common** to **Legendary**, and the occasional one is **shiny**
 - Champions are re-checked every night; the ones losing their edge turn **rusty**
@@ -83,7 +94,7 @@ dens grew, and get a **weekly report** of what it learned.
 
 ## Make it yours
 - Dragons, simple cards or a plain list; full, light or no animation; a compact layout
-- Dark and light themes, custom sounds, keyboard shortcuts, a short guided tour
+- Dark (shown here) and light themes, custom sounds, keyboard shortcuts, a short guided tour
 - Farm presets, settings profiles, one-click backup and restore
 - Farm size up to 200, learning spread over several processor cores, and it goes quiet when minimised
 

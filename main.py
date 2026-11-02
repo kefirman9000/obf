@@ -5401,7 +5401,7 @@ class App:
         tbox.pack(fill="both", expand=True, padx=12)
         tree = self.make_tree(tbox, ("name", "strategy", "pace", "train", "exam", "trades", "wr", "passed"),
                               (150, 190, 90, 110, 110, 60, 60, 80),
-                              ("Bot", "Strategy", "Decides", "Training vs hold", "Exam vs hold", "Trades", "Win rate", "Result"))
+                              ("Bot", "Strategy", "Decides", "Training vs market", "Exam vs market", "Trades", "Win rate", "Result"))
         tree.configure(selectmode="extended")
         tree.tag_configure("pass", foreground=GREEN)
         tree.tag_configure("fail", foreground=MUTED)
@@ -10135,7 +10135,7 @@ class App:
                 self._bar(c, x + 10, by + 13, cw - 10, "HP", hp, GREEN if hp > 0.5 else "#f59e0b" if hp > 0.2 else RED)
                 self._bar(c, x + 10, by + 26, cw - 10, "PWR", r.get("power", 0) / 10, "#f97316")
             chips = [(pct_txt(r["score"]), GREEN if (r["score"] or 0) > 0 else RED if r["score"] else MUTED),
-                     ("vs hold " + pct_txt(r.get("edge")), GREEN if (r.get("edge") or 0) > 0 else MUTED),
+                     ("vs mkt " + pct_txt(r.get("edge")), GREEN if (r.get("edge") or 0) > 0 else MUTED),
                      ("WR " + ("-" if lf["winrate"] is None else f"{lf['winrate'] * 100:.0f}%"), TEXT),
                      (f"{lf['trades']} trades", MUTED)]
             if t == "beast":
@@ -12678,7 +12678,7 @@ class App:
                     "Skips coins": ", ".join(c_ for c_, x in v.coin_pl.items() if x[0] >= 3 and x[1] < -1.5) or "none",
                     "Badges": ", ".join(f"{n}" for n, _ in self.achievements(v, lf)) or "none yet",
                     "Island": f"{v.island + 1} of {int(self.tourn.o.get('islands', 1) or 1)}",
-                    "Backtests": ("; ".join(f"{b_['ret']:+.1f}% ({b_['edge']:+.1f}% vs hold, {b_['segments_passed']}/{b_['segments']} parts)"
+                    "Backtests": ("; ".join(f"{b_['ret']:+.1f}% ({b_['edge']:+.1f}% vs market, {b_['segments_passed']}/{b_['segments']} parts)"
                                             for b_ in v.backtests[-2:]) if v.backtests else "none saved"),
                     "Traits": (E.traits_text(v.traits) or "none yet") + (
                         "  |  " + next((cl["note"] for cl in E.CLASSICS if cl["title"] == v.classic), "") if v.classic else ""), "Fees paid": f"${v.sim.fees:,.2f}"}
