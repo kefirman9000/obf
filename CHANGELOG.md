@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.12.1
+- **Updates are more reliable**: "Check for updates" no longer says you have the latest version for a few minutes after a
+  new one comes out (GitHub's file cache was answering with the old number).
+- **Restarting after an update works when a folder name has a space in it** (like C:\Users\John Smith\...). Before,
+  OBF could close and silently fail to reopen; the update was installed, but it looked like nothing happened.
+
 ## 1.12.0
 - **Scalps and long-term trades no longer trip over each other**: your account now keeps two books on every ticker, one
   for scalps and one for long-term trades. Each follows only its own bots' votes, so a scalper's "sell" can never close a
