@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.16.3
+- **The account is named for what it really is**: PRACTICE when trades are simulated inside OBF, ALPACA PAPER when
+  orders go to your Alpaca paper account (a paper key), IBKR PAPER for Interactive Brokers' paper port, and LIVE only
+  for real money. This shows on the mode switch at the top (it used to say "LIVE - REAL MONEY" even with a paper
+  key), the window title, the PROFIT / LOSS tile, the trade log, notifications and the Trades list.
+- Trades made before this update through an Alpaca paper key still show as LIVE in the Trades list (they weren't
+  marked at the time); new ones show ALPACA PAPER.
+
 ## 1.16.2
 - **The numbers at the top are easier to read**: PROFIT / LOSS now says whose money it counts ("your practice account"
   or "your LIVE account"), and VS THE MARKET shows its working underneath ("you -52.00 | market -752.00"), so a loss on

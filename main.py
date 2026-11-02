@@ -1315,7 +1315,8 @@ class App:
         self.seg_paper.bind("<Button-1>", lambda e: self.switch_mode("paper"))
         self.seg_live.bind("<Button-1>", lambda e: self.switch_mode("live"))
         Tip(self.seg_paper, "PRACTICE: pretend money on real prices. Nothing real happens. Has its own session, separate from Live.")
-        Tip(self.seg_live, "LIVE: your Alpaca account (paper or real money, depending on your key). Has its own session, separate from Practice.")
+        Tip(self.seg_live, "Your broker account: ALPACA PAPER with a paper key, LIVE with a real-money key. Has its own session, "
+                           "separate from PRACTICE (which is simulated inside OBF).")
         self.mode_pill = tk.Label(header, text="", bg=CARD, fg=GREEN, font=("", 9, "bold"), padx=10)
         self.mode_pill.pack(side="left")
         self.kill_btn = tk.Button(header, text="\u25a0 KILL", command=self.kill_switch, relief="flat", bd=0, bg="#b91c1c",
@@ -2084,10 +2085,15 @@ class App:
         rows.sort(key=lambda item: str(item.get("time", "")), reverse=True)
         if hasattr(self, "trade_count_lbl"):
             paper_n = sum(str(r.get("mode", "")).lower() == "paper" for r in rows)
-            live_n = sum(str(r.get("mode", "")).lower() == "live" for r in rows)
+            live_by = {}
+            for r in rows:
+                if str(r.get("mode", "")).lower() == "live":
+                    k_ = str(r.get("acct") or "LIVE")
+                    live_by[k_] = live_by.get(k_, 0) + 1
+            live_by = live_by or {"LIVE": 0}
             bot_n = sum(str(r.get("mode", "")).lower() == "bot" for r in rows)
             self.trade_count_lbl.config(
-                text=f"Your practice account: {paper_n} trades  |  Your LIVE account: {live_n}"
+                text=f"PRACTICE: {paper_n} trades  |  " + "  |  ".join(f"{k}: {n}" for k, n in sorted(live_by.items()))
                      + (f"  |  Farm tests (pretend): {bot_n}" if bot_n else ""))
         for r in rows[:1000]:
             side = str(r.get("side", "")).lower()
@@ -2096,8 +2102,8 @@ class App:
                 is_bot = str(r.get("mode", "")).lower() == "bot"
                 iid = t.insert("", "end", tags=("bot",) if is_bot else ("buy" if side == "buy" else "sell",), values=(
                     str(r.get("time", "")).replace("T", " "),
-                    {"paper": "PRACTICE ACCOUNT", "live": "LIVE ACCOUNT", "bot": "FARM TEST"}.get(str(r.get("mode", "")).lower(),
-                                                                                                str(r.get("mode", "")).upper()),
+                    (str(r.get("acct") or "LIVE") if str(r.get("mode", "")).lower() == "live" else
+                     {"paper": "PRACTICE", "bot": "FARM TEST"}.get(str(r.get("mode", "")).lower(), str(r.get("mode", "")).upper())),
                     side.upper() if side in ("buy", "sell") else str(r.get("side", "")).upper(),
                     r.get("coin", ""),
                     f"{number(r.get('qty')):.6f}".rstrip("0").rstrip("."),
@@ -2345,8 +2351,10 @@ class App:
         on_p, on_l = not live, live
         self.seg_paper.config(bg=GREEN if on_p else LINE, fg="white" if on_p else MUTED,
                               text="PRACTICE" + ("  \u25cf" if on_p and self.running else ""))
+        nm = self.acct_name(True) if self.client else "LIVE"  # before logging in we can't know which account the key is
+        big = "LIVE  \u2022  REAL MONEY" if nm == "LIVE" else nm
         self.seg_live.config(bg=LIVE_BLUE if on_l else LINE, fg="white" if on_l else MUTED,
-                             text="LIVE  \u2022  REAL MONEY" + ("  \u25cf" if on_l and self.running else "") if on_l else "LIVE")
+                             text=big + ("  \u25cf" if on_l and self.running else "") if on_l else nm)
         self.mode_stripe.config(bg=LIVE_BLUE if live else GREEN, height=6 if live else 4)
         self.body.config(highlightthickness=3 if live else 0, highlightbackground=LIVE_BLUE, highlightcolor=LIVE_BLUE)
         if live:
@@ -3203,6 +3211,16 @@ class App:
         # Total value is always cash plus the marked-to-market value of open positions.
         return self.cash + sum(q * self.position_price(c) for c, q in self.pos.items())
 
+    def acct_name(self, live=None):
+        """What the account is called on screen: PRACTICE (simulated inside OBF), ALPACA PAPER / IBKR PAPER (the broker's
+        own paper account) or LIVE (real money)."""
+        live = (self.live if self.session else self.mode_var.get() == "live") if live is None else live
+        if not live:
+            return "PRACTICE"
+        if self.broker() == "ibkr":
+            return "IBKR PAPER" if "paper" in str(self.cfg.get("ib_port_label", "")).lower() else "LIVE"
+        return "ALPACA PAPER" if E.ALPACA.get("paper", True) else "LIVE"
+
     def bench_equity(self):
         """What your starting money would be worth now if it had bought the session's tickers at the start (equal
         shares) and kept them: 'the market'. A ticker with no price right now counts at its last known price."""
@@ -3224,14 +3242,14 @@ class App:
             left = max(0, int(self.last_bar + self.session_bar * 60 - time.time()))
             nxt = f" | next {left // 60}:{left % 60:02d}"
         live = self.live if self.session else self.mode_var.get() == "live"
-        mode = "LIVE (REAL MONEY)" if live else "PRACTICE"
+        mode = {"LIVE": "LIVE (REAL MONEY)"}.get(self.acct_name(live), self.acct_name(live))
         self.root.title(f"OBF {mode} - {'RUNNING ' if self.running else ''}{pl:+,.2f}{nxt}" if self.session else f"OBF {mode}")
         self.tiles["equity"].config(text=f"${eq:,.2f}")
         pct = pl / self.start_cash * 100 if self.start_cash else 0.0
         self.tiles["pl"].config(text=f"{pl:+,.2f}  ({pct:+.2f}%)", fg=GREEN if pl >= 0 else RED)
         subs = getattr(self, "tile_subs", {})
         if "pl" in subs:
-            subs["pl"].config(text=("your LIVE account" if live else "your practice account") if self.session else "")
+            subs["pl"].config(text=self.acct_name(live) if self.session else "")
         if "hold" in subs:
             subs["hold"].config(text=(f"you {pl:+,.2f}   |   market {hold:+,.2f}" if self.session and self.curve and self.bench_units
                                       else ""))
@@ -3278,7 +3296,7 @@ class App:
         if self.session:
             last = self.trades[-1] if self.trades else None
             lt = (f" (last: {last['side'].upper()} {last['coin']} at {str(last.get('time', ''))[11:16]})" if last else "")
-            self.activity_lbl.config(text=f"Your {'LIVE' if self.live else 'practice'} account made {len(self.trades)} trades{lt}: "
+            self.activity_lbl.config(text=f"Your account ({self.acct_name()}) made {len(self.trades)} trades{lt}: "
                                           f"those are what the tiles above count. Separately, the farm's bots made "
                                           f"{len(self.shadow_trades)} test trades with pretend money inside the farm "
                                           f"(they never touch your balance).")
@@ -8553,7 +8571,7 @@ class App:
         self.opt.pop(c, None)
 
     def log_trade(self, side, c, qty, px, usd, pl, reason):
-        row = dict(time=datetime.now().isoformat(timespec="seconds"), mode="live" if self.live else "paper",
+        row = dict(time=datetime.now().isoformat(timespec="seconds"), mode="live" if self.live else "paper", acct=self.acct_name(),
                    side=side, coin=c, qty=round(qty, 8), price=round(px, 6), usd=round(usd, 2),
                    pl="" if pl is None else round(pl, 2), reason=reason, who=self.pending_who.pop(c, ""))
         if self.opt.get(c):
@@ -8613,11 +8631,11 @@ class App:
             msg = f"Bought {qty:g} x {label} at ${px:,.2f} a share (${usd:,.2f} in all) ({why})"
         else:
             msg = f"Sold {qty:g} x {label} at ${px:,.2f} for ${usd:,.2f}, {'made' if (pl or 0) >= 0 else 'lost'} ${abs(pl or 0):,.2f} ({why})"
-        self.write(("LIVE: " if self.live else "Practice: ") + msg)
+        self.write(f"{self.acct_name()}: " + msg)
         self.notify("OBF", f"{side.upper()} {label} @ ${px:,.2f} ({why})", important=False, sound="trade")
         if self.live and self.settings.get("why_popup", True):
-            self.toast(f"LIVE {side.upper()} {label}: why?", (detail or why)[:400], ms=20000)
-        self.alert("trades", ("LIVE " if self.live else "Practice ") + msg)
+            self.toast(f"{self.acct_name()} {side.upper()} {label}: why?", (detail or why)[:400], ms=20000)
+        self.alert("trades", f"{self.acct_name()} " + msg)
 
     def sell_all(self):
         if not any(q > 0 for q in self.pos.values()):
