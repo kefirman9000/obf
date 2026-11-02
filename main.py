@@ -3144,7 +3144,10 @@ class App:
     def ctx_list(self, coins=None):
         """The market-context tickers the bots watch (minus any they trade)."""
         coins = coins if coins is not None else self.session_coins
-        return [c for c in (self.settings.get("ctx_tickers") or []) if E.valid_coin(c) and c not in coins]
+        out = [c for c in (self.settings.get("ctx_tickers") or []) if E.valid_coin(c) and c not in coins]
+        if E.scalp_share(self.settings):  # scalpers' volatility gates always read VIXY and SPY
+            out += [c for c in ("VIXY", "SPY") if c not in out and c not in coins]
+        return out
 
     def extra_now(self):
         """The extra data for a farm step: highs/lows/volumes/times per traded ticker, plus the context tickers."""
@@ -4133,14 +4136,20 @@ class App:
         self.check_daily()
         self.refresh_view()
 
-    def learn_spreads_daily(self):
-        """Once a day, read each traded ticker's option quotes so scalpers pay real bid/ask gaps in Practice."""
-        if not self.client or not E.scalp_share(self.settings):
+    def learn_quotes(self):
+        """While the market is open, every 15 minutes: read each traded ticker's option quotes near the money. Their
+        implied volatility (what the market is charging right now, so it rises with the VIX) prices Practice contracts,
+        and their bid/ask gap is what scalpers pay. Needs the Alpaca login."""
+        if not self.client or getattr(self, "_quotes_busy", False):
             return
-        due = [c for c in self.session_coins if time.time() - (E.SPREAD_FIT.get(c) or [0, 0, 0])[-1] > 86400]
-        if not due or getattr(self, "_spread_busy", False):
+        if not (0 < E.minutes_to_close(time.time()) <= 390) or datetime.now().weekday() >= 5:
             return
-        self._spread_busy = True
+        seen = getattr(self, "_quotes_at", {})
+        due = [c for c in self.session_coins if time.time() - seen.get(c, 0) > 900]
+        if not due:
+            return
+        self._quotes_busy = True
+        self._quotes_at = seen
 
         def work():
             try:
@@ -4148,22 +4157,28 @@ class App:
                 for c in due:
                     try:
                         S = self.last.get(c)
-                        rows = E.option_chain(c, today.strftime("%Y-%m-%d"), (today + timedelta(days=10)).strftime("%Y-%m-%d"),
+                        rows = E.option_chain(c, today.strftime("%Y-%m-%d"), (today + timedelta(days=12)).strftime("%Y-%m-%d"),
                                               None, S * 0.9 if S else None, S * 1.1 if S else None)
                         E.learn_spreads(c, rows, S)
+                        if S:
+                            near = [r for r in rows if r.get("iv") and abs(r["K"] / S - 1) < 0.03 and r["exp"] - time.time() > 2 * 86400]
+                            if near:
+                                first = min(r["exp"] for r in near)
+                                ivs = [float(r["iv"]) for r in near if r["exp"] == first]
+                                E.IV_HINT[c] = sum(ivs) / len(ivs)
+                        seen[c] = time.time()
                     except Exception:
                         pass
             finally:
-                self._spread_busy = False
+                self._quotes_busy = False
         threading.Thread(target=work, daemon=True).start()
 
     def on_bar(self, prices):
         self.bar_n += 1
-        if self.bar_n % 30 == 1:
-            try:
-                self.learn_spreads_daily()
-            except Exception:
-                pass
+        try:
+            self.learn_quotes()
+        except Exception:
+            pass
         keep = min(8000, max(2400, int(1440 / self.session_bar) + 20))
         for c in self.session_coins:
             h = self.hist.setdefault(c, [])
@@ -4184,7 +4199,18 @@ class App:
             del h[:-keep]
             for k in ("h", "l", "v", "t"):
                 del x[k][:-keep]
+        L0 = len(self.hist[self.session_coins[0]]) if self.session_coins else 0
+        iv = E.ivx_now()
+        if iv and L0:  # SPY's live implied volatility (the VIX idea), lined up with the bars like any watched ticker
+            q = self.ctx_hist.get(E.IVX_KEY)
+            if q is None:
+                self.ctx_hist[E.IVX_KEY] = [iv] * (L0 - 1)  # no reading before now: flat, so no move is read into it
+                q = self.ctx_hist[E.IVX_KEY]
+            q.append(iv)
+            del q[:-L0]
         for sym in list(self.ctx_hist):  # the watched tickers move along with every bar
+            if sym == E.IVX_KEY:
+                continue
             q = self.ctx_hist[sym]
             px = prices.get(sym) or self.last.get(sym) or (q[-1] if q else None)
             if px:
@@ -10082,6 +10108,12 @@ class App:
                                          E.save_json(CONFIG_PATH, self.cfg), self.refresh_scan())).pack(side="left")
         ttk.Button(bar, text="Scan now", style="Plain.TButton", command=self.scan_now).pack(side="left", padx=6)
         ttk.Button(bar, text="Add selected to my tickers", style="Plain.TButton", command=self.scan_add).pack(side="left")
+        self.scan_alert_var = tk.BooleanVar(value=bool(self.cfg.get("scan_alerts", True)))
+        al = ttk.Checkbutton(bar, text="Alert me", variable=self.scan_alert_var,
+                             command=lambda: (self.cfg.__setitem__("scan_alerts", bool(self.scan_alert_var.get())),
+                                              E.save_json(CONFIG_PATH, self.cfg)))
+        al.pack(side="left", padx=(8, 0))
+        Tip(al, "A notification when a setup fires on a ticker where the scalpers are already up today (at least 5 closed scalps).")
         self.scan_lbl = tk.Label(bar, text="", bg=CARD, fg=MUTED, anchor="w", font=("", 9, "bold"))
         self.scan_lbl.pack(side="left", padx=10)
         tk.Label(parent, bg=CARD, fg=MUTED, anchor="w", justify="left", padx=8, font=("", 8), wraplength=1100,
@@ -10097,10 +10129,11 @@ class App:
         tk.Label(top, text="Where scalps are paying today", bg=CARD, fg=TEXT, anchor="w", font=("", 9, "bold")).pack(fill="x", padx=4)
         tb = tk.Frame(top, bg=CARD)
         tb.pack(fill="both", expand=True)
-        cols = ("ticker", "move", "setups", "trades", "winrate", "pl", "plpct", "best", "now")
-        self.scan_tree = self.make_tree(tb, cols, (70, 80, 70, 60, 70, 90, 70, 170, 180),
-                                        ("Ticker", "Today", "Scalps", "Closed", "Win rate", "P/L $", "P/L %", "Best scalper here",
-                                         "Setup right now"))
+        cols = ("ticker", "move", "vol", "setups", "trades", "winrate", "pl", "plpct", "best", "now")
+        self.scan_tree = self.make_tree(tb, cols, (70, 70, 80, 60, 60, 70, 90, 70, 170, 180),
+                                        ("Ticker", "Today", "Volatility", "Scalps", "Closed", "Win rate", "P/L $", "P/L %",
+                                         "Best scalper here", "Setup right now"))
+        self.scan_tree.column("vol", anchor="w")
         for c_ in ("ticker", "best", "now"):
             self.scan_tree.column(c_, anchor="w")
         self.scan_tree.tag_configure("up", foreground=GREEN)
@@ -10116,6 +10149,27 @@ class App:
             self.scan_feed_tree.column(c_, anchor="w")
         threading.Thread(target=self._scan_loop, daemon=True).start()
         self.refresh_scan()
+
+    def vol_text(self):
+        """What the scalpers' volatility gates are reading right now, in one line."""
+        parts = []
+        try:
+            if self.session_coins and self.hist.get(self.session_coins[0]):
+                closes = {c: self.hist[c] for c in self.session_coins if self.hist.get(c)}
+                reg, vm, sr, im = E.vol_regime(closes, self.extra_now(), self.session_coins[0])
+                parts.append(f"Volatility now: {reg}")
+                if vm is not None:
+                    parts.append(f"VIXY {vm:+.2f}% in 15 bars")
+                if sr is not None:
+                    parts.append(f"SPY swinging {sr:.1f}x its usual")
+            iv = E.ivx_now()
+            if iv:
+                path = E.ivx_today()
+                old = next((x[1] for x in reversed(path) if x[0] <= time.time() - 900), None)
+                parts.append(f"SPY implied vol {iv * 100:.1f}%" + (f" ({(iv / old - 1) * 100:+.1f}% in 15 min)" if old else ""))
+        except Exception:
+            pass
+        return "   ".join(parts) or "Volatility: waiting for live prices"
 
     def scan_now(self):
         self.scan["now"] = True
@@ -10149,9 +10203,31 @@ class App:
             out.append(dict(uid=0, name=n, params=dict(E.STRATS[n]["params"]), tf=tf, risk=r, traits=tr, vetoes={}, layers={}))
         return out
 
+    def ivx_tick(self):
+        """About once a minute while the market is open: SPY's ~30-day at-the-money implied volatility from its live
+        option quotes. It moves with the VIX itself, minute by minute (VIXY, the VIX fund, follows it slowly)."""
+        if not self.client or time.time() - getattr(self, "_ivx_at", 0) < 55 or not E.scalp_share(self.settings):
+            return
+        if not (0 < E.minutes_to_close(time.time()) <= 390) or datetime.now().weekday() >= 5:
+            return
+        self._ivx_at = time.time()
+        S = self.last.get("SPY") or (E.spot_many(["SPY"]) or {}).get("SPY")
+        if not S:
+            return
+        now = datetime.now()
+        rows = E.option_chain("SPY", (now + timedelta(days=20)).strftime("%Y-%m-%d"), (now + timedelta(days=45)).strftime("%Y-%m-%d"),
+                              None, S * 0.98, S * 1.02)
+        iv = E.ivx_from_chain(rows, S)
+        if iv:
+            E.ivx_add(time.time(), iv)
+
     def _scan_loop(self):
         while True:
             time.sleep(5 if self.scan.get("now") else 20)
+            try:
+                self.ivx_tick()
+            except Exception:
+                pass
             try:
                 if not self.cfg.get("scalp_scan", True) and not self.scan.get("now"):
                     self.scan["status"] = "Off"
@@ -10182,6 +10258,14 @@ class App:
 
     def _scan_once(self):
         uni, genes = self.scan_universe(), self.scan_genes()
+        ctx = {}
+        for sym in ("VIXY", "SPY"):  # the volatility gate and market studies need these lined up with every ticker
+            try:
+                d = E.fetch_ohlcv(sym, 60, 470, self.quote)
+                if d.get("c") and len(d["c"]) == len(d.get("t") or ()):
+                    ctx[sym] = dict(c=d["c"], t=d["t"])
+            except Exception:
+                pass
         bars = {}
         for i, sym in enumerate(uni):
             self.scan["status"] = f"Reading today's prices: {sym} ({i + 1} of {len(uni)})"
@@ -10193,7 +10277,9 @@ class App:
                 continue
         self.scan["status"] = f"Trying {len(genes)} scalpers on {len(bars)} tickers..."
         job = dict(bars=bars, genes=genes, day=E.ny_date(time.time()).isoformat(),
-                   spread={k: list(v) for k, v in E.SPREAD_FIT.items()}, sspread=E.SCALP_SPREAD[0])
+                   spread={k: list(v) for k, v in E.SPREAD_FIT.items()}, sspread=E.SCALP_SPREAD[0],
+                   iv=dict(E.IV_HINT), ctx=dict(ctx, **({E.IVX_KEY: dict(c=[x[1] for x in E.ivx_today()], t=[x[0] for x in E.ivx_today()])}
+                                                         if E.ivx_today() else {})))
         try:  # its own processor core, so the window never stutters
             import concurrent.futures as cf
             import multiprocessing as mp
@@ -10220,6 +10306,14 @@ class App:
             row = dict(x, time=stamp)
             self.scan_feed.appendleft(row)
             fresh.append(row)
+        hot = [f for f in fresh if (res["tickers"].get(f["ticker"]) or {}).get("trades", 0) >= 5
+               and (res["tickers"].get(f["ticker"]) or {}).get("pl", 0) > 0]
+        if hot and self.cfg.get("scan_alerts", True):
+            r0 = res["tickers"][hot[0]["ticker"]]
+            self.notify("OBF scalp setup", f"{hot[0]['ticker']} {(hot[0]['kind'] or 'setup').upper()} "
+                                           f"({STRAT_LABELS.get(hot[0]['bot'], hot[0]['bot'])}): scalps there are "
+                                           f"{r0['pl'] / r0['paid'] * 100 if r0['paid'] else 0:+.1f}% today"
+                                           + (f" (+{len(hot) - 1} more)" if len(hot) > 1 else ""), important=True)
         if fresh:
             self.write("Scalp scan: " + ", ".join(f"{f['ticker']} {f['kind'] or 'setup'} ({STRAT_LABELS.get(f['bot'], f['bot'])})"
                                                   for f in fresh[:6]) + (f" and {len(fresh) - 6} more" if len(fresh) > 6 else "")
@@ -10232,7 +10326,7 @@ class App:
         sc = self.scan
         res = sc.get("res")
         when = (f"last scan {datetime.fromtimestamp(sc['at']).strftime('%I:%M %p').lstrip('0')}" if sc.get("at") else "no scan yet")
-        self.scan_lbl.config(text=f"{sc.get('status') or 'Ready'}   |   {when}")
+        self.scan_lbl.config(text=f"{sc.get('status') or 'Ready'}   |   {when}   |   {self.vol_text()}")
         if self.cur_tab().find("Scalp scan") < 0 and res is not None and getattr(self, "_scan_drawn", None) is res:
             return
         self._scan_drawn = res
@@ -10246,7 +10340,7 @@ class App:
             for sym, r in rows:
                 pct = r["pl"] / r["paid"] * 100 if r["paid"] else 0.0
                 t.insert("", "end", iid=sym, tags=("up" if r["pl"] >= 0 else "down",), values=(
-                    sym, f"{r.get('move', 0):+.2f}%", r["setups"], r["trades"],
+                    sym, f"{r.get('move', 0):+.2f}%", r.get("regime") or "-", r["setups"], r["trades"],
                     f"{r['wins'] / r['trades'] * 100:.0f}%" if r["trades"] else "-", f"{r['pl']:+,.0f}", f"{pct:+.1f}%",
                     STRAT_LABELS.get(r["best"], r["best"] or "-"), "; ".join(now.get(sym, [])) or ""))
         f = self.scan_feed_tree

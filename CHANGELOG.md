@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.13.0
+- **Scalpers read volatility (VIX)**: every scalper now carries a volatility gate, chosen and evolved by the farm:
+  only calm markets, only when volatility is rising, only spikes, never a spike, or ignore it. Some also widen their
+  stop and target when volatility jumps. Every trade a gate blocks is graded in hindsight, so the farm keeps the gates
+  that pay.
+- **Intraday VIX, minute by minute**: while the market is open, OBF reads SPY's ~30-day at-the-money implied volatility
+  from its live option quotes about once a minute. That's what the VIX itself measures, so the gates see it move within
+  the minute: up 2% in 15 minutes (say 16.0 to 16.3) counts as rising, up 5% as a spike. VIXY (the VIX fund) and how
+  fast SPY is swinging vs its last two hours count too. With scalpers on, VIXY and SPY are always watched, and the Scalp
+  scan tab shows what the gates are reading right now. The day's readings are kept, so a restart doesn't lose them.
+- **The Scalp scan sees the market too**: today's live implied-volatility readings, VIXY and SPY are lined up with every ticker it tries, so volatility gates and
+  market studies work there as they do on your farm. A new Volatility column shows each ticker's state (calm, normal,
+  rising, spiking).
+- **Practice prices follow the market during the day**: while the market is open, OBF reads each traded ticker's live
+  option quotes every 15 minutes. Their implied volatility (which climbs with the VIX) now prices Practice contracts
+  for every bot, instead of a reading from once a day at most.
+- **Scan alerts**: a notification when a setup fires on a ticker where the scalpers are already up today (Scalp scan
+  tab > "Alert me").
+
 ## 1.12.1
 - **Updates are more reliable**: "Check for updates" no longer says you have the latest version for a few minutes after a
   new one comes out (GitHub's file cache was answering with the old number).
