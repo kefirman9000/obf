@@ -801,6 +801,7 @@ class App:
         self.hist, self.last = {}, {}
         self.trades, self.curve = [], []
         self.shadow_trades = []  # every bot's own pretend trades (Wildcard), shown in the Trades tab
+        self.mirror, self.mirror_trades = {}, []  # "Both": copies of practice trades on the Alpaca paper account
         self.bench_units = {}
         self.pending = set()
         self.pending_who = {}
@@ -859,7 +860,8 @@ class App:
             bot_alloc={c: {str(u): x for u, x in a.items()} for c, a in self.bot_alloc.items()}, opt=self.opt,
             shadow_live=None if not self.shadow_live else dict(cash=self.shadow_live.cash, pos=self.shadow_live.pos,
                                                                cost=self.shadow_live.cost, fees=self.shadow_live.fees),
-            shadow_curve=self.shadow_curve[-4000:], farm_hist=list(self.farm_hist)[-3000:]))
+            shadow_curve=self.shadow_curve[-4000:], farm_hist=list(self.farm_hist)[-3000:],
+            mirror=getattr(self, "mirror", {}), mirror_trades=list(getattr(self, "mirror_trades", []))[-5000:]))
 
     def save_farm(self, force=False):
         """Saves the whole farm (every bot, its history and family tree) next to the session, so it carries on
@@ -934,6 +936,10 @@ class App:
         self.fees_paid = float(s.get("fees_paid", 0) or 0)
         self.bought_at = {c: float(t) for c, t in (s.get("bought_at") or {}).items() if isinstance(t, (int, float))}
         self.opt = {c: dict(o) for c, o in (s.get("opt") or {}).items() if self.pos.get(c, 0) > 0}
+        self.mirror = {c: dict(m) for c, m in (s.get("mirror") or {}).items() if not m.get("pending")}
+        for m in self.mirror.values():
+            m.pop("closing", None)
+        self.mirror_trades = [r for r in s.get("mirror_trades") or [] if isinstance(r, dict)]
         try:
             self.bot_alloc = {c: {int(u): float(x) for u, x in a.items()} for c, a in (s.get("bot_alloc") or {}).items()}
         except (TypeError, ValueError, AttributeError):
@@ -1378,11 +1384,13 @@ class App:
         tk.Label(self.dest_row, text="Practice trades go to", bg=CARD, fg=MUTED).pack(anchor="w")
         self.dest_var = tk.StringVar(value="Stay in OBF  (PRACTICE)")
         self.dest_box = ttk.Combobox(self.dest_row, textvariable=self.dest_var, state="readonly", width=34,
-                                     values=["Stay in OBF  (PRACTICE)", "My Alpaca paper account  (ALPACA PAPER)"])
+                                     values=["Stay in OBF  (PRACTICE)", "My Alpaca paper account  (ALPACA PAPER)",
+                                             "Both: OBF and my Alpaca paper account"])
         self.dest_box.pack(fill="x")
         self.dest_box.bind("<<ComboboxSelected>>", lambda e: self.pick_practice_dest())
-        Tip(self.dest_box, "PRACTICE: pretend trades simulated inside OBF. ALPACA PAPER: the same pretend money, but every order "
-                           "really goes to your Alpaca paper account (needs a paper key). Each keeps its own session.")
+        Tip(self.dest_box, "PRACTICE: pretend trades simulated inside OBF. ALPACA PAPER: every order really goes to your Alpaca "
+                           "paper account (needs a paper key). BOTH: the PRACTICE session runs inside OBF and every one of its "
+                           "trades is also copied to your Alpaca paper account (labelled ALPACA PAPER). Never real money.")
         self.budget_lbl = tk.Label(c, text="Practice money (pretend, USD)", bg=CARD, fg=MUTED)
         self.budget_lbl.pack(anchor="w", pady=(8, 0))
         self.cash_var = tk.StringVar(value="10000")
@@ -2094,6 +2102,7 @@ class App:
             if isinstance(saved, dict):
                 add_rows(saved.get("trades", []))
         add_rows(self.trades)
+        add_rows(getattr(self, "mirror_trades", []))
         show_bots = True
         try:
             show_bots = bool(self.show_bots_var.get())
@@ -2105,7 +2114,8 @@ class App:
 
         def acct_of(r):
             m = str(r.get("mode", "")).lower()
-            return str(r.get("acct") or "LIVE") if m == "live" else {"paper": "PRACTICE", "bot": "FARM TEST"}.get(m, m.upper())
+            return str(r.get("acct") or "LIVE") if m == "live" else {"paper": "PRACTICE", "alpaca": "ALPACA PAPER",
+                                                                         "bot": "FARM TEST"}.get(m, m.upper())
         if want != "All accounts":
             rows[:] = [r for r in rows if acct_of(r) == want]
 
@@ -2124,8 +2134,8 @@ class App:
             paper_n = sum(str(r.get("mode", "")).lower() == "paper" for r in rows)
             live_by = {}
             for r in rows:
-                if str(r.get("mode", "")).lower() == "live":
-                    k_ = str(r.get("acct") or "LIVE")
+                if str(r.get("mode", "")).lower() in ("live", "alpaca"):
+                    k_ = "ALPACA PAPER" if str(r.get("mode", "")).lower() == "alpaca" else str(r.get("acct") or "LIVE")
                     live_by[k_] = live_by.get(k_, 0) + 1
             live_by = live_by or {"LIVE": 0}
             bot_n = sum(str(r.get("mode", "")).lower() == "bot" for r in rows)
@@ -2140,7 +2150,8 @@ class App:
                 iid = t.insert("", "end", tags=("bot",) if is_bot else ("buy" if side == "buy" else "sell",), values=(
                     str(r.get("time", "")).replace("T", " "),
                     (str(r.get("acct") or "LIVE") if str(r.get("mode", "")).lower() == "live" else
-                     {"paper": "PRACTICE", "bot": "FARM TEST"}.get(str(r.get("mode", "")).lower(), str(r.get("mode", "")).upper())),
+                     {"paper": "PRACTICE", "alpaca": "ALPACA PAPER", "bot": "FARM TEST"}.get(str(r.get("mode", "")).lower(),
+                                                                                              str(r.get("mode", "")).upper())),
                     side.upper() if side in ("buy", "sell") else str(r.get("side", "")).upper(),
                     r.get("coin", ""),
                     f"{number(r.get('qty')):.6f}".rstrip("0").rstrip("."),
@@ -2388,8 +2399,10 @@ class App:
         real = acct == "LIVE" and live  # real money: the only thing that's blue and says LIVE
         self.mode_pill.config(text="\u25cf  RUNNING" if self.running else "", fg=LIVE_BLUE if real else GREEN)
         on_p, on_l = not real, real
+        both = not live and bool(self.cfg.get("mirror_paper"))
         self.seg_paper.config(bg=GREEN if on_p else LINE, fg="white" if on_p else MUTED,
-                              text=("PRACTICE" if acct == "PRACTICE" or real else f"PRACTICE  \u2022  {acct}")
+                              text=("PRACTICE  +  ALPACA PAPER" if both else
+                                    "PRACTICE" if acct == "PRACTICE" or real else f"PRACTICE  \u2022  {acct}")
                                    + ("  \u25cf" if on_p and self.running else ""))
         self.seg_live.config(bg=LIVE_BLUE if on_l else LINE, fg="white" if on_l else MUTED,
                              text=("LIVE  \u2022  REAL MONEY" + ("  \u25cf" if self.running else "")) if on_l else "LIVE")
@@ -2400,7 +2413,8 @@ class App:
                 self.dest_row.pack_forget()
             else:
                 self.dest_row.pack(fill="x", pady=(4, 0), after=self.mode_desc)
-                want = "My Alpaca paper account  (ALPACA PAPER)" if live else "Stay in OBF  (PRACTICE)"
+                want = ("My Alpaca paper account  (ALPACA PAPER)" if live else
+                        "Both: OBF and my Alpaca paper account" if both else "Stay in OBF  (PRACTICE)")
                 if self.dest_var.get() != want:
                     self.dest_var.set(want)
         except tk.TclError:
@@ -2409,10 +2423,13 @@ class App:
             self.headline_lbl.config(bg="#0a1f4d" if DARK else "#eff6ff", fg="#bfdbfe" if DARK else "#0b3aa8")
         else:
             self.headline_lbl.config(bg="#052e16" if DARK else "#ecfdf5", fg="#bbf7d0" if DARK else "#065f46")
-        self.mode_desc.config(text={"PRACTICE": "PRACTICE: pretend money on real prices, simulated inside OBF.",
+        self.mode_desc.config(text=(("PRACTICE + ALPACA PAPER: simulated inside OBF, and every trade also copied to your Alpaca "
+                                     "paper account." + ("" if self.is_paper_key() else " (Log in with your paper key to "
+                                                                                        "start copying.)")) if both else {
+                                    "PRACTICE": "PRACTICE: pretend money on real prices, simulated inside OBF.",
                                     "ALPACA PAPER": "ALPACA PAPER: pretend money, orders sent to your Alpaca paper account.",
                                     "IBKR PAPER": "IBKR PAPER: pretend money, orders sent to your IBKR paper account."}.get(
-                                        acct, "LIVE: REAL MONEY through your broker."), fg=LIVE_BLUE if real else GREEN)
+                                        acct, "LIVE: REAL MONEY through your broker.")), fg=LIVE_BLUE if real else GREEN)
         if not self.running:
             saved = None if self.session else self.saved_session(live)
             if self.session:
@@ -2463,16 +2480,133 @@ class App:
         finally:
             self._choice = "continue"
 
+    # ---------------- "Both": practice trades copied to the Alpaca paper account ----------------
+    def mirror_on(self):
+        """Copy practice trades to Alpaca paper? Only in PRACTICE, only with Both chosen, and only ever with a PAPER key."""
+        return (not self.live and bool(self.cfg.get("mirror_paper")) and self.is_paper_key())
+
+    def mirror_open(self, c, o, qty, reason):
+        if not self.mirror_on() or qty <= 0 or c in self.mirror:
+            return
+        self.mirror[c] = dict(pending=True)
+        self.executor.submit(self._mirror_open, c, dict(o), int(qty), reason)
+
+    def _mirror_open(self, c, o, qty, reason):
+        """Buys the listed contract closest to the practice one (same type, nearest expiry and strike), same size."""
+        try:
+            if not E.ALPACA.get("paper", True):
+                raise E.UnsafeOrder("the key isn't a paper key, so nothing was copied")
+            now = time.time()
+            d0 = datetime.fromtimestamp(max(now, o["exp"] - 7 * 86400)).strftime("%Y-%m-%d")
+            d1 = datetime.fromtimestamp(o["exp"] + 10 * 86400).strftime("%Y-%m-%d")
+            chain = E.option_chain(tick_of(c), d0, d1, o["type"], o["K"] * 0.9, o["K"] * 1.1)
+            cands = [r for r in chain if r.get("ask", 0) > 0 and r["exp"] > now + 86400]
+            if not cands:
+                raise RuntimeError("no listed contract near the practice one")
+            pick = min(cands, key=lambda r: abs(r["exp"] - o["exp"]) / 86400 + abs(r["K"] - o["K"]) / max(o["K"], 1) * 100)
+            r = E.alp_order(pick["symbol"], qty, "buy", limit=round(pick["ask"], 2))
+            got, avg = self._wait_order(r["id"], max(5, int(self.settings.get("limit_wait", 20))))
+            if got <= 0:
+                return self.q.put(("call", lambda: self._mirror_done(c, None, reason, "the order didn't fill in time")))
+            rec = dict(symbol=pick["symbol"], qty=int(got), avg=avg, cost=got * avg * E.CONTRACT, K=pick["K"], exp=pick["exp"],
+                       type=o["type"])
+            self.q.put(("call", lambda: self._mirror_done(c, rec, reason)))
+        except Exception as e:
+            self.q.put(("call", lambda e=e: self._mirror_done(c, None, reason, str(e))))
+
+    def _mirror_done(self, c, rec, reason, err=""):
+        if rec is None:
+            self.mirror.pop(c, None)
+            if time.time() - getattr(self, "_mirror_note", 0) > 600:
+                self._mirror_note = time.time()
+                self.write(f"ALPACA PAPER: the copy of {self.contract_label(c)} wasn't placed ({err}). The PRACTICE trade "
+                           "itself is unaffected.", "warn")
+            return
+        self.mirror[c] = rec
+        self._mirror_row("buy", c, rec["qty"], rec["avg"], rec["cost"], None, reason, rec)
+        if self.pos.get(c, 0) <= 0:  # the practice trade closed while the copy was on its way
+            self.mirror_close(c, "sync")
+        self.save_state()
+
+    def mirror_close(self, c, reason):
+        rec = getattr(self, "mirror", {}).get(c)
+        if not rec or rec.get("pending") or rec.get("closing") or not self.is_paper_key():
+            return
+        rec["closing"] = True
+        self.executor.submit(self._mirror_close, c, dict(rec), reason)
+
+    def _mirror_close(self, c, rec, reason):
+        try:
+            sym = rec["symbol"]
+            held = self.broker_held_alpaca(sym)
+            qty = min(int(rec["qty"]), held)
+            if qty <= 0:
+                return self.q.put(("call", lambda: self._mirror_closed(c, (0, 0.0), reason, gone=True)))
+            urgent = reason in ("stop-loss", "expiry", "manual", "trailing-stop", "scalp-flat", "kill switch", "sync")
+            limit = None
+            if not urgent:
+                q = E.option_quotes([sym]).get(sym)
+                if q and q[0] > 0:
+                    limit = round(q[0], 2)
+            r = E.alp_order(sym, qty, "sell", limit=limit, held=held)
+            got, avg = self._wait_order(r["id"], 30 if urgent else max(5, int(self.settings.get("limit_wait", 20))))
+            if got <= 0 and limit:
+                r = E.alp_order(sym, qty, "sell", held=held)
+                got, avg = self._wait_order(r["id"], 30)
+            self.q.put(("call", lambda: self._mirror_closed(c, (got, avg) if got > 0 else None, reason)))
+        except Exception as e:
+            self.q.put(("call", lambda e=e: self._mirror_closed(c, None, reason, str(e))))
+
+    def _mirror_closed(self, c, fill, reason, err="the order didn't fill", gone=False):
+        rec = self.mirror.get(c)
+        if not rec:
+            return
+        if gone:  # Alpaca no longer holds it (sold or expired there): just forget the copy
+            self.mirror.pop(c, None)
+            self.save_state()
+            return
+        if fill is None:
+            rec.pop("closing", None)
+            if time.time() - getattr(self, "_mirror_note", 0) > 600:
+                self._mirror_note = time.time()
+                self.write(f"ALPACA PAPER: couldn't sell the copy of {self.contract_label(c)} yet ({err}); trying again.", "warn")
+            return
+        got, avg = fill
+        proceeds = got * avg * E.CONTRACT
+        basis = rec["cost"] * (got / rec["qty"]) if rec["qty"] else rec["cost"]
+        self._mirror_row("sell", c, got, avg, proceeds, proceeds - basis, reason, rec)
+        rec["qty"] -= got
+        rec["cost"] -= basis
+        if rec["qty"] <= 0:
+            self.mirror.pop(c, None)
+        else:
+            rec.pop("closing", None)
+        self.save_state()
+
+    def _mirror_row(self, side, c, qty, px, usd, pl, reason, rec):
+        label = f"{tick_of(c)} {rec['K']:g}{'C' if rec['type'] == 'call' else 'P'}" + (" (scalp)" if is_scalp_book(c) else "")
+        row = dict(time=datetime.now().isoformat(timespec="seconds"), mode="alpaca", acct="ALPACA PAPER", side=side, coin=label,
+                   qty=qty, price=round(px, 6), usd=round(usd, 2), pl="" if pl is None else round(pl, 2), reason=reason,
+                   who="copy of a PRACTICE trade")
+        self.mirror_trades.append(row)
+        del self.mirror_trades[:-5000]
+        try:
+            E.append_trade_csv(row)
+        except OSError:
+            pass
+        self.write(f"ALPACA PAPER: {'bought' if side == 'buy' else 'sold'} {qty:g} x {label} at ${px:,.2f} "
+                   + (f"({pl:+,.2f}) " if pl is not None else "") + "- a copy of the PRACTICE trade.")
+        self._trades_dirty = True
+
     def is_paper_key(self):
         return bool(self.client) and self.broker() == "alpaca" and bool(E.ALPACA.get("paper", True))
 
     def click_practice(self):
         """PRACTICE on the switch: practice inside OBF (or stay on Alpaca paper if that's where practice already is)."""
         live = self.live if self.session else self.mode_var.get() == "live"
-        if live and self.acct_name(True) != "LIVE":
-            return  # already practising, on the broker's paper account
+        if not live or self.acct_name(True) != "LIVE":
+            return  # already practising (inside OBF, on the paper account, or both)
         self.switch_mode("paper")
-        self.dest_var.set("Stay in OBF  (PRACTICE)")
 
     def click_live(self):
         """LIVE on the switch: real money only. With a paper key, explain where paper trading lives now."""
@@ -2486,11 +2620,15 @@ class App:
 
     def pick_practice_dest(self):
         """Practice trades go to: inside OBF (PRACTICE) or your Alpaca paper account (ALPACA PAPER)."""
-        want_paper = self.dest_var.get().startswith("My Alpaca")
+        choice = self.dest_var.get()
+        want_paper, both = choice.startswith("My Alpaca"), choice.startswith("Both")
         live = self.live if self.session else self.mode_var.get() == "live"
-        if not want_paper:
+        if not want_paper and not both:
+            self.cfg["mirror_paper"] = False
+            E.save_json(CONFIG_PATH, self.cfg)
             if live:
                 self.switch_mode("paper")
+            self.update_status()
             return
         if not self.client:
             self.dest_var.set("Stay in OBF  (PRACTICE)")
@@ -2502,6 +2640,17 @@ class App:
             return messagebox.showinfo("Alpaca paper", "You're logged in with a real-money (live) key. Log out (Account "
                                                        "menu) and log in with your paper key to send practice trades to "
                                                        "your Alpaca paper account.")
+        if both:
+            self.cfg["mirror_paper"] = True
+            E.save_json(CONFIG_PATH, self.cfg)
+            if live:
+                self.switch_mode("paper")
+            self.write("PRACTICE + ALPACA PAPER: the practice session runs inside OBF, and every practice trade is also "
+                       "copied to your Alpaca paper account (shown as ALPACA PAPER in the Trades list).", "good")
+            self.update_status()
+            return
+        self.cfg["mirror_paper"] = False
+        E.save_json(CONFIG_PATH, self.cfg)
         if not live:
             self.switch_mode("live", quiet=True)
 
@@ -2574,6 +2723,8 @@ class App:
         live = self.live if self.session else self.mode_var.get() == "live"
         mode = {"PRACTICE": "PRACTICE (pretend money, inside OBF)", "ALPACA PAPER": "PRACTICE on your ALPACA PAPER account",
                 "IBKR PAPER": "PRACTICE on your IBKR PAPER account"}.get(self.acct_name(live), "LIVE (real money)")
+        if not live and self.cfg.get("mirror_paper"):
+            mode = "PRACTICE (inside OBF, every trade also copied to your ALPACA PAPER account)"
         if not self.running:
             if not self.session:
                 return f"Ready. You're in {mode}. Pick your coins, then press Start."
@@ -7702,7 +7853,7 @@ class App:
         opened = {}
         n = 0
         for t in self.trades:
-            if t.get("mode") != "live" or str(t.get("time", ""))[:10] not in days:
+            if t.get("mode") not in ("live", "alpaca") or str(t.get("time", ""))[:10] not in days:
                 continue
             k = (t["coin"], str(t["time"])[:10])
             if t["side"] == "buy":
@@ -8310,11 +8461,12 @@ class App:
             return None
         since = datetime.now().timestamp() - 7 * 86400
         lines = [f"OBF weekly report, {datetime.now():%Y-%m-%d}", ""]
-        for mode in ("live", "paper"):
-            rows = [r for r in self.trades if r.get("mode") == mode and (self._ts(r.get("time")) or 0) >= since]
+        for mode in ("live", "alpaca", "paper"):
+            rows = [r for r in self.trades + list(getattr(self, "mirror_trades", [])) if r.get("mode") == mode
+                    and (self._ts(r.get("time")) or 0) >= since]
             if rows:
                 pl = sum(float(r["pl"]) for r in rows if r.get("pl") not in ("", None))
-                lines.append(f"{'LIVE' if mode == 'live' else 'Practice'} account: {len(rows)} trades this week, "
+                lines.append(f"{({'live': 'LIVE', 'alpaca': 'ALPACA PAPER'}).get(mode, 'PRACTICE')} account: {len(rows)} trades this week, "
                              f"closed profit/loss ${pl:+,.2f}.")
         if self.session:
             eq = self.equity()
@@ -8461,6 +8613,9 @@ class App:
     def risk_checks(self):
         """Safety stop / lock-in profit / trailing stop on each contract's own value, and every contract is closed
         the day before it expires."""
+        if not self.live:  # "Both": a copy whose practice trade is gone (closed while the copy was on its way) is closed too
+            for c in [k for k, m in getattr(self, "mirror", {}).items() if not m.get("pending") and self.pos.get(k, 0) <= 0]:
+                self.mirror_close(c, "sync")
         stop, take, _ = self.account_stops()
         trail = float(self.settings.get("trail_stop", 0) or 0) / 100
         for c, q in list(self.pos.items()):
@@ -8676,6 +8831,7 @@ class App:
         self.pos[c] = qty
         self.cost[c] = cost
         self.log_trade("buy", c, qty, fill / E.CONTRACT, cost, None, reason)
+        self.mirror_open(c, o, qty, reason)
 
     def sell(self, c, px, reason="signal"):
         """Close the account's contract on this ticker."""
@@ -8708,9 +8864,12 @@ class App:
         self._closing_label = label
         self.log_trade("sell", c, qty, fill / E.CONTRACT, proceeds, pl, reason)
         self.opt.pop(c, None)
+        self.mirror_close(c, reason)
 
     def log_trade(self, side, c, qty, px, usd, pl, reason):
-        row = dict(time=datetime.now().isoformat(timespec="seconds"), mode="live" if self.live else "paper", acct=self.acct_name(),
+        acct_ = self.acct_name()
+        row = dict(time=datetime.now().isoformat(timespec="seconds"), mode={"PRACTICE": "paper", "ALPACA PAPER": "alpaca"}.get(acct_, "live"),
+                   acct=acct_,
                    side=side, coin=c, qty=round(qty, 8), price=round(px, 6), usd=round(usd, 2),
                    pl="" if pl is None else round(pl, 2), reason=reason, who=self.pending_who.pop(c, ""))
         if self.opt.get(c):
