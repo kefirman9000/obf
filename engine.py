@@ -1608,9 +1608,12 @@ def is_scalp(name):
 # time left, and flat before the close (scalpers never hold overnight).
 SCALP_TF = (1, 2)
 SCALP_RISK = {"sl": (5.0, 60.0), "tp": (6.0, 300.0)}  # from quick 6% nips to 300% home runs on cheap contracts
-SCALP_TRAITS = {"maxhold": (2, 60), "flatby": (5, 45), "odte": (1, 7), "otm": (0.25, 4.0), "cool": (1, 10),
+SCALP_TRAITS = {"vixmode": (1, 5), "vixwide": (1.2, 3.0), "maxhold": (2, 60), "flatby": (5, 45), "odte": (1, 7), "otm": (0.25, 4.0), "cool": (1, 10),
                 "minhold": (2, 5)}
-SCALP_NEEDS = {"maxhold": (3, 20), "flatby": (10, 30), "odte": (1, 5)}  # always carried (random start when missing)
+SCALP_NEEDS = {"maxhold": (3, 20), "flatby": (10, 30), "odte": (1, 5), "vixmode": (1, 5)}  # always carried (random start when missing)
+
+
+SCALP_ONLY = ("flatby", "vixmode", "vixwide")  # genes only scalpers carry
 
 
 def scalp_shape(rng, tf, risk, traits):
@@ -1634,6 +1637,52 @@ def scalp_shape(rng, tf, risk, traits):
     if t.get("minhold", 0) >= t["maxhold"]:
         t.pop("minhold")
     return tf, r, clean_traits(t)
+
+
+# ---- volatility (VIX) regime: what scalpers read before they jump in ----
+VIX_MODES = {1: "only scalps calm markets", 2: "only scalps when volatility is rising", 3: "only scalps volatility spikes",
+             4: "never scalps a volatility spike", 5: "ignores volatility (VIX)"}
+_REG_CACHE = {}
+
+
+def vol_regime(closes, extra, c):
+    """-> (regime, VIXY % move over the last 15 bars or None, swing ratio or None). regime: 'calm', 'normal', 'rising'
+    or 'spiking'. VIXY (the stand-in for the VIX) is a slow fund, so how fast SPY itself is swinging compared with its
+    last couple of hours also counts: that reacts within minutes. Shared by every bot on the same bar."""
+    ctx = (extra or {}).get(CTX_KEY) or {}
+    q = ctx.get("VIXY")
+    ref = closes.get("SPY") if "SPY" in closes else ctx.get("SPY")
+    if ref is None or len(ref) < 131:
+        ref = closes[c]
+    key = (id(ref), len(ref), ref[-1] if len(ref) else None, id(q) if q is not None else 0, len(q) if q is not None else 0)
+    hit = _REG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if len(_REG_CACHE) > 2048:
+        _REG_CACHE.clear()
+    vm = sr = None
+    if q is not None and len(q) > 16 and q[-16]:
+        vm = (q[-1] / q[-16] - 1) * 100
+    if len(ref) > 131:
+        seg = ref[-131:]
+        moves = [abs(seg[i] / seg[i - 1] - 1) for i in range(1, len(seg)) if seg[i - 1]]
+        if len(moves) == 130:
+            base = sum(moves[:120]) / 120
+            sr = (sum(moves[120:]) / 10) / base if base > 0 else None
+    if (vm is not None and vm >= 3.0) or (sr is not None and sr >= 2.2):
+        reg = "spiking"
+    elif (vm is not None and vm >= 1.0) or (sr is not None and sr >= 1.4):
+        reg = "rising"
+    elif (vm is None or vm <= 0.3) and sr is not None and sr < 0.9:
+        reg = "calm"
+    else:
+        reg = "normal"
+    out = _REG_CACHE[key] = (reg, vm, sr)
+    return out
+
+
+def vix_allows(mode, reg):
+    return {1: reg == "calm", 2: reg in ("rising", "spiking"), 3: reg == "spiking", 4: reg != "spiking"}.get(int(mode or 5), True)
 
 
 # ---- what a scalper really pays to get in and out: the bid/ask gap, learned from live option quotes ----
@@ -2347,6 +2396,8 @@ TRAITS = {
     "otm":     dict(lo=0.25, hi=12.0, kind=float, text=lambda v: f"strikes {v:g}% out of the money"),
     "oexit":   dict(lo=1, hi=10, kind=int, text=lambda v: f"gets out {v} day{'s' if v != 1 else ''} before expiry"),
     "flatby":  dict(lo=5, hi=45, kind=int, text=lambda v: f"scalper: flat {v} min before the close, never overnight"),
+    "vixmode": dict(lo=1, hi=5, kind=int, text=lambda v: VIX_MODES.get(int(v), VIX_MODES[5])),
+    "vixwide": dict(lo=1.2, hi=3.0, kind=float, text=lambda v: f"widens its stop and target up to {v:g}x when volatility jumps"),
     "moods":   dict(lo=1, hi=14, kind=int, text=lambda v: "trades only when " + " / ".join(
         m for i, m in enumerate(MOODS) if v & (1 << i))),
 }
@@ -2354,7 +2405,9 @@ TRAIT_NAMES = {"trail": "Trailing stop", "maxhold": "Max hold", "minhold": "Min 
                "minvol": "Min volatility", "rsicap": "Overbought guard", "confirm": "Confirmation",
                "entries": "Max entries", "exit": "Stops-only exit", "moods": "Mood gate", "adapt": "Adaptive stops",
                "omode": "Calls / puts (1 calls, 2 puts, 3 both)", "odte": "Days to expiry", "otm": "% out of the money",
-               "oexit": "Exit days before expiry", "flatby": "Flat before the close (minutes, scalpers)"}
+               "oexit": "Exit days before expiry", "flatby": "Flat before the close (minutes, scalpers)",
+               "vixmode": "Volatility gate (1 calm, 2 rising, 3 spikes, 4 not spikes, 5 any)",
+               "vixwide": "Wider exits when volatility jumps (x)"}
 
 
 def clean_traits(t):
@@ -2511,7 +2564,7 @@ def _grade_vetoes(v, closes, n):
         if k == "coin":  # a skipped coin: if it would have won, its bad record fades
             cp = v.coin_pl.setdefault(c, [0, 0.0])
             cp[1] = cp[1] * 0.9 + max(0.0, -saved)  # bad records also fade slowly, so it re-tries the coin one day
-        st = (v.layer_stats if (k in ("plus", "minus", "confirm", "coin", "htf", "lead") or k.startswith("ctx:"))
+        st = (v.layer_stats if (k in ("plus", "minus", "confirm", "coin", "htf", "lead", "vix") or k.startswith("ctx:"))
               else v.veto_stats).setdefault(k, [0.0, 0.0])
         st[0] += 1
         st[1] += saved
@@ -2753,6 +2806,9 @@ def bot_step(v, closes, n, coins, extra=None):
                     v.adapt_k[c] = min(2.0, max(0.5, sw / ref)) if ref > 0 else 1.0
             if tr.get("adapt"):
                 k_ = v.adapt_k.get(c, 1.0)
+            if tr.get("vixwide"):  # a volatility jump: room to breathe (a spike gets the full width)
+                reg_ = vol_regime(closes, extra, c)[0]
+                k_ *= tr["vixwide"] if reg_ == "spiking" else (1 + tr["vixwide"]) / 2 if reg_ == "rising" else 1.0
             if why is not None:
                 pass
             elif v.risk["sl"] and r <= -v.risk["sl"] * k_:
@@ -2870,6 +2926,11 @@ def bot_step(v, closes, n, coins, extra=None):
             if s and opt and tr.get("flatby") and sim.pos.get(c, 0) <= 0 \
                     and not (tr["flatby"] < minutes_to_close(sim.now) <= 390):
                 s = None  # scalper: only opens during the trading day, and not in its last minutes
+            if s and opt and int(tr.get("vixmode", 5) or 5) != 5 and sim.pos.get(c, 0) <= 0 \
+                    and not vix_allows(tr["vixmode"], vol_regime(closes, extra, c)[0]):
+                if not any(w[0] == "vix" and w[1] == c for w in v.veto_wait):  # graded in hindsight like a never-rule
+                    v.veto_wait.append(("vix", c, s, last[c], n + 10 * v.tf))
+                s = None
             if s and v.vetoes and (s == "buy" or sim.pos.get(c, 0) > 0 or opt):
                 opening = sim.pos.get(c, 0) <= 0
                 for k, x in v.vetoes.items():
@@ -3103,8 +3164,8 @@ class Tournament:
     def _new(self, name, params, tf=1, risk=None, traits=None, vetoes=None, layers=None):
         if is_scalp(name):  # the scalp breed always stays inside its envelope, however it was bred
             tf, risk, traits = scalp_shape(self.rng, tf, risk, traits)
-        elif traits and "flatby" in traits:
-            traits = {k: x for k, x in traits.items() if k != "flatby"}
+        elif traits and any(k in traits for k in SCALP_ONLY):
+            traits = {k: x for k, x in traits.items() if k not in SCALP_ONLY}
         v = Variant(name, params, make_sim(self.start_cash, self.fee, self.pct, slip=self.o.get("slip", 0.0)),
                     self.window_for(tf) + 1, tf, risk, traits, vetoes if self.o.get("vetoes", True) else None,
                     layers if self.o.get("layers", True) else None)
@@ -3427,7 +3488,9 @@ class Tournament:
                 else:
                     out[k] = self.rng.randint(1, 14) if k == "moods" else self.rng.uniform(spec["lo"], spec["hi"])
             elif k in out and roll < 0.35:
-                if k == "moods":
+                if k == "vixmode":  # a choice, not an amount: try another one
+                    out[k] = self.rng.randint(1, 5)
+                elif k == "moods":
                     out[k] = out[k] ^ (1 << self.rng.randrange(len(MOODS))) or out[k]
                 else:
                     out[k] = out[k] * self.rng.uniform(0.75, 1.3)
@@ -4767,19 +4830,24 @@ def slice_extra(extra, i):
 SCAN_CASH = 100000.0  # pretend money each scalper gets on each ticker it's tried on (big enough for one contract)
 
 
-def _scan_one(g, sym, bars, day_start):
+def _scan_one(g, sym, bars, day_start, ctx=None):
     """Replays one scalper (plain genes) over one ticker's 1-minute bars. Only trades from day_start on count;
-    earlier bars just warm up its indicators. -> dict of its day there."""
-    ly = {k: x for k, x in (g.get("layers") or {}).items() if k not in ("ctx", "lead")}  # nothing to watch here
-    vt = {k: x for k, x in (g.get("vetoes") or {}).items() if k != "mktdown"}
+    earlier bars just warm up its indicators. ctx: {'VIXY': closes, 'SPY': closes} lined up with this ticker's bars, so
+    its volatility gate and market studies see what they would have seen. -> dict of its day there."""
     v = Variant(g["name"], dict(g["params"]), make_sim(SCAN_CASH, 0.0, 0.05), 2, g.get("tf", 1), g.get("risk"),
-                g.get("traits"), vt, ly)
+                g.get("traits"), g.get("vetoes"), g.get("layers"))
     v.sim.genes = v.traits
     c, L = bars["c"], len(bars["c"])
+    ctx = ctx or {}
     out = dict(trades=0, wins=0, pl=0.0, paid=0.0, now=None, open=None)
     for i in range(max(WARM, 1), L):
         x = {sym: {k: View(bars[k], i + 1) for k in ("h", "l", "v", "t")}}
-        made = bot_step(v, {sym: View(c, i + 1)}, i, [sym], x)
+        cl = {sym: View(c, i + 1)}
+        if ctx:
+            x[CTX_KEY] = {k: View(q, i + 1) for k, q in ctx.items()}
+            if "SPY" in ctx and sym != "SPY":
+                cl["SPY"] = View(ctx["SPY"], i + 1)  # the market leader, for "follow the leader" studies
+        made = bot_step(v, cl, i, [sym], x)
         if i < day_start:
             continue
         for _, t in made:
@@ -4804,6 +4872,8 @@ def scan_scalps(job):
     Runs in its own process. -> {'tickers': {ticker: summary}, 'bots': {uid: [trades, wins, pl, paid]}, 'now': [...]}"""
     SPREAD_FIT.update(job.get("spread") or {})
     _SPREAD_LOADED[0] = True
+    IV_HINT.update(job.get("iv") or {})
+    ctx_bars = job.get("ctx") or {}
     if job.get("sspread"):
         SCALP_SPREAD[0] = float(job["sspread"])
     day0 = ny_time(job["day"], 9, 30)
@@ -4815,9 +4885,11 @@ def scan_scalps(job):
         if start >= len(bars["t"]) - 1:
             continue
         tk_ = dict(trades=0, wins=0, pl=0.0, paid=0.0, best=None, best_pl=None, setups=0)
+        ctx = {k: align_ctx(bars["t"], cb["t"], cb["c"]) for k, cb in ctx_bars.items() if cb.get("t")}
+        tk_["regime"] = vol_regime({sym: bars["c"]}, {CTX_KEY: ctx}, sym)[0] if ctx else ""
         for g in job["genes"]:
             try:
-                r = _scan_one(g, sym, bars, start)
+                r = _scan_one(g, sym, bars, start, ctx)
             except Exception:
                 continue
             pl = r["pl"] + (r["open"]["pl"] if r["open"] else 0.0)
