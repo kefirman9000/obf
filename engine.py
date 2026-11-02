@@ -1404,6 +1404,93 @@ def sig_trend_dip(p, n, a):
         return "sell"
 
 
+# ---- scalp instincts: fast, in-and-out signals for the scalp breed (seconds to minutes, never overnight) ----
+def sig_micro_pullback(p, n, a, x=None):
+    """Micro pullback: in a short-term trend (price above a rising fast EMA), wait for a pause of a few bars that
+    holds above the EMA, then buy the first bar that closes above the previous bar's high. Mirror for puts."""
+    k, pb = int(a["n"]), int(a["pull"])
+    if not x or len(p) < k * 3 + pb + 2:
+        return None
+    h, lo = x["h"], x["l"]
+    e = _ema(p[-(k * 3 + pb + 2):], k)
+    rising, falling = e[-1] > e[-1 - pb - 1], e[-1] < e[-1 - pb - 1]
+    pulled = all(p[-1 - i] <= p[-2 - i] for i in range(1, pb + 1))
+    popped = all(p[-1 - i] >= p[-2 - i] for i in range(1, pb + 1))
+    if rising and pulled and min(lo[-pb - 1:-1]) >= e[-2] * 0.999 and p[-1] > h[-2]:
+        return "buy"
+    if falling and popped and max(h[-pb - 1:-1]) <= e[-2] * 1.001 and p[-1] < lo[-2]:
+        return "sell"
+
+
+def sig_volume_burst(p, n, a, x=None):
+    """Volume burst: one bar trades several times its usual volume, moves at least thr %, and closes near its own
+    high (buy) or low (sell). Rides the first push of a sudden crowd."""
+    k = int(a["n"])
+    if not x or len(p) < k + 2:
+        return None
+    v, h, lo = x["v"], x["h"], x["l"]
+    avg = sum(v[-k - 1:-1]) / k
+    if avg <= 0 or v[-1] < a["vmult"] * avg or not p[-2]:
+        return None
+    mv = (p[-1] / p[-2] - 1) * 100
+    rng = h[-1] - lo[-1]
+    if rng <= 0:
+        return None
+    where = (p[-1] - lo[-1]) / rng  # 1 = closed at the bar's high, 0 = at its low
+    if mv >= a["thr"] and where >= 0.7:
+        return "buy"
+    if mv <= -a["thr"] and where <= 0.3:
+        return "sell"
+
+
+def sig_vwap_reclaim(p, n, a, x=None):
+    """VWAP reclaim: the price crosses back over its short volume-weighted average on above-normal volume. Crossing
+    up buys, crossing down sells (the opposite of a snap-back: it trades the cross, not the stretch)."""
+    k = int(a["n"])
+    if not x or len(p) < k + 2:
+        return None
+    h, lo, v = x["h"][-k:], x["l"][-k:], x["v"][-k:]
+    tv = sum(v)
+    if tv <= 0:
+        return None
+    vw = sum((h[i] + lo[i] + p[-k + i]) / 3 * v[i] for i in range(k)) / tv
+    if v[-1] < a["vmin"] * tv / k:
+        return None
+    if p[-2] <= vw < p[-1]:
+        return "buy"
+    if p[-2] >= vw > p[-1]:
+        return "sell"
+
+
+def sig_range_scalp(p, n, a, x=None):
+    """Range scalp: when the last n bars sit in a tight box (no wider than maxw %), buy a turn up near the bottom
+    edge and sell a turn down near the top edge."""
+    k = int(a["n"])
+    if not x or len(p) < k + 2:
+        return None
+    hh, ll = max(x["h"][-k - 1:-1]), min(x["l"][-k - 1:-1])
+    if ll <= 0 or hh <= ll or (hh - ll) / ll * 100 > a["maxw"]:
+        return None
+    band = (hh - ll) * a["edge"]
+    if p[-1] <= ll + band and p[-1] > p[-2]:
+        return "buy"
+    if p[-1] >= hh - band and p[-1] < p[-2]:
+        return "sell"
+
+
+def sig_quick_flip(p, n, a):
+    """Quick flip: a run of closes all in one direction adding up to at least thr %. Jumps on the run."""
+    k = int(a["run"])
+    if len(p) < k + 2 or not p[-1 - k]:
+        return None
+    d = [p[-i] - p[-i - 1] for i in range(1, k + 1)]
+    mv = (p[-1] / p[-1 - k] - 1) * 100
+    if all(x > 0 for x in d) and mv >= a["thr"]:
+        return "buy"
+    if all(x < 0 for x in d) and mv <= -a["thr"]:
+        return "sell"
+
+
 STRATS = {
     "SMA crossover": dict(fn=sig_sma, params={"fast": 5, "slow": 20},
                           bounds={"fast": (2, 60), "slow": (10, 200)}, keep=420),
@@ -1439,6 +1526,17 @@ STRATS = {
                         bounds={"n": (5, 60), "m": (0.5, 4.0)}),
     "Dollar-cost averaging": dict(fn=sig_dca, params={"every": 24},
                                   bounds={"every": (6, 96)}),
+    # the scalp breed (scalp=True): only ever hatched as scalpers, see scalp_shape()
+    "Micro pullback": dict(fn=sig_micro_pullback, params={"n": 9, "pull": 2}, hlv=True, keep=80, scalp=True,
+                           bounds={"n": (4, 21), "pull": (1, 4)}),
+    "Volume burst": dict(fn=sig_volume_burst, params={"n": 20, "vmult": 2.5, "thr": 0.08}, hlv=True, keep=80, scalp=True,
+                         bounds={"n": (8, 60), "vmult": (1.5, 6.0), "thr": (0.02, 0.6)}),
+    "VWAP reclaim": dict(fn=sig_vwap_reclaim, params={"n": 30, "vmin": 1.2}, hlv=True, keep=150, scalp=True,
+                         bounds={"n": (10, 120), "vmin": (0.6, 3.0)}),
+    "Range scalp": dict(fn=sig_range_scalp, params={"n": 20, "edge": 0.2, "maxw": 0.4}, hlv=True, keep=80, scalp=True,
+                        bounds={"n": (8, 60), "edge": (0.05, 0.35), "maxw": (0.08, 1.5)}),
+    "Quick flip": dict(fn=sig_quick_flip, params={"run": 3, "thr": 0.06}, keep=20, scalp=True,
+                       bounds={"run": (2, 6), "thr": (0.02, 0.5)}),
 }
 
 
@@ -1496,7 +1594,52 @@ def fix_params(name, p):
     if "mid" in p and not (p["fast"] < p["mid"] < p["slow"]):
         p["fast"], p["mid"], p["slow"] = d["fast"], d["mid"], d["slow"]
     return p
-WILDCARD_STRATS = [n for n in STRATS if n != "Dollar-cost averaging"]  # DCA never sells
+SCALP_STRATS = [n for n, s in STRATS.items() if s.get("scalp")]  # the scalp breed's own instincts
+WILDCARD_STRATS = [n for n in STRATS if n != "Dollar-cost averaging" and n not in SCALP_STRATS]  # DCA never sells
+
+
+def is_scalp(name):
+    """Is this strategy one of the scalp breed's instincts?"""
+    return bool(STRATS.get(name, {}).get("scalp"))
+
+
+# The scalp breed's gene envelope. Whatever mutation or crossbreeding does, a scalper is always pulled back inside
+# it: a fast pace, a tight stop AND target on the premium, a hard time limit, near-the-money contracts with little
+# time left, and flat before the close (scalpers never hold overnight).
+SCALP_TF = (1, 2)
+SCALP_RISK = {"sl": (5.0, 40.0), "tp": (6.0, 60.0)}
+SCALP_TRAITS = {"maxhold": (2, 30), "flatby": (5, 45), "odte": (1, 7), "otm": (0.25, 1.0), "cool": (1, 10),
+                "minhold": (2, 5)}
+SCALP_NEEDS = {"maxhold": (3, 20), "flatby": (10, 30), "odte": (1, 5)}  # always carried (random start when missing)
+
+
+def scalp_shape(rng, tf, risk, traits):
+    """(tf, risk, traits) pulled inside the scalp envelope. Idempotent: genes already inside it are left alone."""
+    tf = clamp_tf(tf)
+    if tf not in SCALP_TF:
+        tf = rng.choice((1, 1, 2))
+    r = dict(clean_risk(risk))
+    for k, (lo, hi) in SCALP_RISK.items():
+        val = float(r.get(k) or 0) or rng.uniform(lo, lo + (hi - lo) * 0.5)
+        r[k] = round(min(max(val, lo), hi), 2)
+    t = dict(clean_traits(traits))
+    t.pop("oexit", None)  # replaced by flatby: a scalper is out the same day
+    for k, (lo, hi) in SCALP_NEEDS.items():
+        if not t.get(k):
+            t[k] = rng.randint(lo, hi)
+    for k, (lo, hi) in SCALP_TRAITS.items():
+        if k in t:
+            t[k] = min(max(t[k], lo), hi)
+    if t.get("minhold", 0) >= t["maxhold"]:
+        t.pop("minhold")
+    return tf, r, clean_traits(t)
+
+
+def minutes_to_close(ts):
+    """Minutes from ts until 4 pm New York on that day (negative after the close, over 390 before the 9:30 open)."""
+    d = datetime.fromtimestamp(ts, timezone.utc)
+    ny = d - timedelta(hours=_ny_offset(d))
+    return (ny.replace(hour=16, minute=0, second=0, microsecond=0) - ny).total_seconds() / 60
 
 
 # ---------------- settings ----------------
@@ -1577,6 +1720,8 @@ DEFAULT_SETTINGS = {
     "risk_adjusted": True,       # rank winners by gain per unit of downside swing, not raw gain
     "luck_check": True,          # a bot's score counts for less when it rests on only a few trades
     "long_holds": True,          # include slow, longer-holding bots from the start
+    "scalpers": True,            # the scalp breed: fast in-and-out bots (tight stop + target, time limit, flat by the close)
+    "scalp_share": 25,           # % of the fast farm kept for scalpers (they can win up to twice that; needs 5-min bars or faster)
     "min_hold_min": 0.0,         # account: minutes to hold before a strategy signal may sell (stops still sell)
     "fee_aware": True,           # don't sell for a profit smaller than the round-trip fees (losses and stops still sell)
     "max_trades_hour": 30,       # brake: most signal trades the account may make in an hour (0 = no limit)
@@ -2068,6 +2213,7 @@ def tournament_opts(settings):
                 classics=bool(settings.get("classics", True)), classic_rate=float(settings.get("classic_rate", 25)) / 100,
                 vetoes=bool(settings.get("vetoes", True)), layers=bool(settings.get("layers", True)),
                 long_holds=bool(settings.get("long_holds", True)),
+                scalp_share=scalp_share(settings),
                 coin_prefs=bool(settings.get("coin_prefs", True)), confidence_sizing=bool(settings.get("confidence_sizing", True)),
                 twin_test=bool(settings.get("twin_test", True)), elders=bool(settings.get("elders", True)),
                 seasons=bool(settings.get("seasons", True)),
@@ -2077,6 +2223,22 @@ def tournament_opts(settings):
                 time_habits=bool(settings.get("time_habits", True)), agree_sizing=bool(settings.get("agree_sizing", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
                 prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0])
+
+
+def scalp_share(settings):
+    """Share of the fast farm (0..0.6) kept for the scalp breed. 0 when switched off or when the bars are slower
+    than 5 minutes (a scalper deciding once an hour isn't scalping)."""
+    try:
+        if not settings.get("scalpers", True) or float(settings.get("bar_minutes", 1)) > 5:
+            return 0.0
+        return min(0.6, max(0.0, float(settings.get("scalp_share", 25) or 0) / 100))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def opts_for_bars(opts, gran_seconds):
+    """Farm options for a farm running on candles of this size: no scalp breed on candles slower than 5 minutes."""
+    return dict(opts, scalp_share=0.0) if float(gran_seconds or 0) > 300 else dict(opts)
 
 
 RISK_BOUNDS = {"sl": (2.0, 95.0), "tp": (2.0, 500.0)}  # a bot's own stop / target on the PREMIUM it paid, % (0 = none)
@@ -2118,6 +2280,7 @@ TRAITS = {
     "odte":    dict(lo=1, hi=60, kind=int, text=lambda v: f"buys contracts about {v} days from expiry"),
     "otm":     dict(lo=0.25, hi=12.0, kind=float, text=lambda v: f"strikes {v:g}% out of the money"),
     "oexit":   dict(lo=1, hi=10, kind=int, text=lambda v: f"gets out {v} day{'s' if v != 1 else ''} before expiry"),
+    "flatby":  dict(lo=5, hi=45, kind=int, text=lambda v: f"scalper: flat {v} min before the close, never overnight"),
     "moods":   dict(lo=1, hi=14, kind=int, text=lambda v: "trades only when " + " / ".join(
         m for i, m in enumerate(MOODS) if v & (1 << i))),
 }
@@ -2125,7 +2288,7 @@ TRAIT_NAMES = {"trail": "Trailing stop", "maxhold": "Max hold", "minhold": "Min 
                "minvol": "Min volatility", "rsicap": "Overbought guard", "confirm": "Confirmation",
                "entries": "Max entries", "exit": "Stops-only exit", "moods": "Mood gate", "adapt": "Adaptive stops",
                "omode": "Calls / puts (1 calls, 2 puts, 3 both)", "odte": "Days to expiry", "otm": "% out of the money",
-               "oexit": "Exit days before expiry"}
+               "oexit": "Exit days before expiry", "flatby": "Flat before the close (minutes, scalpers)"}
 
 
 def clean_traits(t):
@@ -2501,6 +2664,8 @@ def bot_step(v, closes, n, coins, extra=None):
                 o = sim.opt.get(c) or {}
                 if o and sim.now >= o["exp"] - int(tr.get("oexit", 1) or 1) * 86400:
                     why = "expiry"
+                elif tr.get("flatby") and minutes_to_close(sim.now) <= tr["flatby"]:
+                    why = "flat"  # scalpers never hold into the close
             k_ = 1.0
             if tr.get("adapt") and n % v.tf == 0:  # adaptive stops: scaled by today's swing vs this bot's usual swing
                 ser = tail_series(closes[c], v.tf, 21)
@@ -2526,7 +2691,8 @@ def bot_step(v, closes, n, coins, extra=None):
                 v.sig[c] = "sell"
                 v.why[c] = {"expiry": "its contract was close to expiry",
                             "stop": f"its own safety stop ({v.risk['sl']:g}%)", "target": f"its own profit target ({v.risk['tp']:g}%)",
-                            "trail": f"its trailing stop ({tr.get('trail', 0):g}%)", "time": "it held as long as it allows"}[why]
+                            "trail": f"its trailing stop ({tr.get('trail', 0):g}%)", "time": "it held as long as it allows",
+                            "flat": f"scalpers are flat {tr.get('flatby', 0)} min before the close"}[why]
         if sim.last is None:
             if n % v.tf:  # between this bot's own decisions: no signal, no trade
                 v.sig[c] = None
@@ -2624,6 +2790,9 @@ def bot_step(v, closes, n, coins, extra=None):
                     s = None  # fee-aware: a profit this small would be eaten by the fees, so keep holding
             if opt and s == "sell" and sim.pos.get(c, 0) <= 0 and int(tr.get("omode", 3) or 3) == 1:
                 s = None  # calls-only bot with nothing to close
+            if s and opt and tr.get("flatby") and sim.pos.get(c, 0) <= 0 \
+                    and not (tr["flatby"] < minutes_to_close(sim.now) <= 390):
+                s = None  # scalper: only opens during the trading day, and not in its last minutes
             if s and v.vetoes and (s == "buy" or sim.pos.get(c, 0) > 0 or opt):
                 opening = sim.pos.get(c, 0) <= 0
                 for k, x in v.vetoes.items():
@@ -2834,7 +3003,13 @@ class Tournament:
             self.vars.append(self._new(name, self._rand_params(name), tf=self.rng.choice(TIMEFRAMES),
                                        risk=self.rand_risk(), traits=self.rand_traits(), vetoes=self.rand_vetoes(),
                                        layers=self.rand_layers()))
-        del self.vars[max(self.cap, 14):]
+        n_sc = self.scalp_target()
+        del self.vars[max(self.cap, 14) - n_sc:]
+        for i in range(n_sc):  # the scalp breed: one of each instinct at its usual settings, then random ones
+            if i < len(SCALP_STRATS):
+                self.vars.append(self._new(SCALP_STRATS[i], dict(STRATS[SCALP_STRATS[i]]["params"])))
+            else:
+                self.vars.append(self._rand_scalper())
         k_isl = int(self.o.get("islands", 1) or 1)
         for i, v in enumerate(self.vars):
             self._register(v, [], "classic" if v.classic else "starter")
@@ -2845,6 +3020,10 @@ class Tournament:
         return self.W * min(max(1, clamp_tf(tf) // 2), 10)
 
     def _new(self, name, params, tf=1, risk=None, traits=None, vetoes=None, layers=None):
+        if is_scalp(name):  # the scalp breed always stays inside its envelope, however it was bred
+            tf, risk, traits = scalp_shape(self.rng, tf, risk, traits)
+        elif traits and "flatby" in traits:
+            traits = {k: x for k, x in traits.items() if k != "flatby"}
         v = Variant(name, params, make_sim(self.start_cash, self.fee, self.pct, slip=self.o.get("slip", 0.0)),
                     self.window_for(tf) + 1, tf, risk, traits, vetoes if self.o.get("vetoes", True) else None,
                     layers if self.o.get("layers", True) else None)
@@ -2864,6 +3043,71 @@ class Tournament:
         v.rt_cost = 2 * (self.fee + self.o.get("slip", 0.0))
         v.fee_guard = 2 * (self.fee + self.o.get("slip", 0.0)) if self.o.get("fee_aware", True) else 0.0
         return v
+
+    # ---- the scalp breed ----
+    def scalp_target(self):
+        """How many scalpers this farm keeps at least (0 = the breed is switched off here)."""
+        sh = float(self.o.get("scalp_share", 0) or 0)
+        return 0 if sh <= 0 else max(2, int(round(self.cap * sh)))
+
+    def scalpers(self):
+        return [v for v in self.vars if is_scalp(v.name)]
+
+    def _rand_scalper(self):
+        name = self.rng.choice(SCALP_STRATS)
+        return self._new(name, self._rand_params(name), self.rng.choice((1, 1, 2)), None, self.rand_traits(0.2),
+                         self.rand_vetoes(), self.rand_layers(0.25))
+
+    def spawn_scalp(self, closes=None):
+        """Hatches one scalper: a tweaked copy of the best scalper (winners first), or a random one. Makes room by
+        dropping the weakest long-term bot that isn't winning. Returns the new bot or None."""
+        ranked = [v for v, _ in self.ranking() if is_scalp(v.name)]
+        par = next((v for v in ranked if v in self.active), None)
+        if par is None and ranked and self.rng.random() < 0.6:
+            par = ranked[0]
+        if len(self.vars) >= self.cap:
+            cands = [v for v, _ in reversed(self.ranking()) if v not in self.active and not is_scalp(v.name)]
+            cands = [v for v in cands if sum(1 for x in self.vars if x.name == v.name) > 1] or cands
+            if not cands:
+                return None
+            self._remove(cands[0], "made room for a scalper")
+        if par is not None:
+            vt, vs = self.inherit_vetoes([par])
+            ly, ls = self.inherit_layers([par], par.name)
+            child = self._new(par.name, self.mutate(par.name, par.params, 0.25), self.mutate_tf(par.tf),
+                              self.mutate_risk(par.risk), self.mutate_traits(par.traits), vt, ly)
+            child.veto_stats, child.layer_stats = vs, ls
+            self._register(child, [par], "scalp hatch")
+            note = f"Scalp egg: {child.label} (from {par.label})"
+        else:
+            child = self._rand_scalper()
+            self._register(child, [], "random scalper")
+            note = f"Scalp egg: {child.label}"
+        if closes:
+            self.replay(child, closes)
+        self.vars.append(child)
+        self.events.append(note)
+        return child
+
+    def scalp_balance(self, closes):
+        """Keeps the scalp breed between its share of the farm and twice that (never over 60%): enough scalpers to
+        find the quick moves, never so many that the long-term bots are crowded out."""
+        tgt, sc = self.scalp_target(), self.scalpers()
+        if not tgt:
+            for v in sc:
+                self._remove(v, "scalpers switched off")
+            if sc:
+                self.events.append(f"Scalpers are off: {len(sc)} scalp bot{'s' if len(sc) != 1 else ''} left the farm")
+            return
+        for _ in range(min(2, tgt - len(sc))):  # a couple per round, so the farm isn't flooded at once
+            self.spawn_scalp(closes)
+        most = max(tgt, min(tgt * 2, int(self.cap * 0.6)))
+        sc = self.scalpers()
+        if len(sc) > most:
+            weak = [v for v, _ in reversed(self.ranking()) if is_scalp(v.name) and v not in self.active]
+            for v in weak[:len(sc) - most]:
+                self._remove(v, "too many scalpers")
+                self.events.append(f"Dropped {v.label} (the scalp den was full)")
 
     def rand_traits(self, chance=0.3):
         t = {}
@@ -3558,6 +3802,7 @@ class Tournament:
             self._spawn(closes)  # strong winners get an extra tweaked copy
         for _ in range(min(3, self.cap - len(self.vars))):  # keep filling up to the limit
             self._spawn_or_random(closes)
+        self.scalp_balance(closes)
         self.evolves += 1
         k_isl = int(self.o.get("islands", 1) or 1)
         if k_isl > 1 and self.evolves % 8 == 0:
@@ -4633,6 +4878,18 @@ STRAT_DOCS = {  # plain-English rules for every strategy, for people and other p
     "Trend + dip": ("SMA over `trend` bars and RSI over `period` bars.",
                     "Buy when the close is above the SMA and RSI < `lo`; sell when RSI > `hi` or the close drops below the SMA."),
     "Dollar-cost averaging": ("A counter of decisions.", "Buy every `every` decisions; never sells by itself."),
+    # the scalp breed (always with a tight stop and target, a time limit, and flat before the 4 pm close)
+    "Micro pullback": ("EMA(`n`) of the close, the last `pull` bars, and the previous bar's high and low.",
+                       "Buy when the EMA is rising, the last `pull` closes eased back without breaking the EMA, and the "
+                       "close tops the previous bar's high; sell (put) on the mirror image."),
+    "Volume burst": ("This bar's volume vs the `n`-bar average, its % move, and where it closed in its own range.",
+                     "Buy when volume >= `vmult` x average, the bar rose >= `thr` % and closed in its top 30%; sell on the "
+                     "mirror image."),
+    "VWAP reclaim": ("Volume-weighted average price over `n` bars, and this bar's volume vs average.",
+                     "Buy when the close crosses up through VWAP on volume >= `vmin` x average; sell on a cross down."),
+    "Range scalp": ("Highest high / lowest low of the previous `n` bars (a box at most `maxw` % tall).",
+                    "Inside a tight box only: buy a tick up within `edge` of the bottom; sell a tick down within `edge` of the top."),
+    "Quick flip": ("The last `run` closes.", "Buy when all `run` closes rose and add up to >= `thr` %; sell when all fell."),
 }
 
 

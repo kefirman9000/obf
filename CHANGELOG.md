@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.11.0
+- **Scalpers: a new breed (wind dragons)**: fast in-and-out bots for the quick moves the long-term bots let pass.
+  Five scalp instincts of their own: Micro pullback, Volume burst, VWAP reclaim, Range scalp and Quick flip.
+  Every scalper always carries a tight stop AND target on the premium, a time limit, near-the-money contracts, and is
+  flat before the close (never overnight). Breeding and mutation can't push one outside that.
+- **Their own den on the farm**: a share of the fast farm (25% by default) is kept for scalpers. They breed from the best
+  scalpers and can win up to twice their share (never over 60%), so the long-term bots are never crowded out. Off on the
+  Slow farm and whenever the decision speed is slower than 5 minutes.
+- **The account trades scalps like scalps**: when scalpers carry a vote, that contract uses the scalpers' own stop,
+  target and time limit, opens only during the trading day, and is sold before the bell. Long-term trades keep the
+  stops they had (scalpers' tight stops no longer count toward "Let the winning bots set stops").
+- Settings > Learning > "Scalp breed" and "...% of the farm kept for scalpers".
+- If you saw "The syntax of the command is incorrect." in a command window after updating to 1.10.1: that was the old
+  launcher being replaced while it was still open. It's harmless and won't happen again with the new launcher.
+
 ## 1.10.1
 - **No more black command window**: Run OBF.bat now starts OBF with Python's windowless version and closes right away.
   There's also a new OBF.pyw in the folder: double-click it to start with no window flashing at all (you can pin a
