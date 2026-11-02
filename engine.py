@@ -4306,7 +4306,9 @@ class Tournament:
 
     def spawn_random(self, closes=None):
         """A brand new strategy with random settings, or now and then a famous one. Makes room by dropping the
-        weakest duplicate."""
+        weakest duplicate. A scalpers-only farm (the live scalp lab) hatches a scalper instead."""
+        if self.o.get("scalp_only"):
+            return self.spawn_scalp(closes)
         name = self.rng.choice(WILDCARD_STRATS)
         p = self._rand_params(name)
         if len(self.vars) >= self.cap:

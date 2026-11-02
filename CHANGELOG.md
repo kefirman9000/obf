@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.15.0
+- **Scalp lab** (new, under the "\u26a1 Scalpers" tab): a farm of scalpers only that learns on its own from LIVE prices
+  while the market is open, like Free roam but in real time. Switch it on and it:
+  - each morning picks up to 8 tickers (yours, the ones the Scalp scan found paying, then the busiest), starts from
+    yesterday's best scalpers plus new ones, and warms up on the day so far;
+  - every minute, as each 1-minute bar finishes, lets 24 scalpers decide with real bid/ask costs, their own stops,
+    targets and time limits, and their volatility gates (VIXY, SPY and the live VIX-like reading);
+  - every 15 minutes evolves: losers retire, winners lay eggs and crossbreed, new scalpers are tried, all judged on
+    their last 30 scalps;
+  - every 30 minutes sends its best proven scalper (15+ scalps, in profit, winning) to your farm as a "Scalp lab
+    graduate" (or pick one yourself: "Send selected to my farm");
+  - at the close keeps its 12 best scalpers for tomorrow.
+  Its screen shows the scalpers best to worst, their live trades (CALL / PUT), the tickers it's on with their
+  volatility, and a lab log. It never trades your account. Needs the Alpaca login.
+- The Scalp scan moved under the same "\u26a1 Scalpers" tab.
+
 ## 1.14.0
 - **Scalp roams in Free roam**: Free roam now has a third kind of study next to Self-tests and Practice farms. Every
   fourth study, your best scalpers plus four new ones (two tweaked from your best, two brand new) trade a whole day on
