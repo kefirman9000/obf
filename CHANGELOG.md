@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.19.0
+- **Day replays trade real contracts at their real prices**: when Free roam replays a past trading day (scalp roams,
+  now called day replays), it loads that day's real option history from Alpaca: the contracts that were actually
+  listed, and what each one traded at minute by minute. Bots buy and sell those contracts at those prices, instead of a
+  calculated estimate. Any day from February 2024 on works, nothing has to be recorded first, and each day is kept on
+  disk after the first time. A contract with no real price falls back to the estimate; the study log says what share of
+  fills were real. Needs the Alpaca login.
+- **Kamikazes train in Free roam too**: your best kamikazes join every day replay, and every self-test includes your
+  best kamikaze and (on short candles) your best scalper. Day replays now run when your farm has scalpers or kamikazes.
+- **Overview** (the first tab, was Features): every farm at a glance (Bot Farm, Slow farm, Scalp lab: dragons, winning,
+  generation, best right now, breeds, what it has learned and what it's doing), plus totals for everything being
+  learned: Free roam studies, days replayed, share of real option prices, what would have worked, rules tested by
+  kamikazes, graduates adopted, Library and Hall of Fame, and things learned. The feature cards are below it.
+
 ## 1.18.1
 - **Features tab** (first tab): every learning feature on one page: Free roam, Hindsight, Scalp lab, Scalp scan, the
   Scalper and Kamikaze breeds, the Slow farm, Shadow Live, Farm knowledge, Training camp, practising on Alpaca paper too,

@@ -640,6 +640,81 @@ def option_chain(under, exp_from=None, exp_to=None, typ=None, strike_lo=None, st
     return sorted(out, key=lambda r: (r["exp"], r["K"], r["type"]))
 
 
+OPT_HIST_START = "2024-02-01"  # Alpaca keeps option history from February 2024
+
+
+def _optbook_path(under, day):
+    return os.path.join(HOME_DIR, "cache", "optbars", f"{under}-{day}.json")
+
+
+def day_option_book(under, day, S, exp_days=8, width=0.06, per=12, note=None):
+    """One past trading day's real option history for a ticker, from Alpaca: the listed contracts expiring 1 to
+    exp_days days after that day with strikes within +-width of the price S (the nearest `per` strikes of each expiry and
+    type), and every one's 1-minute prices during that day. Cached on disk (a past day never changes).
+    -> {contracts: [{symbol, type, K, exp}], bars: {symbol: [[times], [closes]]}} or None (before Feb 2024, or nothing)"""
+    if day < OPT_HIST_START:
+        return None
+    path = _optbook_path(under, day)
+    hit = load_json(path, None)
+    if isinstance(hit, dict) and "contracts" in hit:
+        return hit if hit["contracts"] else None
+    d0 = datetime.strptime(day, "%Y-%m-%d")
+    lo_d, hi_d = (d0 + timedelta(days=1)).strftime("%Y-%m-%d"), (d0 + timedelta(days=exp_days)).strftime("%Y-%m-%d")
+    raw = {}
+    for status in ("inactive", "active"):  # contracts that have expired since, and ones still listed
+        token, pages = None, 0
+        while pages < 5:
+            q = (f"underlying_symbols={urllib.parse.quote(under)}&expiration_date_gte={lo_d}&expiration_date_lte={hi_d}"
+                 f"&strike_price_gte={S * (1 - width):.2f}&strike_price_lte={S * (1 + width):.2f}&status={status}&limit=10000")
+            d = alp("GET", f"{trade_url()}/v2/options/contracts?{q}" + (f"&page_token={token}" if token else ""), timeout=20)
+            for x in d.get("option_contracts") or []:
+                try:
+                    raw[x["symbol"]] = dict(symbol=x["symbol"], type=x["type"], K=float(x["strike_price"]),
+                                            exp=ny_time(x["expiration_date"], 16, 0))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            token = d.get("next_page_token")
+            pages += 1
+            if not token:
+                break
+    groups = {}
+    for x in raw.values():
+        groups.setdefault((x["type"], x["exp"]), []).append(x)
+    keep = []
+    for g in groups.values():
+        keep += sorted(g, key=lambda x: abs(x["K"] - S))[:per]
+    bars = {}
+    start, end = ny_time(day, 9, 30), ny_time(day, 16, 0)
+    syms = [x["symbol"] for x in keep]
+    for i in range(0, len(syms), 100):
+        chunk = syms[i:i + 100]
+        if note:
+            note(f"Loading real option prices for {under} ({min(i + 100, len(syms))} of {len(syms)} contracts)")
+        token, pages = None, 0
+        while pages < 40:
+            q = (f"symbols={urllib.parse.quote(','.join(chunk))}&timeframe=1Min&start={_iso(start)}&end={_iso(end)}&limit=10000")
+            d = alp("GET", f"{DATA_URL}/v1beta1/options/bars?{q}" + (f"&page_token={token}" if token else ""), timeout=30)
+            for sym, rows in (d.get("bars") or {}).items():
+                b = bars.setdefault(sym, [[], []])
+                for r in rows:
+                    try:
+                        b[0].append(_iso_ts(r["t"]))
+                        b[1].append(float(r["c"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            token = d.get("next_page_token")
+            pages += 1
+            if not token:
+                break
+    book = dict(contracts=[x for x in keep if x["symbol"] in bars], bars=bars)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        save_json(path, book)
+    except Exception:
+        pass
+    return book if book["contracts"] else None
+
+
 def option_oi(under, exp_from=None, exp_to=None, typ=None):
     """{option symbol: open interest} from Alpaca's contract list (open interest is updated once a day)."""
     q = [f"underlying_symbols={urllib.parse.quote(under)}", "limit=10000", "status=active"]
@@ -2225,6 +2300,8 @@ class OptionSim(Sim):
         self.opt = {}               # underlying -> {type, K, exp}
         self.now = time.time()
         self.vol_src = {}
+        self.book = None            # past-day replays: {ticker: day_option_book(...)}: real listed contracts and prices
+        self.real_fills = self.est_fills = 0  # fills priced from real option history vs estimated
 
     def _vol(self, c, closes=None, times=None):
         iv = IV_HINT.get(c)
@@ -2234,11 +2311,33 @@ class OptionSim(Sim):
 
     def mark(self, c, S):
         """Value of one contract right now."""
-        o = self.opt.get(c)
-        if not o or not S:
+        if not S:
             return 0.0
-        T = max(0.0, o["exp"] - self.now) / YEAR
-        return bs_price(S, o["K"], T, self._vol(c), o["type"]) * CONTRACT
+        return self.mark_one(c, S)
+
+    def _real_px(self, o):
+        """The contract's real price (its last 1-minute bar at or before now, within 30 minutes), or None."""
+        if not self.book or not o or not o.get("symbol"):
+            return None
+        b = (self.book.get(o.get("under")) or {}).get("bars", {}).get(o["symbol"])
+        if not b:
+            return None
+        i = bisect.bisect_right(b[0], self.now) - 1
+        if i < 0 or self.now - b[0][i] > 1800 or b[1][i] <= 0:
+            return None
+        return b[1][i] * CONTRACT
+
+    def _pick_listed(self, c, typ, K, exp, S):
+        """The real listed contract closest to the one wanted (that day's option history), or None."""
+        bk = (self.book or {}).get(c)
+        if not bk:
+            return None
+        dte = max(1.0, (exp - self.now) / 86400)
+        cands = [x for x in bk["contracts"] if x["type"] == typ and x["exp"] > self.now + 86400
+                 and self._real_px(dict(x, under=c))]
+        if not cands:
+            return None
+        return min(cands, key=lambda x: abs(x["exp"] - exp) / 86400 / max(3.0, dte) + abs(x["K"] - K) / S * 10)
 
     def value_of(self, c, S):
         return self.pos.get(c, 0) * self.mark(c, S)
@@ -2253,6 +2352,10 @@ class OptionSim(Sim):
         K = round((S * (1 + otm) if typ == "call" else S * (1 - otm)) / step) * step
         exp = next_expiry(self.now, int(g.get("odte", 14) or 14))
         self.opt[c] = dict(type=typ, K=K, exp=exp, under=c)
+        real = self._pick_listed(c, typ, K, exp, S) if self.book else None
+        if real:  # a past day with real option history: trade the listed contract at what it really traded at
+            self.opt[c].update(K=real["K"], exp=real["exp"], symbol=real["symbol"])
+            K, step = real["K"], strike_step(S)
         prem = self.mark_one(c, S)
         if (PREM_RANGE[0] or PREM_RANGE[1]) and not prem_ok(prem / CONTRACT):
             # outside the price range: walk the strike (further out of the money = cheaper, closer in = dearer)
@@ -2263,6 +2366,7 @@ class OptionSim(Sim):
                 if K <= 0:
                     break
                 self.opt[c]["K"] = K
+                self.opt[c].pop("symbol", None)  # walked off the real contract: estimated from here
                 prem = self.mark_one(c, S)
                 if prem_ok(prem / CONTRACT):
                     break
@@ -2299,14 +2403,25 @@ class OptionSim(Sim):
         self.cost[c] = cost
         self.tbars.append(n)
         self.last = dict(side="buy", coin=c, qty=qty, price=fill, usd=cost, pl=None, contract=dict(self.opt[c]))
+        self._count_fill(self.opt[c])
         return True
 
     def mark_one(self, c, S):
         o = self.opt.get(c)
         if not o:
             return 0.0
+        real = self._real_px(o) if self.book else None
+        if real:
+            return real
         T = max(0.0, o["exp"] - self.now) / YEAR
         return bs_price(S, o["K"], T, self._vol(c), o["type"]) * CONTRACT
+
+    def _count_fill(self, o):
+        if self.book is not None:
+            if self._real_px(o):
+                self.real_fills += 1
+            else:
+                self.est_fills += 1
 
     def buy(self, c, px, n=0, mult=1.0):
         o = self.opt.get(c)
@@ -2322,6 +2437,7 @@ class OptionSim(Sim):
             return False
         o = dict(self.opt.get(c) or {})
         prem = self.mark_one(c, px)
+        self._count_fill(o)
         expired = o and self.now >= o["exp"]
         slip = half_spread(c, prem / CONTRACT) if (self.genes or {}).get("flatby") else self.slip
         fill = prem if expired else prem * (1 - slip)
@@ -5399,13 +5515,15 @@ def load_knowledge(path):
 SCAN_CASH = 100000.0  # pretend money each scalper gets on each ticker it's tried on (big enough for one contract)
 
 
-def _scan_one(g, sym, bars, day_start, ctx=None, feed=None):
+def _scan_one(g, sym, bars, day_start, ctx=None, feed=None, book=None):
     """Replays one scalper (plain genes) over one ticker's 1-minute bars. Only trades from day_start on count;
     earlier bars just warm up its indicators. ctx: {'VIXY': closes, 'SPY': closes} lined up with this ticker's bars, so
     its volatility gate and market studies see what they would have seen. -> dict of its day there."""
     v = Variant(g["name"], dict(g["params"]), make_sim(SCAN_CASH, 0.0, 0.05), 2, g.get("tf", 1), g.get("risk"),
                 g.get("traits"), g.get("vetoes"), g.get("layers"))
     v.sim.genes = v.traits
+    if book:
+        v.sim.book = {sym: book}
     c, L = bars["c"], len(bars["c"])
     ctx = ctx or {}
     out = dict(trades=0, wins=0, pl=0.0, paid=0.0, now=None, open=None, best=None, worst=None)
@@ -5439,6 +5557,7 @@ def _scan_one(g, sym, bars, day_start, ctx=None, feed=None):
         o = v.sim.opt.get(sym) or {}
         worth = v.sim.value_of(sym, c[-1])
         out["open"] = dict(kind=o.get("type", ""), pl=worth - v.sim.cost.get(sym, 0), paid=v.sim.cost.get(sym, 0))
+    out["real"], out["est"] = v.sim.real_fills, v.sim.est_fills
     return out
 
 
@@ -5450,6 +5569,7 @@ def scan_scalps(job):
     _SPREAD_LOADED[0] = True
     IV_HINT.update(job.get("iv") or {})
     ctx_bars = job.get("ctx") or {}
+    books = job.get("opt") or {}
     if job.get("sspread"):
         SCALP_SPREAD[0] = float(job["sspread"])
     day0 = ny_time(job["day"], 9, 30)
@@ -5461,18 +5581,20 @@ def scan_scalps(job):
         start = next((i for i, t in enumerate(bars["t"]) if t >= day0), len(bars["t"]))
         if start >= len(bars["t"]) - 1:
             continue
-        tk_ = dict(trades=0, wins=0, pl=0.0, paid=0.0, best=None, best_pl=None, setups=0)
+        tk_ = dict(trades=0, wins=0, pl=0.0, paid=0.0, best=None, best_pl=None, setups=0, real=0, est=0)
         ctx = {k: align_ctx(bars["t"], cb["t"], cb["c"]) for k, cb in ctx_bars.items() if cb.get("t")}
         tk_["regime"] = vol_regime({sym: bars["c"]}, {CTX_KEY: ctx}, sym)[0] if ctx else ""
         for g in job["genes"]:
             try:
-                r = _scan_one(g, sym, bars, start, ctx, feed)
+                r = _scan_one(g, sym, bars, start, ctx, feed, books.get(sym))
             except Exception:
                 continue
             pl = r["pl"] + (r["open"]["pl"] if r["open"] else 0.0)
             paid = r["paid"] + (r["open"]["paid"] if r["open"] else 0.0)
             tk_["trades"] += r["trades"]
             tk_["wins"] += r["wins"]
+            tk_["real"] += r.get("real", 0)
+            tk_["est"] += r.get("est", 0)
             tk_["pl"] += pl
             tk_["paid"] += paid
             tk_["setups"] += r["trades"] + (1 if r["open"] else 0)
