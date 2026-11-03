@@ -1614,6 +1614,34 @@ SCALP_NEEDS = {"maxhold": (3, 20), "flatby": (10, 30), "odte": (1, 5), "vixmode"
 
 
 SCALP_ONLY = ("flatby", "vixmode", "vixwide")  # genes only scalpers carry
+BREED_ONLY = SCALP_ONLY + ("kami",)            # genes no ordinary egg grows by chance
+
+# The kamikaze breed's envelope: cheap far-out contracts with little time left, a huge target and almost no stop, so
+# each bet is all-or-nothing. They trade tiny (KAMI_SAY of a normal bot's say in your account) and every one of them
+# carries one or two untested rules, whose results the farm learns from (its "trial book").
+KAMI_RISK = {"sl": (80.0, 95.0), "tp": (150.0, 500.0)}
+KAMI_TRAITS = {"otm": (3.0, 12.0), "odte": (1, 7), "maxhold": (5, 60)}
+KAMI_SAY = 0.3
+
+
+def is_kami(v_or_traits):
+    t = v_or_traits.traits if hasattr(v_or_traits, "traits") else (v_or_traits or {})
+    return bool((t or {}).get("kami"))
+
+
+def kami_shape(rng, risk, traits):
+    """(risk, traits) pulled inside the kamikaze envelope (idempotent)."""
+    r = dict(clean_risk(risk))
+    for k, (lo, hi) in KAMI_RISK.items():
+        val = float(r.get(k) or 0) or rng.uniform(lo, hi)
+        r[k] = round(min(max(val, lo), hi), 2)
+    t = {k: x for k, x in clean_traits(traits).items() if k not in SCALP_ONLY}
+    t["kami"] = 1
+    for k, (lo, hi) in KAMI_TRAITS.items():
+        if not t.get(k):
+            t[k] = rng.uniform(lo, hi) if isinstance(lo, float) else rng.randint(lo, hi)
+        t[k] = min(max(t[k], lo), hi)
+    return r, clean_traits(t)
 
 
 def scalp_shape(rng, tf, risk, traits):
@@ -1871,6 +1899,9 @@ DEFAULT_SETTINGS = {
     "luck_check": True,          # a bot's score counts for less when it rests on only a few trades
     "long_holds": True,          # include slow, longer-holding bots from the start
     "show_broker_value": True,   # a tile with your Alpaca account's own value (logged in)
+    "hindsight": True,           # bots learn from what would have worked (hindsight studies), and new eggs start from it
+    "kamikazes": True,           # the kamikaze breed: all-or-nothing bets on cheap contracts, and the farm's rule testers
+    "kami_share": 10,            # % of the farm kept for kamikazes (they have only a small say in your account)
     "scalpers": True,            # the scalp breed: fast in-and-out bots (tight stop + target, time limit, flat by the close)
     "scalp_share": 25,
     "scalp_spread": 8.0,         # scalpers skip contracts whose bid/ask gap is wider than this % of the price           # % of the fast farm kept for scalpers (they can win up to twice that; needs 5-min bars or faster)
@@ -2372,7 +2403,9 @@ def tournament_opts(settings):
                 classics=bool(settings.get("classics", True)), classic_rate=float(settings.get("classic_rate", 25)) / 100,
                 vetoes=bool(settings.get("vetoes", True)), layers=bool(settings.get("layers", True)),
                 long_holds=bool(settings.get("long_holds", True)),
-                scalp_share=scalp_share(settings),
+                scalp_share=scalp_share(settings), hindsight=bool(settings.get("hindsight", True)),
+                kami_share=(min(0.3, max(0.0, float(settings.get("kami_share", 10) or 0) / 100))
+                            if settings.get("kamikazes", True) else 0.0),
                 coin_prefs=bool(settings.get("coin_prefs", True)), confidence_sizing=bool(settings.get("confidence_sizing", True)),
                 twin_test=bool(settings.get("twin_test", True)), elders=bool(settings.get("elders", True)),
                 seasons=bool(settings.get("seasons", True)),
@@ -2449,6 +2482,7 @@ TRAITS = {
     "oexit":   dict(lo=1, hi=10, kind=int, text=lambda v: f"gets out {v} day{'s' if v != 1 else ''} before expiry"),
     "flatby":  dict(lo=5, hi=45, kind=int, text=lambda v: f"scalper: flat {v} min before the close, never overnight"),
     "vixmode": dict(lo=1, hi=5, kind=int, text=lambda v: VIX_MODES.get(int(v), VIX_MODES[5])),
+    "kami":    dict(lo=1, hi=1, kind=int, text=lambda v: "kamikaze: all-or-nothing bets on cheap contracts, and a rule tester"),
     "vixwide": dict(lo=1.2, hi=3.0, kind=float, text=lambda v: f"widens its stop and target up to {v:g}x when volatility jumps"),
     "moods":   dict(lo=1, hi=14, kind=int, text=lambda v: "trades only when " + " / ".join(
         m for i, m in enumerate(MOODS) if v & (1 << i))),
@@ -2459,7 +2493,7 @@ TRAIT_NAMES = {"trail": "Trailing stop", "maxhold": "Max hold", "minhold": "Min 
                "omode": "Calls / puts (1 calls, 2 puts, 3 both)", "odte": "Days to expiry", "otm": "% out of the money",
                "oexit": "Exit days before expiry", "flatby": "Flat before the close (minutes, scalpers)",
                "vixmode": "Volatility gate (1 calm, 2 rising, 3 spikes, 4 not spikes, 5 any)",
-               "vixwide": "Wider exits when volatility jumps (x)"}
+               "vixwide": "Wider exits when volatility jumps (x)", "kami": "Kamikaze (1 = yes)"}
 
 
 def clean_traits(t):
@@ -3218,6 +3252,8 @@ class Tournament:
     def _new(self, name, params, tf=1, risk=None, traits=None, vetoes=None, layers=None):
         if is_scalp(name):  # the scalp breed always stays inside its envelope, however it was bred
             tf, risk, traits = scalp_shape(self.rng, tf, risk, traits)
+        elif traits and traits.get("kami"):  # the kamikaze breed stays inside its envelope too
+            risk, traits = kami_shape(self.rng, risk, traits)
         elif traits and any(k in traits for k in SCALP_ONLY):
             traits = {k: x for k, x in traits.items() if k not in SCALP_ONLY}
         v = Variant(name, params, make_sim(self.start_cash, self.fee, self.pct, slip=self.o.get("slip", 0.0)),
@@ -3239,6 +3275,101 @@ class Tournament:
         v.rt_cost = 2 * (self.fee + self.o.get("slip", 0.0))
         v.fee_guard = 2 * (self.fee + self.o.get("slip", 0.0)) if self.o.get("fee_aware", True) else 0.0
         return v
+
+    # ---- the kamikaze breed: daring bets, and the farm's rule testers ----
+    def kami_target(self):
+        sh = float(self.o.get("kami_share", 0) or 0)
+        return 0 if sh <= 0 else max(1, int(round(self.cap * sh)))
+
+    def kamikazes(self):
+        return [v for v in self.vars if is_kami(v)]
+
+    def trial_rules(self):
+        """One or two rules a kamikaze tries for the farm: never-rules and studies the farm hasn't much evidence on yet
+        (the least-tested first), so the good bots don't have to pay for finding out what fails."""
+        book = getattr(self, "trial_book", {})
+        pool = [k for k in VETOES if self.rule_allowed(k)]
+        pool.sort(key=lambda k: (book.get(f"rule:{k}", [0, 0])[0], self.rng.random()))
+        vt = {k: self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"]) for k in pool[:self.rng.randint(1, 2)]}
+        ly = self.rand_layers(0.5) if self.o.get("layers", True) else {}
+        return clean_vetoes(vt), ly
+
+    def spawn_kami(self, closes=None):
+        """Hatches one kamikaze: any instinct, all-or-nothing contracts, and one or two rules on trial."""
+        if len(self.vars) >= self.cap:
+            cands = [v for v, _ in reversed(self.ranking()) if v not in self.active and not is_kami(v)
+                     and not is_scalp(v.name) and sum(1 for x in self.vars if x.name == v.name) > 1]
+            if not cands:
+                return None
+            self._remove(cands[0], "made room for a kamikaze")
+        name = self.rng.choice(WILDCARD_STRATS)
+        vt, ly = self.trial_rules()
+        v = self._new(name, self._rand_params(name), self.rng.choice((1, 2, 3, 5)), None, dict(kami=1), vt, ly)
+        self._register(v, [], "kamikaze")
+        v.trials = sorted(vt)
+        if closes:
+            self.replay(v, closes)
+        self.vars.append(v)
+        self.events.append(f"Kamikaze egg: {v.label}")
+        return v
+
+    def kami_learn(self, v):
+        """A kamikaze leaving the farm hands in what its trial rules did: the farm's trial book grows, and never-rules that
+        kept saving money become more likely in ordinary eggs (costly ones less likely)."""
+        book = self.__dict__.setdefault("trial_book", {})
+        for k, st in (v.veto_stats or {}).items():
+            b = book.setdefault(f"rule:{k}", [0, 0.0])
+            b[0] += st[0]
+            b[1] += st[1]
+        for k, st in (v.layer_stats or {}).items():
+            b = book.setdefault(f"study:{k}", [0, 0.0])
+            b[0] += st[0]
+            b[1] += st[1]
+        for k, st in (v.veto_stats or {}).items():  # proven by a kamikaze: the post-trade review hears about it
+            if st[0] >= 3:
+                rv = self.review.setdefault(k, [0, 0])
+                rv[0 if st[1] > 0 else 1] += int(st[0] // 3)
+
+    def kami_balance(self, closes):
+        tgt, ks = self.kami_target(), self.kamikazes()
+        if not tgt:
+            for v in ks:
+                self._remove(v, "kamikazes switched off")
+            return
+        for _ in range(min(1, tgt - len(ks))):
+            self.spawn_kami(closes)
+        ks = self.kamikazes()
+        if len(ks) > tgt * 2:
+            for v in [v for v, _ in reversed(self.ranking()) if is_kami(v) and v not in self.active][:len(ks) - tgt * 2]:
+                self._remove(v, "too many kamikazes")
+
+    # ---- hindsight: what would have worked, recorded so new eggs start from it ----
+    def learn_hindsight(self, res):
+        """Records a hindsight study: per instinct, how often its settings would have made money (on the stretch AND on
+        the part after it they didn't see), and the best settings found. Older evidence slowly counts for less."""
+        book = self.__dict__.setdefault("hindsight", {})
+        for e in book.values():
+            e["tries"] *= 0.9
+            e["wins"] *= 0.9
+        for r in res.get("results", []):
+            g = r["genes"]
+            e = book.setdefault(g["name"], dict(tries=0.0, wins=0.0, best=[]))
+            e["tries"] += 1
+            if r["ok"]:
+                e["wins"] += 1
+                e["best"].append(dict(genes=g, score=r["check_ret"], at=res.get("at", 0)))
+                e["best"] = sorted(e["best"], key=lambda x: -x["score"])[:5]
+
+    def hindsight_genes(self):
+        """Genes for a new egg from the hindsight book (weighted by how often each instinct would have worked), or None."""
+        book = getattr(self, "hindsight", {}) or {}
+        cands = [(n, e) for n, e in book.items() if e["best"] and n in STRATS and n in WILDCARD_STRATS]
+        if not cands or not self.o.get("hindsight", True):
+            return None
+        n, e = self.rng.choices(cands, weights=[(x["wins"] + 1) / (x["tries"] + 2) for _, x in cands])[0]
+        g = json.loads(json.dumps(self.rng.choice(e["best"][:3])["genes"]))
+        g["params"] = self.mutate(n, g["params"], 0.15)
+        return g
 
     # ---- the scalp breed ----
     def scalp_target(self):
@@ -3308,6 +3439,8 @@ class Tournament:
     def rand_traits(self, chance=0.3):
         t = {}
         for k, spec in TRAITS.items():
+            if k == "kami":
+                continue
             if self.rng.random() < chance:
                 v = self.rng.uniform(spec["lo"], spec["hi"])
                 if k == "moods":
@@ -3535,6 +3668,8 @@ class Tournament:
     def mutate_traits(self, t):
         out = dict(t)
         for k, spec in TRAITS.items():
+            if k == "kami":  # a breed, not a habit: never switched on or off by mutation
+                continue
             roll = self.rng.random()
             if roll < 0.08 * self.mut_bias("traits"):  # switch a trait on or off
                 if k in out:
@@ -3578,6 +3713,11 @@ class Tournament:
                                    gen=v.gen, origin=origin, born=self.n, died=None, why="", ret=None, inducted=False)
 
     def _remove(self, v, why):
+        if v in self.vars and is_kami(v):
+            try:
+                self.kami_learn(v)
+            except Exception:
+                pass
         if v in self.vars:
             self.vars.remove(v)
             if self.o.get("elders", True) and v.ntrades >= 3 and v.eq:
@@ -3855,6 +3995,8 @@ class Tournament:
                 w *= 0.6  # failed its twin test: probably lucky, so it counts for less
             if w > 0 and o.get("luck_check", True):
                 w *= luck_factor(v)
+            if w > 0 and is_kami(v):
+                w *= KAMI_SAY  # kamikazes are tried, never trusted much
             scn = [a + b for a, b in zip(getattr(v, "scan", None) or [0, 0, 0.0, 0.0],
                                          getattr(v, "roam_scan", None) or [0, 0, 0.0, 0.0])]  # [trades, wins, pl, paid]
             if w > 0 and scn[0] >= 10 and scn[3] > 0:  # scalp scan today + scalp roams in the past, on other tickers
@@ -4036,6 +4178,7 @@ class Tournament:
         for _ in range(min(3, self.cap - len(self.vars))):  # keep filling up to the limit
             self._spawn_or_random(closes)
         self.scalp_balance(closes)
+        self.kami_balance(closes)
         self.evolves += 1
         k_isl = int(self.o.get("islands", 1) or 1)
         if k_isl > 1 and self.evolves % 8 == 0:
@@ -4316,6 +4459,17 @@ class Tournament:
         weakest duplicate. A scalpers-only farm (the live scalp lab) hatches a scalper instead."""
         if self.o.get("scalp_only"):
             return self.spawn_scalp(closes)
+        hg = self.hindsight_genes() if self.rng.random() < 0.6 else None
+        if hg:  # an egg from what would have worked, rather than a random one
+            if len(self.vars) >= self.cap:
+                cands = [v for v, _ in reversed(self.ranking()) if v not in self.active
+                         and sum(1 for x in self.vars if x.name == v.name) > 1]
+                if not cands:
+                    return None
+                self._remove(cands[0], "dropped to make room")
+            return self.add_variant(hg["name"], hg["params"], closes, note="Hindsight egg:", tf=hg.get("tf", 1),
+                                    origin="hindsight", risk=hg.get("risk"), traits=hg.get("traits"),
+                                    vetoes=hg.get("vetoes"), layers=hg.get("layers"))
         name = self.rng.choice(WILDCARD_STRATS)
         p = self._rand_params(name)
         if len(self.vars) >= self.cap:
@@ -4396,7 +4550,8 @@ class Tournament:
         return dict(version=1, n=self.n, serial=self.serial, cap=self.cap, coins=self.coins, start_cash=self.start_cash,
                     elders=self.elders[-40:], champions=self.champions, season=self.season,
                     review=self.review, mut_stats=self.mut_stats, evolves=self.evolves,
-                    seasons_log=self.seasons_log[-50:],
+                    seasons_log=self.seasons_log[-50:], hindsight=getattr(self, "hindsight", {}),
+                    trial_book=getattr(self, "trial_book", {}),
                     hold_curve=list(getattr(self, "hold_curve", []))[-(self.W * 10 + 2):], bots=bots,
                     lineage={str(k): v for k, v in lineage.items()})
 
@@ -4476,6 +4631,8 @@ class Tournament:
         self.champions = dict(st.get("champions") or {})
         self.season = st.get("season")
         self.seasons_log = [tuple(x) for x in st.get("seasons_log") or []]
+        self.hindsight = dict(st.get("hindsight") or {})
+        self.trial_book = {k: list(x) for k, x in (st.get("trial_book") or {}).items()}
         hc = st.get("hold_curve") or [1.0]
         self.hold_curve = deque(hc, maxlen=self.W * 10 + 2)
         self._rate()
@@ -4900,9 +5057,86 @@ def slice_extra(extra, i):
     return {c: {k: View(v, i) for k, v in d.items()} for c, d in extra.items() if d}
 
 
+# ---------------- Hindsight: which instincts and settings WOULD have worked on a stretch of the past ----------------
+def _hs_run(g, closes, extra, a, z, start_cash, fee, pct, slip):
+    """One candidate traded from bar a to bar z: (return, closed trades, wins, best trade %, worst trade %)."""
+    coins = list(closes)
+    b = _bt_bot(g, coins, start_cash, fee, pct, slip)
+    closed = wins = 0
+    best = worst = None
+    for i in range(a, z):
+        for _, t in bot_step(b, {c: View(closes[c], i + 1) for c in coins}, i, coins, slice_extra(extra, i + 1) if extra else None):
+            if t["side"] == "sell" and t.get("pl") is not None:
+                closed += 1
+                wins += t["pl"] > 0
+                paid = t["usd"] - t["pl"]
+                if paid > 0:
+                    pc = t["pl"] / paid * 100
+                    best = pc if best is None else max(best, pc)
+                    worst = pc if worst is None else min(worst, pc)
+    return b.sim.equity({c: closes[c][z - 1] for c in coins}) / start_cash - 1, closed, wins, best, worst
+
+
+def hindsight_study(closes, extra, start_cash, fee, pct, slip, rng, n=48, prior=None, stop=None, progress=None,
+                    risk_caps=None):
+    """Looks back over a stretch: many instincts and settings are tried on its first 70% (the look-back), the most
+    promising are checked on the last 30% they never saw (the check). A candidate 'would have worked' when it made
+    money on both, with at least 3 finished trades. prior: the farm's hindsight book (its best settings are tried again,
+    tweaked, so good finds get refined). -> dict(results=[...], look_bars, check_bars)"""
+    coins = list(closes)
+    L = min(len(closes[c]) for c in coins)
+    a0 = max(WARM, min(L - 2, max(60, LOOKBACK // 2)))
+    cut = a0 + int((L - a0) * 0.7)
+    if cut - a0 < 60 or L - cut < 30:
+        raise NoHistory("too few candles for a hindsight study")
+    caps = dict(risk_caps or FAST_RISK)
+    cands = []
+    for e in (prior or {}).values():  # refine what worked before
+        for b in (e.get("best") or [])[:2]:
+            g = json.loads(json.dumps(b["genes"]))
+            if g.get("name") in STRATS:
+                cands.append(g)
+    names = list(WILDCARD_STRATS)
+    while len(cands) < n:
+        nm = rng.choice(names)
+        spec, p = STRATS[nm], {}
+        for k, dv in spec["params"].items():
+            lo, hi = spec["bounds"][k]
+            p[k] = int(round(rng.uniform(lo, hi))) if isinstance(dv, int) else round(rng.uniform(lo, hi), 2)
+        if len(cands) % 4 == 0:
+            p = dict(spec["params"])  # the instinct's usual settings, too
+        p = fix_params(nm, p)
+        risk = {k: (round(rng.uniform(lo, caps.get(k, hi) * 0.5), 2) if rng.random() < 0.5 else 0.0)
+                for k, (lo, hi) in RISK_BOUNDS.items()}
+        cands.append(dict(name=nm, params=p, tf=rng.choice((1, 2, 3, 5, 10)), risk=risk, traits={}, vetoes={}, layers={}))
+    cands = cands[:n]
+    looked = []
+    for i, g in enumerate(cands):
+        if stop and stop():
+            raise TrainingStopped()
+        ret, closed, wins, best, worst = _hs_run(g, closes, extra, a0, cut, start_cash, fee, pct, slip)
+        looked.append((g, ret, closed, wins, best, worst))
+        if progress:
+            progress(i + 1, len(cands) + 12)
+    top = sorted([x for x in looked if x[2] >= 3], key=lambda x: -x[1])[:12]
+    out = []
+    for j, (g, ret, closed, wins, best, worst) in enumerate(top):
+        if stop and stop():
+            raise TrainingStopped()
+        cret, cclosed, cwins, cbest, cworst = _hs_run(g, closes, extra, cut, L, start_cash, fee, pct, slip)
+        out.append(dict(genes=g, look_ret=ret, check_ret=cret, closed=closed + cclosed, wins=wins + cwins,
+                        best=max(x for x in (best, cbest) if x is not None) if (best is not None or cbest is not None) else None,
+                        worst=min(x for x in (worst, cworst) if x is not None) if (worst is not None or cworst is not None) else None,
+                        ok=ret > 0 and cret > 0 and closed >= 3))
+        if progress:
+            progress(len(cands) + j + 1, len(cands) + 12)
+    out.sort(key=lambda r: (not r["ok"], -r["check_ret"]))
+    return dict(results=out, tried=len(cands), look_bars=cut - a0, check_bars=L - cut, at=time.time())
+
+
 # ---------------- Farm knowledge: everything a farm has learned, as items you can save, view and add elsewhere ----------------
 KNOW_KINDS = ("Never-rule", "Study", "Instinct", "Volatility gate", "Season champion", "Elder", "Mutation lesson",
-              "Proven bot", "Ticker habit")
+              "Proven bot", "Hindsight", "Ticker habit")
 KNOW_FORMAT = "obf-knowledge"
 
 
@@ -5019,6 +5253,23 @@ def farm_knowledge(t):
                           detail=v.label[:160], evidence=f"{sc_of[id(v)] * 100:+.1f}% recently; {v.wins} wins, {v.losses} losses",
                           score=round(sc_of[id(v)] * 100, 3), strong=t.info.get(id(v), {}).get("status") == "active",
                           data=dict(genes=_genes(v))))
+    for nm, e in (getattr(t, "hindsight", {}) or {}).items():  # what would have worked
+        if not e.get("best"):
+            continue
+        b0 = e["best"][0]
+        items.append(dict(id=f"hindsight:{nm}", kind="Hindsight", title=f"{nm} would have worked",
+                          detail=", ".join(f"{k}={x}" for k, x in b0["genes"]["params"].items())[:160],
+                          evidence=f"worked in {e['wins']:.0f} of {e['tries']:.0f} looks back; best {b0['score'] * 100:+.1f}% on unseen prices",
+                          score=round(b0["score"] * 100, 3), strong=e["wins"] >= 2, data=dict(genes=b0["genes"])))
+    for k, (n_, saved) in (getattr(t, "trial_book", {}) or {}).items():  # what the kamikazes found out
+        if n_ < 3:
+            continue
+        kind_, key_ = k.split(":", 1)
+        title = (VETOES[key_]["name"] if kind_ == "rule" and key_ in VETOES else key_) + " (tested by kamikazes)"
+        items.append(dict(id=f"trial:{k}", kind="Never-rule" if kind_ == "rule" else "Study", title=title,
+                          detail="tried first by throwaway kamikaze bots", evidence=f"{n_:.0f} decisions, {saved / n_:+.2f}% each",
+                          score=round(saved / n_, 3), strong=n_ >= 5 and saved > 0, data=dict(key=key_, value=(VETOES[key_]["lo"] + VETOES[key_]["hi"]) / 2
+                                                                                              if key_ in VETOES else 0, n=n_, saved=saved)))
     bad = {}
     for v in t.vars:
         for c, x in (v.coin_pl or {}).items():
@@ -5060,7 +5311,7 @@ def apply_knowledge(t, items, closes=None):
                     g["vetoes"] = dict(g["vetoes"], **{d["key"]: d["value"]})
                     _know_hatch(t, g, closes, "Knowledge egg (never-rule):")
                 notes.append(f"{it['title']}: new eggs favour it" + (", and an egg of your best bot carries it" if g else ""))
-            elif k in ("Study", "Instinct", "Proven bot", "Volatility gate"):
+            elif k in ("Study", "Instinct", "Proven bot", "Volatility gate", "Hindsight"):
                 g = d.get("genes")
                 if not g:
                     notes.append(f"{it['title']}: nothing to hatch (no bot carries it)")
