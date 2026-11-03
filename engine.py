@@ -3516,6 +3516,7 @@ class Tournament:
                       prove_live=True, risk_adjusted=True, long_holds=True, classics=True, classic_rate=0.25, vetoes=True,
                       layers=True)
         self.replaying = False
+        self.conds = []  # today's conditions (wild/calm, time of day, news day), set on every decision
         self.o.update(opts or {})
         if self.o.get("prem"):  # worker processes get the contract price range this way
             set_prem_range(*self.o["prem"])
@@ -4287,7 +4288,7 @@ class Tournament:
         n_all = max(1, len(v.eq) - 1)
         overall = (v.eq[-1] / v.eq[0] - 1) / n_all if len(v.eq) > 1 and v.eq[0] > 0 else 0.0
         m = 1.0
-        for cd in self.conds:
+        for cd in getattr(self, "conds", None) or []:
             f = cond_fit(v, cd)
             if f is None:
                 continue
@@ -4394,7 +4395,7 @@ class Tournament:
                 fit = self.mood_fit(v)
                 if fit is not None:
                     w *= 1.25 if fit > 0 else 0.8
-            if w > 0 and o.get("cond_aware", True) and self.conds:
+            if w > 0 and o.get("cond_aware", True) and getattr(self, "conds", None):
                 w *= self.cond_mult(v)
             info[id(v)] = dict(score=sc, cons=cons, weight=w, stake=0.0, status=status, failing=failing,
                                edge=edge, behind=behind, proving=proving and status == "slowed" and not behind,
