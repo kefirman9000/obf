@@ -3629,7 +3629,7 @@ class Tournament:
     def spawn_kami(self, closes=None):
         """Hatches one kamikaze: any instinct, all-or-nothing contracts, and one or two rules on trial."""
         if len(self.vars) >= self.cap:
-            cands = [v for v, _ in reversed(self.ranking()) if v not in self.active and not is_kami(v)
+            cands = [v for v, _ in self.weakest() if v not in self.active and not is_kami(v)
                      and not is_scalp(v.name) and sum(1 for x in self.vars if x.name == v.name) > 1]
             if not cands:
                 return None
@@ -3672,7 +3672,7 @@ class Tournament:
             self.spawn_kami(closes)
         ks = self.kamikazes()
         if len(ks) > tgt * 2:
-            for v in [v for v, _ in reversed(self.ranking()) if is_kami(v) and v not in self.active][:len(ks) - tgt * 2]:
+            for v in [v for v, _ in self.weakest() if is_kami(v) and v not in self.active][:len(ks) - tgt * 2]:
                 self._remove(v, "too many kamikazes")
 
     # ---- hindsight: what would have worked, recorded so new eggs start from it ----
@@ -3757,7 +3757,7 @@ class Tournament:
         if par is None and ranked and self.rng.random() < 0.6:
             par = ranked[0]
         if len(self.vars) >= self.cap:
-            cands = [v for v, _ in reversed(self.ranking()) if v not in self.active and not is_scalp(v.name)]
+            cands = [v for v, _ in self.weakest() if v not in self.active and not is_scalp(v.name)]
             cands = [v for v in cands if sum(1 for x in self.vars if x.name == v.name) > 1] or cands
             if not cands:
                 return None
@@ -3795,7 +3795,7 @@ class Tournament:
         most = max(tgt, min(tgt * 2, int(self.cap * 0.6)))
         sc = self.scalpers()
         if len(sc) > most:
-            weak = [v for v, _ in reversed(self.ranking()) if is_scalp(v.name) and v not in self.active]
+            weak = [v for v, _ in self.weakest() if is_scalp(v.name) and v not in self.active]
             for v in weak[:len(sc) - most]:
                 self._remove(v, "too many scalpers")
                 self.events.append(f"Dropped {v.label} (the scalp den was full)")
@@ -4424,6 +4424,21 @@ class Tournament:
                 d["stake"] *= v.size_mult
         self.info = info
 
+    def young(self, v):
+        """Still within its first window of decisions: too new to judge, so never dropped to make room."""
+        return self.score(v) is None and v.age < self.window_for(v.tf)
+
+    def weakest(self):
+        """Who goes first when room is needed, as (bot, score) pairs: bots that have had a full window and still
+        can't be scored (they hardly trade) first, then the scored ones from the bottom of the ranking. Bots too young
+        to judge are left alone, so new eggs get their chance and the farm doesn't fill with unjudged eggs."""
+        stuck = sorted((v for v in self.vars if self.score(v) is None and not self.young(v)), key=lambda v: len(v.sim.tbars))
+        return [(v, None) for v in stuck] + list(reversed(self.ranking()))
+
+    def nursery_full(self):
+        """True when too many bots are still too young to judge (40% of the farm): extra eggs then wait."""
+        return sum(1 for v in self.vars if self.young(v)) >= 0.4 * max(1, self.cap)
+
     def ranking(self):
         r = [(v, self.score(v)) for v in self.vars]
         if self.o.get("luck_check", True):  # breeding and culling also trust long records over short lucky ones
@@ -4593,7 +4608,7 @@ class Tournament:
             if not best:
                 continue
             if len(self.vars) >= self.cap:
-                cands = [v for v, _ in reversed(self.ranking()) if v not in self.active and v is not best]
+                cands = [v for v, _ in self.weakest() if v not in self.active and v is not best]
                 if not cands:
                     continue
                 self._remove(cands[0], "dropped to make room")
@@ -4685,7 +4700,7 @@ class Tournament:
         if v:
             ch["uid"] = v.uid
             if len(self.vars) > self.cap:
-                cands = [x for x, _ in reversed(self.ranking()) if x not in self.active and x is not v]
+                cands = [x for x, _ in self.weakest() if x not in self.active and x is not v]
                 if cands:
                     self._remove(cands[0], "dropped to make room")
 
@@ -4735,7 +4750,7 @@ class Tournament:
             parent = r[0][0]
         fam = sum(1 for x in self.vars if x.name == parent.name)
         if fam >= self.family_cap or len(self.vars) >= self.cap:
-            cands = [v for v, _ in reversed(self.ranking()) if v is not parent and v not in self.active
+            cands = [v for v, _ in self.weakest() if v is not parent and v not in self.active
                      and sum(1 for x in self.vars if x.name == v.name) > 1]
             if fam >= self.family_cap:
                 cands = [v for v in cands if v.name == parent.name]
@@ -4856,7 +4871,7 @@ class Tournament:
         hg = self.hindsight_genes() if self.rng.random() < self.hindsight_share() else None
         if hg:  # an egg from what would have worked, rather than a random one
             if len(self.vars) >= self.cap:
-                cands = [v for v, _ in reversed(self.ranking()) if v not in self.active
+                cands = [v for v, _ in self.weakest() if v not in self.active
                          and sum(1 for x in self.vars if x.name == v.name) > 1]
                 if not cands:
                     return None
@@ -4870,7 +4885,7 @@ class Tournament:
         name = self.rng.choice(WILDCARD_STRATS)
         p = self._rand_params(name)
         if len(self.vars) >= self.cap:
-            cands = [v for v, _ in reversed(self.ranking()) if v not in self.active
+            cands = [v for v, _ in self.weakest() if v not in self.active
                      and sum(1 for x in self.vars if x.name == v.name) > 1]
             if cands:
                 self._remove(cands[0], "dropped to make room")
@@ -5440,7 +5455,7 @@ def warm_islands(coins, start_cash, fee, pct, evolve, params, opts, cap, retire_
         return None
     t.cap = cap
     while len(t.vars) > cap:
-        worst = [v for v, _ in reversed(t.ranking()) if v not in t.active] or \
+        worst = [v for v, _ in t.weakest() if v not in t.active] or \
             [v for v in t.vars if t.info.get(id(v), {}).get("status") == "warming up"]
         if not worst:
             break
@@ -5755,7 +5770,7 @@ def _know_hatch(t, g, closes, note):
     if have is not None:  # already on this farm (another item pointed at the same bot)
         return have
     if len(t.vars) >= t.cap:
-        cands = [v for v, _ in reversed(t.ranking()) if v not in t.active] or [v for v in t.vars if v not in t.active]
+        cands = [v for v, _ in t.weakest() if v not in t.active] or [v for v in t.vars if v not in t.active]
         if cands:
             t._remove(cands[0], "made room for a knowledge egg")
     return t.add_variant(g["name"], g["params"], closes, 1.0, note=note, tf=g.get("tf", 1), origin="knowledge",

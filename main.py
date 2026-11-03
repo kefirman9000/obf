@@ -4478,7 +4478,15 @@ class App:
                                    best=[b.get("score") for b in e.get("best", [])]) for k, e in (getattr(t, "hindsight", {}) or {}).items()},
                 hindsight_share=t.hindsight_share(), trial_book=getattr(t, "trial_book", {}),
                 rule_review=t.review, mutation_stats=t.mut_stats, elders=len(t.elders), knowledge=know,
-                top_bots=self._bot_rows(t), events=list(getattr(t, "events", []))[-40:])
+                top_bots=self._bot_rows(t), events=list(getattr(t, "events", []))[-40:],
+                all_bots=[dict(nickname=E.bot_nickname(v.key()), strategy=v.name, tf=v.tf, origin=v.origin,
+                               status=t.info.get(id(v), {}).get("status"), age=v.age, live_n=v.live_n,
+                               eq=f"{len(v.eq)}/{v.eq.maxlen}", trades_in_window=len(v.sim.tbars), trades=v.ntrades,
+                               wins=v.wins, losses=v.losses, young=t.young(v), bad=getattr(v, "bad", 0),
+                               ret_pct=round((v.eq[-1] / v.sim.start - 1) * 100, 2) if v.eq and v.sim.start else None)
+                          for v in vs],
+                deaths=[dict(uid=u, why=r.get("why"), ret=r.get("ret")) for u, r in list(t.lineage.items())[-60:]
+                        if r.get("died") is not None])
         trades = [dict(x) for x in self.trades[-300:]]
         for x in trades:
             for k in list(x):
@@ -6243,7 +6251,7 @@ class App:
             t.learn_hindsight(res)
             ok = [r for r in res["results"] if r["ok"]]
             grad = ""
-            if ok and self.seeded:
+            if ok and self.seeded and not t.nursery_full():  # (when the farm is full of young eggs the lesson waits in the book)
                 g = ok[0]["genes"]
                 v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
                                   note="Hindsight egg:", tf=g["tf"], origin="hindsight", risk=g["risk"], traits=g["traits"],
@@ -6428,7 +6436,7 @@ class App:
             grad = ""
             if not live and not exam:
                 self.roam_days.add(day.isoformat())
-            if new and self.seeded and len(t.vars) < t.cap + 2 and not exam:
+            if new and self.seeded and len(t.vars) < t.cap + 2 and not exam and not t.nursery_full():
                 g = new[0][0]
                 v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
                                   note="Free roam scalp graduate:", tf=g["tf"], origin="free roam", risk=g["risk"],
@@ -8734,7 +8742,7 @@ class App:
             t.evolve_every = int(self.settings["evolve_every"])
             t.retire_steps = self.retire_steps(self.session_bar)
             while len(t.vars) > t.cap:
-                worst = [v for v, _ in reversed(t.ranking()) if v not in t.active]
+                worst = [v for v, _ in t.weakest() if v not in t.active]
                 if not worst:
                     break
                 t._remove(worst[0], "farm made smaller")

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.20.2
+- **Fix: the farm was filling up with eggs that never got judged.** Free roam hatches eggs often (hindsight eggs,
+  graduates), and every new egg made room by dropping the weakest bot that already had a score. Bots too new to have
+  a score were never picked, so matured bots kept being dropped and the farm ended up almost all "warming up", with
+  hardly anyone allowed to trade. Now:
+  - bots still in their first window are never dropped to make room;
+  - bots that have had a full window and still can't be scored (they hardly trade) go first;
+  - when 40% of the farm is still too young to judge, Free roam keeps its new lessons in the book instead of hatching
+    more eggs.
+  In a test that copied what your farm was doing, the old rules left every bot warming up; the new ones left most
+  bots judged and several winning.
+- The report for Claude now lists every bot (age, trades, status) and recent departures, not just the scored ones.
+
 ## 1.20.1
 - **Fix: saved farms didn't load after updating to 1.20.0** ("'Tournament' object has no attribute 'conds'"). Farms,
   the slow farm and the Scalp lab load again with all their bots.
