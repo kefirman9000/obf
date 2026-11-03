@@ -1610,7 +1610,8 @@ class App:
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
-        t0, t1, t7, t8, tm, tt, tb, ts = (ttk.Frame(nb) for _ in range(8))
+        t0, t1, t7, t8, tm, tt, tb, ts, tf_ = (ttk.Frame(nb) for _ in range(9))
+        nb.add(tf_, text="  \u2630 Features  ")
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t7, text="  \u25c7 Slow farm  ")
         nb.add(t8, text="  Options  ")
@@ -1640,6 +1641,7 @@ class App:
         self.build_options_tab(t8)
         self.build_portfolio(t1)
         self.build_botpos_tab(tb)
+        self.build_features_tab(tf_)
         sn_ = ttk.Notebook(ts)  # Scalpers = the live scalp lab + the market scan
         sn_.pack(fill="both", expand=True, pady=(4, 0))
         sn_.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
@@ -10864,10 +10866,219 @@ class App:
             self.opt_load(quiet=True)
         elif tab == "Bot positions":
             self.refresh_botpos()
+        elif "Features" in tab:
+            self.refresh_features()
         elif "Scalp scan" in tab:
             self.refresh_scan()
         elif tab == "Scalp lab":
             self.refresh_lab()
+
+    # ---------------- Features: every learning feature in one place ----------------
+    def _set_flag(self, where, key, on):
+        """Switches a feature setting (where = 'settings' or 'cfg'), saves it and tells the farms."""
+        if where == "settings":
+            self.settings[key] = bool(on)
+            self.cfg["settings"] = self.settings
+        else:
+            self.cfg[key] = bool(on)
+        E.save_json(CONFIG_PATH, self.cfg)
+        if self.tourn:
+            self.tourn.o.update(E.tournament_opts(self.settings))
+        sl_ = getattr(self, "slow", {}).get("t")
+        if sl_:
+            sl_.o.update(E.tournament_opts(self.settings), scalp_share=0.0)  # the slow farm never keeps scalpers
+
+    def _settings_tab(self, name):
+        self.open_settings()
+        try:
+            nb = self.settings_nb
+            for t_ in nb.tabs():
+                if name in nb.tab(t_, "text"):
+                    nb.select(t_)
+        except Exception:
+            pass
+
+    def features(self):
+        """[(icon, name, what it is, status fn, switch (get, set) or None, open fn)] for the Features tab."""
+        st = self.settings
+
+        def roam_status():
+            cur = getattr(self, "roam_now", None)
+            n = getattr(self, "roam_n", 0)
+            if not self.cfg.get("roam_on"):
+                return f"Off.  {n} studies done so far."
+            if cur:
+                return f"Now: {cur.get('kind', '')}: {cur.get('text', '')}"[:150]
+            last = (getattr(self, "roam_log", None) or [None])[-1]
+            return f"{n} studies done." + (f"  Last: {last['kind']}: {last['summary']}"[:140] if last else "")
+
+        def hind_status():
+            t = self.tourn
+            book = getattr(t, "hindsight", {}) if t else {}
+            if not book:
+                return "Nothing recorded yet. Its first study runs inside Free roam."
+            worked = sorted(((e["wins"], n) for n, e in book.items() if e.get("best")), reverse=True)
+            return (f"{len(book)} instincts looked at; {len(worked)} would have worked"
+                    + (f". Best so far: {', '.join(STRAT_LABELS.get(n, n) for _, n in worked[:3])}" if worked else "") + ".")
+
+        def breed_status(pick, what):
+            t = self.tourn
+            if not t:
+                return "No farm yet: press Start once."
+            vs = [v for v in t.vars if pick(v)]
+            win = sum(1 for v in vs if t.info.get(id(v), {}).get("status") == "active")
+            return f"{len(vs)} {what} on your farm, {win} winning."
+
+        def kami_status():
+            base = breed_status(E.is_kami, "kamikazes")
+            t = self.tourn
+            book = getattr(t, "trial_book", {}) if t else {}
+            tested = [k for k, x in book.items() if x[0] >= 3]
+            return base + (f"  {len(tested)} rules tested for the farm so far." if book else "")
+
+        def lab_status():
+            lab = getattr(self, "lab", {})
+            lt = lab.get("t")
+            if lt:
+                return (f"Learning live on {', '.join(lab.get('coins', []))}: {len(lt.scalpers())} scalpers, "
+                        f"{lab.get('trades', 0)} scalps today, {len(lab.get('grads', []))} graduated to your farm.")
+            return (lab.get("status") or "Off.") + f"  ({len(lab.get('grads', []))} graduated so far)"
+
+        def scan_status():
+            sc = getattr(self, "scan", {})
+            res = sc.get("res") or {}
+            hot = [k for k, x in (res.get("tickers") or {}).items() if x.get("paid") and x["pl"] > 0]
+            return (sc.get("status") or "Ready") + (f".  Paying today: {', '.join(hot[:5])}" if hot else "")
+
+        def slow_status():
+            sl = getattr(self, "slow", {})
+            if sl.get("t"):
+                return f"{len(sl['t'].vars)} slow dragons on {', '.join(sl.get('coins') or [])}. " + (sl.get("status") or "")
+            return sl.get("status") or "Off."
+
+        def know_status():
+            t = self.tourn
+            if not t:
+                return "No farm yet."
+            items = E.farm_knowledge(t)
+            return f"{len(items)} things learned, {sum(1 for x in items if x.get('strong'))} proven by their own evidence."
+
+        def shadow_status():
+            cur = getattr(self, "shadow_curve", None)
+            return (f"Following your Hall of Fame with pretend money: {cur[-1][1] - self.start_cash:+,.2f} so far."
+                    if cur else "Waiting for Hall of Fame bots to follow.")
+
+        def mirror_status():
+            if not self.cfg.get("mirror_paper"):
+                return "Off: practice trades stay inside OBF."
+            if not self.is_paper_key():
+                return "On, but waiting for your Alpaca paper key (Account > Log in)."
+            return f"On: {len(getattr(self, 'mirror_trades', []))} copies placed on your Alpaca paper account this session."
+
+        s_ = lambda k: (lambda: bool(st.get(k, True)), lambda on: self._set_flag("settings", k, on))
+        c_ = lambda k, d=False: (lambda: bool(self.cfg.get(k, d)), lambda on: self._set_flag("cfg", k, on))
+        return [
+            ("\u25c7", "Free roam", "The farm goes back in time by itself: bots test themselves on stretches of the past, "
+                                   "practice farms live through them, and every lesson comes home.",
+             roam_status, (lambda: bool(self.cfg.get("roam_on")), lambda on: self.toggle_roam(on)), self.open_roam),
+            ("\U0001f52e", "Hindsight", "Looks back at what WOULD have worked: many instincts and settings tried on the past, "
+                                       "checked on prices they didn't see. New eggs start from what worked.",
+             hind_status, s_("hindsight"), lambda: self.open_knowledge()),
+            ("\u26a1", "Scalp lab", "A farm of scalpers only, learning from live prices minute by minute while the market is "
+                                   "open, and sending its best to your farm.",
+             lab_status, (lambda: bool(self.cfg.get("lab_on")), lambda on: on != bool(self.cfg.get("lab_on")) and self.toggle_lab()),
+             lambda: self.show_tab("Scalp lab")),
+            ("\U0001f50d", "Scalp scan", "Every 5 minutes during the trading day, your best scalpers are tried on today's "
+                                        "prices of many tickers, to see where scalps are paying.",
+             scan_status, c_("scalp_scan", True), lambda: self.show_tab("Scalp scan")),
+            ("\U0001f32a", "Scalper breed", "Wind dragons: quick in-and-out bots with tight exits, a time limit and flat "
+                                           "before the close.",
+             lambda: breed_status(lambda v: E.is_scalp(v.name), "scalpers"), s_("scalpers"),
+             lambda: (self.show_tab("Bot Farm"), self.grid_search.set("scalp"), self._grid_set_filter("All"))),
+            ("\u2604", "Kamikaze breed", "All-or-nothing bets on cheap contracts, with a small say; each one tests risky "
+                                        "rules so your good bots don't pay for them.",
+             kami_status, s_("kamikazes"), lambda: self.open_knowledge()),
+            ("\u25c7", "Slow farm", "A separate farm of patient dragons that decide on hourly candles and hold for days.",
+             slow_status, (lambda: bool(self.cfg.get("slow_on")), lambda on: on != bool(self.cfg.get("slow_on")) and self.slow_toggle()),
+             lambda: self.show_tab("Slow farm")),
+            ("\u2605", "Shadow Live", "Follows only your Hall of Fame bots with pretend money in real time, so you see how "
+                                    "your champions would do on their own.",
+             shadow_status, s_("shadow_live"), lambda: (self.show_tab("Bot Farm"), self._grid_set_filter("Hall of Fame"))),
+            ("\U0001f4d6", "Farm knowledge", "Everything the farm has learned, with the evidence: save it as a book and teach "
+                                           "it to another farm.",
+             know_status, None, lambda: self.open_knowledge()),
+            ("\u2694", "Training camp", "Send a whole farm through days or months of history, then give the best a final "
+                                       "exam on prices they never saw.",
+             lambda: "Runs when you start it.", None, self.open_training),
+            ("\u21c4", "Practice on Alpaca paper too", "Every practice trade is also copied to your Alpaca paper account "
+                                                      "(Practice trades go to: Both).",
+             mirror_status, (lambda: bool(self.cfg.get("mirror_paper")),
+                             lambda on: (self.dest_var.set("Both: OBF and my Alpaca paper account" if on else "Stay in OBF  (PRACTICE)"),
+                                         self.pick_practice_dest())),
+             lambda: self._settings_tab("Basics")),
+            ("\u2699", "Learning switches", "Every rule the bots can grow (never-rules, studies, seasons, elders, islands...), "
+                                          "each one on or off.",
+             lambda: f"{sum(1 for k, v in st.items() if isinstance(v, bool) and v)} learning options on.", None,
+             lambda: self._settings_tab("Learning")),
+        ]
+
+    def build_features_tab(self, parent):
+        top = tk.Frame(parent, bg=BG, padx=10, pady=6)
+        top.pack(fill="x")
+        tk.Label(top, text="\u2630 Features", bg=BG, fg=TEXT, font=("", 13, "bold")).pack(side="left")
+        tk.Label(top, text="   What each one is, what it's learning right now, a switch, and a way to jump to it.",
+                 bg=BG, fg=MUTED, font=("", 9)).pack(side="left")
+        sf = ScrollFrame(parent, BG, width=900)
+        sf.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.feat_rows = []
+        grid = sf.inner
+        for col in (0, 1):
+            grid.columnconfigure(col, weight=1, uniform="feat")
+        for i, (icon, name, what, status, switch, opener) in enumerate(self.features()):
+            card = tk.Frame(grid, bg=CARD, highlightthickness=1, highlightbackground=LINE, padx=12, pady=8)
+            card.grid(row=i // 2, column=i % 2, sticky="nsew", padx=5, pady=5)
+            head = tk.Frame(card, bg=CARD)
+            head.pack(fill="x")
+            tk.Label(head, text=f"{icon}  {name}", bg=CARD, fg=TEXT, font=("", 11, "bold")).pack(side="left")
+            btn = None
+            if switch:
+                btn = tk.Button(head, relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=("", 8, "bold"), fg="white",
+                                activeforeground="white")
+                btn.pack(side="right")
+
+                def flip(sw=switch, b=None):
+                    try:
+                        sw[1](not sw[0]())
+                    except Exception:
+                        note = self._record_error("switching a feature")
+                        if note:
+                            self.write(note, "bad")
+                    self.refresh_features()
+                btn.config(command=flip)
+            ttk.Button(head, text="Open \u203a", style="Plain.TButton", command=opener).pack(side="right", padx=(0, 8))
+            tk.Label(card, text=what, bg=CARD, fg=MUTED, font=("", 8), wraplength=520, justify="left", anchor="w").pack(fill="x", pady=(4, 2))
+            lbl = tk.Label(card, text="", bg=CARD, fg=ACCENT, font=("", 8, "bold"), wraplength=520, justify="left", anchor="w")
+            lbl.pack(fill="x")
+            self.feat_rows.append((btn, switch, lbl, status))
+        self._feat_tick()
+
+    def _feat_tick(self):
+        try:
+            if "Features" in self.cur_tab() and not self.in_bg():
+                self.refresh_features()
+        except Exception:
+            pass
+        self.root.after(3000, self._feat_tick)
+
+    def refresh_features(self):
+        for btn, switch, lbl, status in getattr(self, "feat_rows", []):
+            try:
+                if btn is not None:
+                    on = bool(switch[0]())
+                    btn.config(text="ON" if on else "OFF", bg=GREEN if on else "#4b5563", activebackground=GREEN if on else "#4b5563")
+                lbl.config(text=status())
+            except Exception:
+                lbl.config(text="")
 
     # ---------------- bot positions: every bot's open pretend contracts ----------------
     def build_botpos_tab(self, parent):
@@ -13140,6 +13351,7 @@ class App:
         outer.pack()
         nb = ttk.Notebook(outer)
         nb.pack()
+        self.settings_nb = nb
         ents = {}
         adv_tabs = []
         for title, blurb, fields in self.settings_groups():

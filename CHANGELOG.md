@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.18.1
+- **Features tab** (first tab): every learning feature on one page: Free roam, Hindsight, Scalp lab, Scalp scan, the
+  Scalper and Kamikaze breeds, the Slow farm, Shadow Live, Farm knowledge, Training camp, practising on Alpaca paper too,
+  and the learning switches. Each card says what the feature is, what it's learning right now (updated every few
+  seconds), has an ON / OFF switch, and an Open button that jumps straight to it.
+
 ## 1.18.0
 - **Hindsight: bots learn what WOULD have worked**: a new Free roam study (every fifth). Looking back at a stretch of the
   past, about 50 instincts and settings are tried on its first 70%, and the most promising are checked on the last 30%
