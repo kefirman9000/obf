@@ -908,7 +908,17 @@ class App:
                          self.settings["trade_pct"] / 100, self.settings["evolve_every"], params=self.settings["params"],
                          opts=E.tournament_opts(self.settings), cap=int(self.settings["max_bots"]),
                          retire_steps=self.retire_steps(self.session_bar))
-        return t if t.restore(d.get("farm")) else None
+        try:
+            return t if t.restore(d.get("farm")) else None
+        except Exception:
+            # never lose a farm to a bug: keep a copy of the file before anything could save over it
+            try:
+                import shutil
+                shutil.copy2(E.farm_path(self.sess_tag()), E.farm_path(self.sess_tag()) + f".couldnt-load-{int(time.time())}.json")
+            except OSError:
+                pass
+            self._farm_load_failed = True
+            raise
 
     def restore_last_session(self):
         """On start-up: put the last session (and its farm) back on screen, paused, exactly where it left off."""
@@ -7823,7 +7833,7 @@ class App:
             log.config(text="\n".join(friendly_text(e)[:140] for e in recent))
 
         def tick():
-            if not w.winfo_exists() or not st["playing"]:
+            if not w.winfo_exists() or not cv.winfo_exists() or not st["playing"]:
                 return
             step = int(sp.get().rstrip("x")) // 2 or 1
             st["i"] = min(len(data) - 1, st["i"] + step)

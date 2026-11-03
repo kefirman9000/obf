@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.20.1
+- **Fix: saved farms didn't load after updating to 1.20.0** ("'Tournament' object has no attribute 'conds'"). Farms,
+  the slow farm and the Scalp lab load again with all their bots.
+- If a saved farm ever fails to load, a copy of its file is now kept first (`...couldnt-load-....json` in the data
+  folder), so it can't be lost.
+- Fix: a rare error when the farm replay window was rebuilt while playing.
+
 ## 1.20.0
 - **Exams on unseen days**: every bot now builds a record of exams on prices it never trained on (Free roam
   self-tests, and day replays on held-back days). A bot passes when its exam results are positive, mostly winning and
