@@ -1974,6 +1974,8 @@ DEFAULT_SETTINGS = {
     "prove_live": True,          # a bot can only be Winning after it also made money on prices it hadn't seen yet
     "risk_adjusted": True,       # rank winners by gain per unit of downside swing, not raw gain
     "luck_check": True,          # a bot's score counts for less when it rests on only a few trades
+    "exam_gate": True,           # a bot that fails its exams (days it never trained on) can't be a BEAST
+    "cond_aware": True,          # each bot's say depends on its record in today's conditions (wild/calm, time, news)
     "long_holds": True,          # include slow, longer-holding bots from the start
     "show_broker_value": True,   # a tile with your Alpaca account's own value (logged in)
     "hindsight": True,           # bots learn from what would have worked (hindsight studies), and new eggs start from it
@@ -2329,6 +2331,22 @@ class OptionSim(Sim):
             return None
         return b[1][i] * CONTRACT
 
+    def _real_slip(self, c, o, prem):
+        """On a past day with real option history: half the bid/ask gap this contract really costs to trade (learned
+        from live quotes of the same ticker), widened when its last real trade is getting old (a quiet contract's
+        last price says less about what you could trade it at now). None when the price isn't a real one."""
+        if not self.book or not o or not o.get("symbol"):
+            return None
+        b = (self.book.get(o.get("under") or c) or {}).get("bars", {}).get(o["symbol"])
+        if not b:
+            return None
+        i = bisect.bisect_right(b[0], self.now) - 1
+        if i < 0 or self.now - b[0][i] > 1800:
+            return None
+        hs = half_spread(c, prem / CONTRACT)
+        age = self.now - b[0][i]
+        return min(0.5, hs * (1 + min(1.0, max(0.0, age - 120) / 900)))
+
     def _pick_listed(self, c, typ, K, exp, S):
         """The real listed contract closest to the one wanted (that day's option history), or None."""
         bk = (self.book or {}).get(c)
@@ -2382,8 +2400,11 @@ class OptionSim(Sim):
             self.opt.pop(c, None)
             return False
         slip = self.slip
+        rs = self._real_slip(c, self.opt[c], prem)
+        if rs is not None:  # a real contract on a past day: buys pay the ask (its real bid/ask gap), for every bot
+            slip = max(rs, half_spread(c, prem / CONTRACT) if g.get("flatby") else 0.0)
         if g.get("flatby"):  # scalper: the real bid/ask gap for this contract, and only tight ones
-            slip = half_spread(c, prem / CONTRACT)
+            slip = half_spread(c, prem / CONTRACT) if rs is None else slip
             if 2 * slip * 100 > SCALP_SPREAD[0]:
                 self.opt.pop(c, None)
                 return False
@@ -2442,6 +2463,9 @@ class OptionSim(Sim):
         self._count_fill(o)
         expired = o and self.now >= o["exp"]
         slip = half_spread(c, prem / CONTRACT) if (self.genes or {}).get("flatby") else self.slip
+        rs = self._real_slip(c, o, prem)
+        if rs is not None:  # a real contract on a past day: sells get the bid
+            slip = max(slip if (self.genes or {}).get("flatby") else 0.0, rs)
         fill = prem if expired else prem * (1 - slip)
         proceeds = q * fill * (1 - (0 if expired else self.fee)) - (0 if expired else q * CONTRACT_FEE[0])
         self.fees += 0 if expired else q * prem * slip + q * fill * self.fee + q * CONTRACT_FEE[0]
@@ -2518,6 +2542,7 @@ def tournament_opts(settings):
                 regime_aware=bool(settings.get("regime_aware", True)),
                 slip=slip, fee_aware=bool(settings.get("fee_aware", True)),
                 prove_live=bool(settings.get("prove_live", True)), risk_adjusted=bool(settings.get("risk_adjusted", True)), luck_check=bool(settings.get("luck_check", True)),
+                exam_gate=bool(settings.get("exam_gate", True)), cond_aware=bool(settings.get("cond_aware", True)),
                 classics=bool(settings.get("classics", True)), classic_rate=float(settings.get("classic_rate", 25)) / 100,
                 vetoes=bool(settings.get("vetoes", True)), layers=bool(settings.get("layers", True)),
                 long_holds=bool(settings.get("long_holds", True)),
@@ -2658,10 +2683,20 @@ VETOES = {
                     text=lambda x: f"never opens a contract in the last {int(x)} minutes before the 4 pm close (New York)"),
     "panic":   dict(lo=0.5, hi=5.0, side="sell", name="No panic selling",
                     text=lambda x: f"never sells on its strategy right after a {x:g}%+ one-bar drop (stops still work)"),
+    "gap":     dict(lo=0.3, hi=4.0, side="open", name="No gap days",
+                    text=lambda x: f"never opens a contract on a day that opened {x:g}%+ away from the day before's close"),
+    "weekday": dict(lo=1, hi=5, side="open", name="Skips one weekday",
+                    text=lambda x: f"never opens a contract on a {WEEKDAYS[int(x) - 1]}"),
+    "pricey":  dict(lo=1.2, hi=3.0, side="open", name="No expensive options",
+                    text=lambda x: f"never opens a contract while the ticker swings {x:g}x more than usual (options cost "
+                                   f"more then)"),
+    "newsday": dict(lo=1, hi=1, side="open", name="Sits out news days",
+                    text=lambda x: "never opens a contract on a CPI, jobs-report or Fed day"),
 }
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
 MAX_VETOES = 3
-EVENT_VETOES = ("preev", "prefed", "postev")  # only grown once the economic calendar is downloaded
-TIME_VETOES = ("opening", "closing")  # time-of-day habits (only on bars shorter than a day)
+EVENT_VETOES = ("preev", "prefed", "postev", "newsday")  # only grown once the economic calendar is downloaded
+TIME_VETOES = ("opening", "closing", "gap")  # time-of-day habits (only on bars shorter than a day)
 
 
 def clean_vetoes(d):
@@ -2673,7 +2708,7 @@ def clean_vetoes(d):
             x = 0
         if x > 0 and len(out) < MAX_VETOES:
             x = min(max(x, spec["lo"]), spec["hi"])
-            out[k] = int(round(x)) if k in ("revenge", "opening", "closing") else round(x, 2)
+            out[k] = int(round(x)) if k in ("revenge", "opening", "closing", "weekday", "newsday") else round(x, 2)
     return out
 
 
@@ -2733,7 +2768,48 @@ def _veto(v, k, x, c, closes, n, extra, coins):
         return bool(moves) and sum(moves) / len(moves) * 100 <= -x
     if k == "panic":
         return (p[-1] / p[-2] - 1) * 100 <= -x
+    if k == "gap":
+        g = day_gap(c, p, ((extra or {}).get(c) or {}).get("t"))
+        return g is not None and abs(g) >= x
+    if k == "weekday":
+        d = datetime.fromtimestamp(_bar_time(extra, c, v.sim), timezone.utc)
+        return (d - timedelta(hours=_ny_offset(d))).weekday() == int(x) - 1
+    if k == "newsday":
+        return bool(events()) and _news_day(_bar_time(extra, c, v.sim))
+    if k == "pricey":
+        ser = tail_series(p, v.tf, 201)
+        if len(ser) < 60:
+            return False
+        mv = [abs(ser[i] / ser[i - 1] - 1) for i in range(1, len(ser)) if ser[i - 1]]
+        base = sum(mv) / len(mv) if mv else 0
+        return base > 0 and (sum(mv[-20:]) / len(mv[-20:])) / base >= x
     return False
+
+
+_GAP_CACHE = {}
+
+
+def day_gap(c, p, t):
+    """% the ticker's day opened away from the previous day's last price (intraday bars with times), or None.
+    A ticker's gap on a given day is a fact, so it's worked out once and remembered."""
+    if not t or len(t) < 3 or len(p) < 3 or t[-1] - t[-2] >= 6 * 3600:
+        return None
+    day = ny_date(t[-1])
+    key = (c, day)
+    if key in _GAP_CACHE:
+        return _GAP_CACHE[key]
+    i, lim = len(t) - 1, min(len(t), len(p)) - 1
+    j = 0
+    while j < lim and ny_date(t[i - j]) == day and j < 1000:
+        j += 1
+    if j >= lim or j >= 1000:
+        return None  # the day's start isn't in the data
+    first, prev = p[len(p) - j], p[len(p) - j - 1]
+    g = (first / prev - 1) * 100 if prev else None
+    if len(_GAP_CACHE) > 20000:
+        _GAP_CACHE.clear()
+    _GAP_CACHE[key] = g
+    return g
 
 
 SCALP_JUDGE = 30   # a scalper is judged on its last this-many finished trades
@@ -3191,6 +3267,139 @@ def bot_step(v, closes, n, coins, extra=None):
     return made
 
 
+# ---------------- exams: results on days a bot never trained on ----------------
+EXAM_KEEP = 12   # exams remembered per bot
+EXAM_MIN = 3     # exams needed before a verdict
+
+
+def trading_days(t0, t1):
+    """Weekdays (New York dates) from t0 to t1, oldest first. Holidays are included: they're found out and skipped."""
+    d, end, out = ny_date(t0), ny_date(t1), []
+    while d <= end:
+        if d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def is_exam_day(d):
+    """One trading day in five is held back for exams: the same days on every computer, never trained on."""
+    import hashlib
+    return int(hashlib.md5(("obf-exam-" + d.isoformat()).encode()).hexdigest(), 16) % 5 == 0
+
+
+def add_exam(v, kind, edge, n, when=None):
+    """Records one exam (edge: % result on unseen prices, vs the market where there is one; n: its trades)."""
+    ex = list(getattr(v, "exams", None) or [])
+    ex.append(dict(k=kind, edge=round(float(edge), 3), n=int(n), at=round(time.time()), when=when))
+    v.exams = ex[-EXAM_KEEP:]
+
+
+def exam_bar(tried):
+    """How convincing exam results must be when `tried` bots have been tried: the more bots a farm tries, the
+    luckier its best one looks by chance alone, so the bar rises (about the best of `tried` coin flips)."""
+    return math.sqrt(2 * math.log(max(2, tried))) / 2
+
+
+def exam_verdict(v, tried=100):
+    """-> (verdict, detail). verdict: 'passed', 'failed' or 'untested'. A bot passes when its exam results are
+    positive, mostly winning, and steady enough (mean / its spread x sqrt(exams)) to clear the bar for how many bots
+    the farm has tried. Exams with no trades say nothing and don't count."""
+    ex = [x for x in (getattr(v, "exams", None) or []) if x.get("n", 0) > 0]
+    k = len(ex)
+    if k == 0:
+        return "untested", dict(k=0, mean=None, score=None, bar=round(exam_bar(tried), 2), wins=0)
+    e = [x["edge"] for x in ex]
+    mean = sum(e) / k
+    sd = (sum((x - mean) ** 2 for x in e) / (k - 1)) ** 0.5 if k > 1 else 0.0
+    score = mean / sd * k ** 0.5 if sd > 1e-9 else (9.9 if mean > 0 else -9.9 if mean < 0 else 0.0)
+    wins = sum(1 for x in e if x > 0)
+    bar = exam_bar(tried)
+    d = dict(k=k, mean=round(mean, 2), score=round(score, 2), bar=round(bar, 2), wins=wins)
+    trades = sum(x["n"] for x in ex)
+    if k >= 2 and trades >= 6 and wins == 0:
+        return "failed", d
+    if k < EXAM_MIN or trades < 6:
+        return "untested", d
+    if mean <= 0 or wins * 2 < k:
+        return "failed", d
+    if score >= bar:
+        return "passed", d
+    return "untested", d
+
+
+def exam_text(v, tried=100):
+    verdict, d = exam_verdict(v, tried)
+    if not d["k"]:
+        return "no exams yet (Free roam tests it on days it never trained on)"
+    base = f"{d['wins']} of {d['k']} won, average {d['mean']:+.1f}%"
+    if verdict == "passed":
+        return f"passed: {base}, steady enough to beat luck (score {d['score']:.1f}, needed {d['bar']:.1f})"
+    if verdict == "failed":
+        return f"failed: {base}. It can't be a BEAST until it does better"
+    return f"not proven yet: {base}" + (f" (score {d['score']:.1f}, needs {d['bar']:.1f})" if d["k"] >= EXAM_MIN else
+                                        f" ({EXAM_MIN - d['k']} more exam{'s' if EXAM_MIN - d['k'] > 1 else ''} needed)")
+
+
+COND_TEXT = {"vol:calm": "calm markets", "vol:normal": "normal markets", "vol:wild": "wild markets",
+             "tod:open": "the first hour", "tod:mid": "the middle of the day", "tod:late": "the last hour",
+             "day:news": "news days (CPI, jobs, Fed)", "day:plain": "days without big news"}
+COND_MIN = 30    # decisions in a condition before its record counts
+
+
+def market_conds(closes, extra, coins):
+    """The conditions right now, shared by every bot: how wild the market is, the time of day (bars shorter than a
+    day only), and whether it's a big-news day."""
+    out = []
+    if not coins:
+        return out
+    try:
+        reg = vol_regime(closes, extra, coins[0])[0]
+        if reg:
+            out.append("vol:" + ("calm" if reg == "calm" else "wild" if reg in ("rising", "spiking") else "normal"))
+    except Exception:
+        pass
+    t = ((extra or {}).get(coins[0]) or {}).get("t")
+    if t and len(t) >= 2 and t[-1] - t[-2] < 6 * 3600:
+        m = 390 - minutes_to_close(t[-1])  # minutes since the open
+        if 0 <= m <= 390:
+            out.append("tod:" + ("open" if m < 60 else "late" if m >= 330 else "mid"))
+    if t and events():
+        out.append("day:news" if _news_day(t[-1]) else "day:plain")
+    return out
+
+
+def cond_fit(v, cond):
+    """Average gain per decision while `cond` held, or None with too little evidence."""
+    k = (getattr(v, "cond_n", None) or {}).get(cond, 0)
+    return v.cond_gain.get(cond, 0.0) / k if k >= COND_MIN else None
+
+
+def good_at(v):
+    """[(condition text, average % per decision)] where the bot does best, best first (only with enough evidence)."""
+    fits = [(c, cond_fit(v, c)) for c in (getattr(v, "cond_n", None) or {})]
+    fits = [(c, f) for c, f in fits if f is not None]
+    return [(COND_TEXT.get(c, c), f * 100) for c, f in sorted(fits, key=lambda x: -x[1])]
+
+
+_NEWS_CACHE = {}
+
+
+def _news_day(ts):
+    """True if a CPI, jobs-report or Fed decision falls on this New York day."""
+    d = datetime.fromtimestamp(ts, timezone.utc)
+    ny = (d - timedelta(hours=_ny_offset(d))).date()
+    hit = _NEWS_CACHE.get(ny)
+    if hit is None:
+        day0 = ny_time(ny.isoformat(), 0, 0)
+        _, t = next_event(day0, BIG_EVENTS)
+        hit = t is not None and t < day0 + 86400
+        if len(_NEWS_CACHE) > 5000:
+            _NEWS_CACHE.clear()
+        _NEWS_CACHE[ny] = hit
+    return hit
+
+
 class Variant:
     def __init__(self, name, params, sim, maxlen, tf=1, risk=None, traits=None, vetoes=None, layers=None):
         self.name, self.params, self.sim = name, params, sim
@@ -3245,6 +3454,10 @@ class Variant:
         self.log_ct = {}  # (decision, ticker) -> "call" / "put" of the contract traded there
         self.roam_scan = None  # scalpers: [trades, wins, pl, paid] from Free roam's scalp roams on past days (fading)
         self.trade_eq = deque(maxlen=SCALP_JUDGE + 1)  # scalpers: (decision, equity) after each finished trade
+        self.exams = []        # results on days / stretches it never trained on: {k: kind, edge: %, n: trades, at: time}
+        self.cond_gain = {}    # condition (e.g. "vol:wild", "tod:open") -> summed equity change while it held
+        self.cond_n = {}
+        self.hs_src = None     # hatched from the hindsight book: the instinct it came from (graded forward once)
 
     @property
     def label(self):
@@ -3484,10 +3697,42 @@ class Tournament:
         cands = [(n, e) for n, e in book.items() if e["best"] and n in STRATS and n in WILDCARD_STRATS]
         if not cands or not self.o.get("hindsight", True):
             return None
-        n, e = self.rng.choices(cands, weights=[(x["wins"] + 1) / (x["tries"] + 2) for _, x in cands])[0]
+        n, e = self.rng.choices(cands, weights=[(x["wins"] + 1) / (x["tries"] + 2) * self.hindsight_fwd(x) * 2
+                                                 for _, x in cands])[0]
         g = json.loads(json.dumps(self.rng.choice(e["best"][:3])["genes"]))
         g["params"] = self.mutate(n, g["params"], 0.15)
         return g
+
+    @staticmethod
+    def hindsight_fwd(e):
+        """0..1: how often eggs hatched from this hindsight lesson went on to do well on days that came after
+        (their exams, or how they did by the time they left). 0.5 with no evidence yet."""
+        f = e.get("fwd") or [0, 0]
+        return (f[1] + 1) / (f[0] + 2)
+
+    def grade_hindsight(self, v, ok):
+        """A hindsight egg has shown how it does going forward: its lesson is graded (once per egg)."""
+        src = getattr(v, "hs_src", None)
+        if not src:
+            return
+        v.hs_src = None
+        e = (getattr(self, "hindsight", {}) or {}).get(src)
+        if e is None:
+            return
+        f = e.setdefault("fwd", [0, 0])
+        f[0] += 1
+        f[1] += 1 if ok else 0
+        if not ok and e.get("best") and f[0] >= 3 and f[1] * 3 < f[0]:
+            e["best"] = e["best"][1:]  # its lessons keep failing later on: drop the top one, try the next
+
+    def hindsight_share(self):
+        """Share of new eggs hatched from the hindsight book: 60% while its eggs hold up, down to 20% if they don't."""
+        book = getattr(self, "hindsight", {}) or {}
+        n = sum((e.get("fwd") or [0, 0])[0] for e in book.values())
+        w = sum((e.get("fwd") or [0, 0])[1] for e in book.values())
+        if n < 5:
+            return 0.6
+        return min(0.6, max(0.2, 0.6 * (w / n) / 0.5))
 
     # ---- the scalp breed ----
     def scalp_target(self):
@@ -3831,6 +4076,8 @@ class Tournament:
                                    gen=v.gen, origin=origin, born=self.n, died=None, why="", ret=None, inducted=False)
 
     def _remove(self, v, why):
+        if v in self.vars and getattr(v, "hs_src", None):  # a hindsight egg leaving before its exams: how did it do?
+            self.grade_hindsight(v, bool(v.eq) and v.sim.start > 0 and v.eq[-1] > v.sim.start)
         if v in self.vars and is_kami(v):
             try:
                 self.kami_learn(v)
@@ -3932,6 +4179,11 @@ class Tournament:
         if mood and mood != "unknown" and prev_eq:
             v.mood_gain[mood] = v.mood_gain.get(mood, 0.0) + (e / prev_eq - 1)
             v.mood_n[mood] = v.mood_n.get(mood, 0) + 1
+        if prev_eq:  # its record in each condition (wild or calm, time of day, news days): who to trust when
+            g_ = e / prev_eq - 1
+            for cd in getattr(self, "conds", ()):
+                v.cond_gain[cd] = v.cond_gain.get(cd, 0.0) + g_
+                v.cond_n[cd] = v.cond_n.get(cd, 0) + 1
         while v.sim.tbars and v.sim.tbars[0] <= n - (v.eq.maxlen - 1):
             v.sim.tbars.popleft()
 
@@ -3952,6 +4204,7 @@ class Tournament:
         self.moods = {c: market_mood(closes[c])[0] for c in self.coins}
         known = [m for m in self.moods.values() if m != "unknown"]
         self.mood = max(set(known), key=known.count) if known else "unknown"
+        self.conds = market_conds(closes, getattr(self, "xfull", None), self.coins) if self.o.get("cond_aware", True) else []
 
     def step(self, closes, extra=None):
         """closes: coin -> list of bar closes, newest last, same length per coin.
@@ -4028,6 +4281,19 @@ class Tournament:
         peak = max(eq) if eq else 0
         return (peak - eq[-1]) / peak if peak > 0 else 0.0
 
+    def cond_mult(self, v):
+        """How much more (or less) to trust a bot right now, from its own record in today's conditions compared with
+        its record overall: a bot that shines in wild markets leads when the market is wild, and steps back when calm."""
+        n_all = max(1, len(v.eq) - 1)
+        overall = (v.eq[-1] / v.eq[0] - 1) / n_all if len(v.eq) > 1 and v.eq[0] > 0 else 0.0
+        m = 1.0
+        for cd in self.conds:
+            f = cond_fit(v, cd)
+            if f is None:
+                continue
+            m *= 0.75 if f <= 0 else 1.2 if f > overall else 1.0
+        return min(1.6, max(0.4, m))
+
     def mood_fit(self, v, mood=None):
         """Average gain per decision while `mood` ruled, or None with too little evidence."""
         mood = mood or self.mood
@@ -4099,12 +4365,17 @@ class Tournament:
             base = edge if (o["beat_hold"] and edge is not None and edge > 0) else sc
             proving = bool(o.get("prove_live", True)) and (
                 v.live_n < max(10, (v.eq.maxlen - 1) // 4) or (v.eq and v.live_eq0 and v.eq[-1] < v.live_eq0))
+            exam = exam_verdict(v, self.serial)[0] if o.get("exam_gate", True) and not is_kami(v) else "off"
             if failing or sc <= 0 or cons < 0.25:
                 status, w = "benched", 0.0
-            elif cons >= 0.5 and not behind and not proving:
+            elif cons >= 0.5 and not behind and not proving and exam != "failed":
                 status, w = "active", base * cons ** 2
             else:
                 status, w = "slowed", sc * cons ** 2
+            if exam in ("passed", "failed") and getattr(v, "hs_src", None):
+                self.grade_hindsight(v, exam == "passed")
+            if w > 0 and exam != "off":  # results on days it never trained on: passing counts for more, failing for less
+                w *= {"passed": 1.3, "failed": 0.5}.get(exam, 0.85)
             if w > 0 and o.get("risk_adjusted", True):
                 w *= 0.5 + min(self.sortino(v), 5.0) / 2  # steady gains count for more than bumpy ones
             if w > 0:
@@ -4123,8 +4394,11 @@ class Tournament:
                 fit = self.mood_fit(v)
                 if fit is not None:
                     w *= 1.25 if fit > 0 else 0.8
+            if w > 0 and o.get("cond_aware", True) and self.conds:
+                w *= self.cond_mult(v)
             info[id(v)] = dict(score=sc, cons=cons, weight=w, stake=0.0, status=status, failing=failing,
-                               edge=edge, behind=behind, proving=proving and status == "slowed" and not behind)
+                               edge=edge, behind=behind, proving=proving and status == "slowed" and not behind,
+                               exam=exam)
             if status == "active" and not v.credited:
                 v.credited = True
                 for k in v.mut_kinds:
@@ -4243,7 +4517,8 @@ class Tournament:
                      classic=v.classic, vetoes=dict(v.vetoes), veto_stats={k: list(s) for k, s in v.veto_stats.items()},
                      health=self.health(v), power=v.power, layers=json.loads(json.dumps(v.layers)),
                      layer_stats={k: list(s) for k, s in v.layer_stats.items()}, twin=v.twin,
-                     bad_coins=[c for c, x in v.coin_pl.items() if x[0] >= 3 and x[1] < -1.5], island=v.island)
+                     bad_coins=[c for c, x in v.coin_pl.items() if x[0] >= 3 and x[1] < -1.5], island=v.island,
+                     exam=d.get("exam", "off"))
                 for v, d in rows]
 
     def mutate(self, name, params, scale=0.25):
@@ -4577,7 +4852,7 @@ class Tournament:
         weakest duplicate. A scalpers-only farm (the live scalp lab) hatches a scalper instead."""
         if self.o.get("scalp_only"):
             return self.spawn_scalp(closes)
-        hg = self.hindsight_genes() if self.rng.random() < 0.6 else None
+        hg = self.hindsight_genes() if self.rng.random() < self.hindsight_share() else None
         if hg:  # an egg from what would have worked, rather than a random one
             if len(self.vars) >= self.cap:
                 cands = [v for v, _ in reversed(self.ranking()) if v not in self.active
@@ -4585,9 +4860,12 @@ class Tournament:
                 if not cands:
                     return None
                 self._remove(cands[0], "dropped to make room")
-            return self.add_variant(hg["name"], hg["params"], closes, note="Hindsight egg:", tf=hg.get("tf", 1),
-                                    origin="hindsight", risk=hg.get("risk"), traits=hg.get("traits"),
-                                    vetoes=hg.get("vetoes"), layers=hg.get("layers"))
+            v = self.add_variant(hg["name"], hg["params"], closes, note="Hindsight egg:", tf=hg.get("tf", 1),
+                                 origin="hindsight", risk=hg.get("risk"), traits=hg.get("traits"),
+                                 vetoes=hg.get("vetoes"), layers=hg.get("layers"))
+            if v:
+                v.hs_src = hg["name"]
+            return v
         name = self.rng.choice(WILDCARD_STRATS)
         p = self._rand_params(name)
         if len(self.vars) >= self.cap:
@@ -4653,7 +4931,7 @@ class Tournament:
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
-                "backtests", "own_review", "roam_scan")
+                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -4730,6 +5008,8 @@ class Tournament:
                 v.mut_kinds = list(v.mut_kinds or [])
                 v.island = int(v.island or 0) % max(1, int(self.o.get("islands", 1) or 1))
                 v.mood_gain = dict(v.mood_gain or {})
+                v.exams = [dict(x) for x in (v.exams or []) if isinstance(x, dict)][-EXAM_KEEP:]
+                v.cond_gain, v.cond_n = dict(v.cond_gain or {}), dict(v.cond_n or {})
                 v._key = None
                 v.mood_n = dict(v.mood_n or {})
                 vars_.append(v)

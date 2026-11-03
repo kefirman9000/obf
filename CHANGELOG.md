@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.20.0
+- **Exams on unseen days**: every bot now builds a record of exams on prices it never trained on (Free roam
+  self-tests, and day replays on held-back days). A bot passes when its exam results are positive, mostly winning and
+  steady enough to beat luck. The bar rises with how many bots the farm has tried, because the best of many bots looks
+  good by chance. Bots that fail can't be BEASTS, and passing gives a bigger say. Self-tests now go first to the BEASTS
+  and top bots that haven't been examined. The scoreboard, each bot's card and the Overview show it.
+- **Day replays in order, with held-back exam days**: one trading day in five is never trained on and is kept for
+  exams. The other days are replayed in order, oldest first (from February 2024 with the Alpaca login), so every day
+  gets its turn. Every third replay is an exam: no new tryouts, no graduates, nothing learned. Holidays are found and
+  skipped.
+- **Real bid/ask costs**: on replayed days with real option prices, every bot now buys at the ask and sells at the bid,
+  using what that ticker's options really cost to trade (learned from live quotes, refreshed weekly during replays).
+  The cost grows when a contract hasn't traded for a while.
+- **New things bots can learn**: four new never-rules: skip gap days, skip one weekday, skip expensive options (when
+  the ticker swings much more than usual) and sit out news days. Like the others, each is graded in hindsight.
+- **The right bot for the moment**: each bot keeps a record of how it does in wild or calm markets, at each time of day,
+  and on news days. Its say in the vote follows its record in today's conditions. Each bot's card shows what it's best at.
+- **Hindsight lessons graded forward**: eggs hatched from "what would have worked" are graded on how they do afterwards
+  (their exams, or how they did when they left). Lessons that keep failing are dropped, and fewer eggs come from
+  hindsight while its eggs don't hold up (down to 20% from 60%).
+- **Export a report for Claude** (File menu, the Overview tab and Diagnostics): saves a .zip of what every farm is
+  doing and learning (top bots and their rules, exams, Free roam log, settings, recent trades, logs). Attach it in a chat
+  for analysis. API keys, passwords and account numbers are left out.
+- Two new settings switches: Exams, and Right bot for the moment (both on).
+
 ## 1.19.1
 - **Reset account**: a new button on the left that simply puts the account back to its starting money, with no
   positions and no trades. Your farms, bots and everything they've learned are kept. The old Reset is now
