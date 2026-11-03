@@ -1330,7 +1330,10 @@ class App:
 
         self.build_menu()
         root.bind("<Map>", self.on_restore, add="+")
-        root.bind("<Configure>", self._on_root_configure, add="+")
+        # A binding on the window itself fires for every one of its widgets too (hundreds per resize step, each a
+        # trip into Python): a tag of its own makes it fire for the window alone.
+        root.bindtags(("OBFRoot",) + root.bindtags())
+        root.bind_class("OBFRoot", "<Configure>", self._on_root_configure, add="+")
 
         header = tk.Frame(root, bg=CARD, highlightthickness=1, highlightbackground=LINE)
         header.pack(fill="x")
@@ -1534,7 +1537,11 @@ class App:
         self._new_after = self.btn
         Tip(self.new_btn, "Start a fresh session instead of continuing the saved one. Your trade history stays in the "
                           "Trades tab and trades.csv.")
-        self.reset_btn = ttk.Button(left, text="Reset \u25be", style="Plain.TButton")
+        self.acct_reset_btn = ttk.Button(left, text="Reset account", style="Plain.TButton", command=self.reset_account)
+        self.acct_reset_btn.pack(fill="x", pady=(0, 4))
+        Tip(self.acct_reset_btn, "Puts the account back to its starting money with no positions and no trades. "
+                                 "Your farms, bots and everything they've learned are kept.")
+        self.reset_btn = ttk.Button(left, text="More reset options \u25be", style="Plain.TButton")
         self.reset_btn.configure(command=self.open_reset)
         self.reset_btn.pack(fill="x", pady=(0, 4))
         Tip(self.reset_btn, "Start over: reset the practice account (cash and trades), the farm (fresh eggs), or both. "
@@ -4031,6 +4038,42 @@ class App:
         self.refresh_board()
         self.write("The farm was reset: fresh eggs hatch when you press Start.", "good")
 
+    def reset_account(self):
+        """Reset account: starting money again, no positions, no trades. The farm and everything it learned stay."""
+        if self.pending:
+            return messagebox.showinfo("Reset account", "An order is on its way. Try again in a moment.")
+        try:
+            cash = float(self.cash_var.get())
+        except ValueError:
+            cash = self.start_cash or 1000.0
+        msg = (f"Reset the {self.acct_name()} account to ${cash:,.2f}?\n\nOpen positions and the trade list are cleared. "
+               "Your farms, bots and everything they've learned are kept.")
+        if self.session and self.live and any(q > 0 for q in self.pos.values()):
+            msg += ("\n\nThis only resets what OBF tracks: positions it bought stay in your broker account, "
+                    "and you can close them there.")
+        if self.mirror:
+            msg += "\n\nCopies on your Alpaca paper account stay open there."
+        if not messagebox.askyesno("Reset account", msg):
+            return
+        self.start_cash = self.cash = cash
+        self.pos, self.cost, self.opt = {}, {}, {}
+        self.trades, self.curve = [], []
+        self.mirror, self.mirror_trades = {}, []
+        self.bench_units, self.high, self.bought_at, self.bot_alloc = {}, {}, {}, {}
+        self.pending_who, self.pending_detail, self.pending_voters = {}, {}, {}
+        self.trade_marks, self.curve_n, self.fees_paid = [], 0, 0.0
+        self.day, self.day_eq, self.halted_day = None, None, None
+        self.shadow_live, self.shadow_curve = None, []
+        self.start_px = dict(self.last) if self.last else {}
+        if self.session:
+            self.save_state(force=True)
+        for fn in (self.refresh_trades, self.update_status, self.refresh_view, self.refresh_board, self.draw_chart):
+            try:
+                fn()
+            except Exception:
+                pass
+        self.write(f"Account reset to ${cash:,.2f}. The farm and its learning are kept.")
+
     def reset(self, ask=True):
         if ask and (self.trades or self.pos):
             msg = "Clear this session and its saved state?"
@@ -6080,7 +6123,8 @@ class App:
         rng = random.Random()
         live = False
         try:
-            live = bool(self.client) and E.market_clock()["is_open"]
+            # while the market is open, half the roams watch today live and half replay a past day on real prices
+            live = bool(self.client) and E.market_clock()["is_open"] and rng.random() < 0.5
         except Exception:
             pass
         uni = self.scan_universe()
@@ -11090,8 +11134,9 @@ class App:
             tk.Label(card, text=lab.upper(), bg=CARD, fg=MUTED, font=("", 7, "bold")).pack(anchor="w")
             big = tk.Label(card, text="-", bg=CARD, fg=TEXT, font=("", 13, "bold"))
             big.pack(anchor="w")
-            sub = tk.Label(card, text="", bg=CARD, fg=MUTED, font=("", 7), wraplength=330, justify="left")
-            sub.pack(anchor="w")
+            sub = tk.Label(card, text="", bg=CARD, fg=MUTED, font=("", 7), wraplength=330, justify="left", anchor="nw", height=3)
+            sub.pack(anchor="w", fill="x")
+            card.bind("<Configure>", lambda e, l=sub: self._fit_wrap(l, e.width - 24))
             self.ov_stats[key] = (big, sub)
         tk.Label(sf.inner, text="FEATURES  \u2014  what each one is, what it's learning right now, a switch, and a way to jump to it",
                  bg=BG, fg=ACCENT, font=("", 8, "bold"), padx=8).pack(anchor="w", pady=(4, 0))
@@ -11122,10 +11167,21 @@ class App:
                 btn.config(command=flip)
             ttk.Button(head, text="Open \u203a", style="Plain.TButton", command=opener).pack(side="right", padx=(0, 8))
             tk.Label(card, text=what, bg=CARD, fg=MUTED, font=("", 8), wraplength=520, justify="left", anchor="w").pack(fill="x", pady=(4, 2))
-            lbl = tk.Label(card, text="", bg=CARD, fg=ACCENT, font=("", 8, "bold"), wraplength=520, justify="left", anchor="w")
+            # always three lines tall, so the card doesn't jump as the news changes
+            lbl = tk.Label(card, text="", bg=CARD, fg=ACCENT, font=("", 8, "bold"), wraplength=520, justify="left", anchor="nw",
+                           height=3)
             lbl.pack(fill="x")
+            card.bind("<Configure>", lambda e, l=lbl, w=card.winfo_children()[1]: (self._fit_wrap(l, e.width - 30),
+                                                                                 self._fit_wrap(w, e.width - 30)))
             self.feat_rows.append((btn, switch, lbl, status))
         self._feat_tick()
+
+    @staticmethod
+    def _fit_wrap(lbl, w):
+        """Wraps a label's text to the width it really has (only when that changes, so resizing stays light)."""
+        w = max(120, int(w))
+        if abs(int(lbl.cget("wraplength") or 0) - w) > 8:
+            lbl.config(wraplength=w)
 
     def _feat_tick(self):
         try:
@@ -11172,15 +11228,23 @@ class App:
         log = list(getattr(self, "roam_log", []) or [])
         kinds = collections.Counter(r.get("kind") for r in log)
         day = time.time() - 86400
-        set_ = lambda k, big, sub="": (self.ov_stats[k][0].config(text=big), self.ov_stats[k][1].config(text=sub))
+        clip = lambda x: x if len(x) <= 140 else x[:137].rstrip() + "..."
+        set_ = lambda k, big, sub="": (self.ov_stats[k][0].config(text=big), self.ov_stats[k][1].config(text=clip(" ".join(str(sub).split()))))
         set_("roam", f"{getattr(self, 'roam_n', 0):,}", "  |  ".join(x for x in (
             ", ".join(f"{n} {k.lower()}" for k, n in kinds.most_common()),
             f"{sum(1 for r in log if r.get('time', 0) >= day)} in the last 24 h") if x))
         reps = [r for r in log if r.get("kind") == "Scalp roam"]
         set_("replay", f"{len(reps)}", f"last: {reps[-1].get('day', '')}  {reps[-1].get('summary', '')[:90]}" if reps else "none yet")
-        reals = [r["real"] for r in reps if r.get("real") is not None]
-        set_("real", f"{sum(reals) / len(reals) * 100:.0f}% of fills" if reals else "-",
-             f"over {len(reals)} replayed days since Feb 2024" if reals else "log in to Alpaca: past days then trade real contracts")
+        reals = [r["real"] for r in reps if r.get("real") is not None and not r.get("live")]
+        if reals:
+            sub = f"over {len(reals)} replayed past days (Alpaca history since Feb 2024)"
+        elif not self.client:
+            sub = "log in to Alpaca: replayed past days then trade real contracts"
+        elif not self.cfg.get("roam_on"):
+            sub = "logged in: turn on Free roam and its day replays will use real contracts"
+        else:
+            sub = "logged in: waiting for Free roam's first past-day replay"
+        set_("real", f"{sum(reals) / len(reals) * 100:.0f}% of fills" if reals else "-", sub)
         tf = self.tourn
         hb = getattr(tf, "hindsight", {}) if tf else {}
         worked = [n for n, e in hb.items() if e.get("best")]
@@ -11212,7 +11276,8 @@ class App:
                 if btn is not None:
                     on = bool(switch[0]())
                     btn.config(text="ON" if on else "OFF", bg=GREEN if on else "#4b5563", activebackground=GREEN if on else "#4b5563")
-                lbl.config(text=status())
+                txt = " ".join(str(status() or "").split())
+                lbl.config(text=txt if len(txt) <= 260 else txt[:257].rstrip() + "...")
             except Exception:
                 lbl.config(text="")
 
