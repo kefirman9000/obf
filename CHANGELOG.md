@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.17.2
+- **Free roam no longer gets stuck on a ticker with a short or patchy history** (a new listing, or one with days
+  without a single trade): it fits each journey to the history your tickers actually share and tries more starting
+  points. If one ticker still leaves no clean stretch, Free roam studies the others without it for now and says so once
+  (the farm still trades it as usual). Before, it could fail with "no stretch that long where every ticker was trading"
+  every few minutes.
+- **No more error reports when OBF closes or restarts**: messages that arrive after the window is gone are skipped
+  instead of trying to update screens that no longer exist ("invalid command name ..." in the crash log). Nothing was
+  ever lost; it only cluttered the log.
+- The last few "vs hold" labels (on dragon cards, in Training camp and in a bot's saved tests) now say "vs market" too.
+
 ## 1.17.1
 - **Practice in both places at once**: under Account > "Practice trades go to", choose **Both: OBF and my Alpaca paper
   account**. The PRACTICE session runs inside OBF as usual, and every practice trade is also copied to your Alpaca paper
