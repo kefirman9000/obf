@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.18.0
+- **Hindsight: bots learn what WOULD have worked**: a new Free roam study (every fifth). Looking back at a stretch of the
+  past, about 50 instincts and settings are tried on its first 70%, and the most promising are checked on the last 30%
+  they never saw. Whatever made money on both goes into the farm's **hindsight book**; the best one hatches on your farm
+  as a "Hindsight egg", and from then on most new eggs start from the book instead of being random. Good finds are tried
+  again, tweaked, so they get refined. The book is kept with the farm and shows in Farm knowledge as "What would have
+  worked". Settings > Learning > Hindsight.
+- **Kamikaze dragons** (charcoal, with a burning tail): a new breed (10% of the farm by default) that makes
+  all-or-nothing bets on cheap, far-out contracts with little time left, a huge target and almost no stop. They get only
+  a small say in your account. Each one also tests one or two rules the farm knows least about, so your good bots don't
+  pay for finding out what fails: when a kamikaze leaves, what its rules did goes into the farm's trial book (in Farm
+  knowledge), and never-rules that kept saving money become more likely in ordinary eggs.
+  Settings > Learning > Kamikaze breed.
+
 ## 1.17.3
 - **Training shows each bot's own results**: Free roam and the Training camp no longer compare bots with simply holding.
   - Free roam's "best to worst" list: tests, how many made money, average return, total trades, win rate, and each

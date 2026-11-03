@@ -181,6 +181,11 @@ SETTING_GROUPS = [
         ("classics", "Famous strategies hatch from silver eggs (golden cross, turtle, RSI-2...)", bool),
         ("classic_rate", "...% of new eggs that are a famous strategy", float),
         ("long_holds", "Slow, longer-holding bots from the start", bool),
+        ("hindsight", "Hindsight: Free roam also looks back at what WOULD have worked (many instincts and settings tried on "
+                      "a stretch, checked on the part after it), and new eggs start from what worked instead of at random", bool),
+        ("kamikazes", "Kamikaze breed: all-or-nothing bets on cheap far-out contracts with huge targets; each one also tests "
+                      "one or two risky rules so your good bots don't have to. They get only a small say in your account", bool),
+        ("kami_share", "...% of the farm kept for kamikazes", int),
         ("scalpers", "Scalp breed (wind dragons): fast in-and-out bots with their own stop and target (from quick 6% "
                      "nips up to 300% runs), a time limit, and flat before the close. Needs a decision speed of 5 min "
                      "or faster", bool),
@@ -600,9 +605,11 @@ THEMES = {  # themed dragons: palette per type
     "ice": dict(body="#7dd3fc", belly="#f0f9ff", horn="#e0f2fe", wing="#0ea5e9", eye="#0c4a6e"),
     "lightning": dict(body="#facc15", belly="#fef9c3", horn="#1e3a8a", wing="#2563eb", eye="#1e3a8a"),
     "space": dict(body="#3730a3", belly="#a78bfa", horn="#e9d5ff", wing="#1e1b4b", eye="#f0abfc"),
+    "kami": dict(body="#1c1917", belly="#f97316", horn="#fbbf24", wing="#7c2d12", eye="#fde047", outline="#ea580c"),
     "wind": dict(body="#2dd4bf", belly="#ccfbf1", horn="#134e4a", wing="#0d9488", eye="#f8fafc"),
     "skeleton": dict(body="#1f2937", belly="#1f2937", horn="#e7e5e4", wing="#374151", eye="#4ade80", outline="#e7e5e4"),
 }
+KAMI_MARK = "\u2604 "  # cards of the kamikaze breed are drawn by passing the strategy name with this mark in front
 FAMILY_THEME = {  # strategy family -> dragon type
     "SMA crossover": "fire", "EMA crossover": "fire", "MACD": "fire", "Momentum": "fire",
     "RSI": "ice", "Stochastic": "ice", "Bollinger bands": "ice", "Mean reversion": "ice", "VWAP snap-back": "ice",
@@ -614,6 +621,7 @@ FAMILY_THEME = {  # strategy family -> dragon type
 THEME_NAMES = {"fire": "Fire dragon (trend follower)", "ice": "Ice dragon (buys dips)",
                "lightning": "Lightning dragon (breakouts)", "space": "Space dragon (dips in an uptrend)",
                "wind": "Wind dragon (scalper: in and out within minutes)",
+               "kami": "Kamikaze dragon (all-or-nothing bets, tests risky rules for the farm)",
                "skeleton": "Skeleton dragon (resting: not winning right now)"}
 CHARACTER_MODE = {"mode": "Themed dragons"}  # or "Classic dragons" (coloured by status)
 
@@ -623,6 +631,8 @@ def theme_for(strat, status=None):
         return None
     if status == "benched":
         return "skeleton"
+    if str(strat).startswith(KAMI_MARK):
+        return "kami"
     return FAMILY_THEME.get(strat, "fire")
 
 
@@ -658,6 +668,13 @@ def draw_creature(c, strat, x, y, size, color, status=None, **kw):
             c.create_line(*P(4, -4, 1, 2, 5, 2, 2, 8), fill="#fde047", width=max(1, 1.5 * k), tags=tags)
         if awake and phase % 6 == 3:
             c.create_line(*P(27, -2, 24, 3, 28, 3, 25, 9), fill="#93c5fd", width=max(1, 1.5 * k), tags=tags)
+    elif th == "kami":  # the kamikaze breed: a burning tail and sparks
+        f_ = phase % 4
+        c.create_polygon(*P(-6 - f_, 12, 0, 9, 1, 15), fill="#f97316", outline="#fde047", tags=tags)
+        if awake:
+            for n in range(2):
+                t_ = (phase + n * 5) % 10
+                c.create_oval(*P(2 + n * 4, 8 - t_, 3.6 + n * 4, 9.6 - t_), fill="#fbbf24", outline="", tags=tags)
     elif th == "wind":  # the scalp breed: speed streaks rushing past
         n_ = 3 if awake else 1
         for n in range(n_):
@@ -5602,6 +5619,7 @@ class App:
     KNOW_TEXT = {"Never-rule": "Things bots refuse to do", "Study": "Extra reasons for and against",
                  "Instinct": "Main instincts", "Volatility gate": "Reading volatility", "Season champion": "Seasons mastered",
                  "Elder": "Elders' wisdom", "Mutation lesson": "How to breed winners", "Proven bot": "Proven dragons",
+                 "Hindsight": "What would have worked",
                  "Ticker habit": "Tickers it struggles with"}
 
     def know_sources(self):
@@ -5645,7 +5663,7 @@ class App:
         src_box.pack(side="left")
         ttk.Button(top, text="Save as a book...", style="Plain.TButton", command=lambda: save_book()).pack(side="left", padx=6)
         ttk.Button(top, text="Delete book", style="Plain.TButton", command=lambda: del_book()).pack(side="left")
-        meters = tk.Canvas(w, height=126, bg=CARD, highlightthickness=0)
+        meters = tk.Canvas(w, height=168, bg=CARD, highlightthickness=0)
         meters.pack(fill="x", padx=10)
         fbar = tk.Frame(w, bg=BG, padx=10)
         fbar.pack(fill="x", pady=(8, 2))
@@ -5708,7 +5726,7 @@ class App:
                     meters.create_rectangle(px, y0 + 17, px + (cw - 24) / 10 - 3, y0 + 27, outline="",
                                             fill=(GREEN if level >= 7 else ACCENT if level >= 4 else "#f59e0b") if j < level else LINE)
             tot = sum(1 for x in items if x.get("strong"))
-            meters.create_text(10, 112, anchor="w", fill=MUTED, font=("", 8),
+            meters.create_text(10, 154, anchor="w", fill=MUTED, font=("", 8),
                                text=f"{len(items)} things learned, {tot} proven by their own evidence. "
                                     "Meters fill as more of each kind is proven.")
 
@@ -5807,7 +5825,9 @@ class App:
                     if time.time() - getattr(self, "_roam_last", 0) < wait:
                         continue
                     k += 1
-                    if self.cfg.get("roam_scalp", True) and t.scalpers() and k % 4 == 2:
+                    if self.settings.get("hindsight", True) and k % 5 == 4:
+                        self._roam_hindsight(t)
+                    elif self.cfg.get("roam_scalp", True) and t.scalpers() and k % 4 == 2:
                         self._roam_scalp(t)
                     elif k % 3 == 0:
                         self._roam_camp(t)
@@ -5998,6 +6018,50 @@ class App:
             if False:
                 self.write(f"◇ Free roam: {len(res)} bots tested themselves on {self._when(info['start'], True)} to "
                            f"{self._when(info['end'], True)}; {good} made money. Lessons saved.")
+        self.q.put(("call", apply))
+
+    def _roam_hindsight(self, t):
+        """Hindsight study: looking back at a stretch, which instincts and settings WOULD have made money (checked on the
+        part after it they didn't see). What worked goes into the farm's hindsight book, which new eggs start from, and
+        the best find hatches on your farm."""
+        rng = random.Random()
+        closes, extra, info = self._roam_pick(rng, 600)
+        self.roam_now = dict(info, kind="Hindsight", phase="study", text="Looking back: which instincts would have worked here?",
+                             bots=[], done=0, total=1, t0=time.time())
+        cur = self.roam_now
+        self.roam_feed.append(dict(kind="sep", text=f"Hindsight on {self._when(info['start'], True)} to "
+                                                    f"{self._when(info['end'], True)}  ({E.fmt_bar(info['gran'] / 60)} candles)"))
+        fee, slip = E.cost_model(self.settings)
+
+        def prog(d, n):
+            self.roam_check_on(t)
+            cur.update(done=d, total=n, text=f"Looking back: tried {d} of {n} instincts and settings")
+        res = E.hindsight_study(closes, extra, self.start_cash, fee, self.settings["trade_pct"] / 100, slip, rng,
+                                prior=getattr(t, "hindsight", {}), stop=lambda: self.tourn is not t or not self.cfg.get("roam_on"),
+                                progress=prog, risk_caps=t.risk_caps)
+
+        def apply():
+            if self.tourn is not t:
+                return
+            t.learn_hindsight(res)
+            ok = [r for r in res["results"] if r["ok"]]
+            grad = ""
+            if ok and self.seeded:
+                g = ok[0]["genes"]
+                v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
+                                  note="Hindsight egg:", tf=g["tf"], origin="hindsight", risk=g["risk"], traits=g["traits"],
+                                  vetoes=g["vetoes"], layers=g["layers"])
+                if v:
+                    grad = E.bot_nickname(v.key())
+                    self.refresh_board()
+            rows = [(STRAT_LABELS.get(r["genes"]["name"], r["genes"]["name"]) + " (" + ", ".join(f"{k}={x}" for k, x in r["genes"]["params"].items()) + ")",
+                     round(r["check_ret"] * 100, 2), r["closed"], round(r["check_ret"] * 100, 2), r["closed"], r["wins"],
+                     r["best"], r["worst"]) for r in res["results"][:6]]
+            rec = dict(time=time.time(), kind="Hindsight", start=info["start"], end=info["end"], gran=info["gran"], bars=info["bars"],
+                       hold=round(info["hold"] * 100, 2), mood=info["mood"], results=rows, passed=len(ok), graduate=grad,
+                       summary=f"tried {res['tried']} instincts and settings; {len(ok)} would have worked (on prices they "
+                               f"hadn't seen too)" + (f"; {grad} hatched from the best" if grad else ""))
+            self._roam_finish(rec, cur)
         self.q.put(("call", apply))
 
     def _roam_scalp(self, t):
@@ -6232,6 +6296,8 @@ class App:
         win rate and its single best and worst trade."""
         agg = {}
         for r in self.roam_log:
+            if r.get("kind") == "Hindsight":
+                continue
             for x in (self.roam_result(r, x) for x in r.get("results", [])):
                 nm = x["name"]
                 a = agg.setdefault(nm, dict(name=nm, n=0, made=0, tot=0.0, trades=0, closed=0, wins=0, best=None, worst=None,
@@ -6343,7 +6409,7 @@ class App:
         fr.pack(fill="x", pady=(4, 2))
         tk.Label(fr, text="Show", bg=BG, fg=MUTED).pack(side="left")
         flt = tk.StringVar(value="All")
-        ttk.Combobox(fr, textvariable=flt, values=["All", "Good finds", "Bad results", "Self-tests", "Practice farms", "Scalp roams"],
+        ttk.Combobox(fr, textvariable=flt, values=["All", "Good finds", "Bad results", "Self-tests", "Practice farms", "Scalp roams", "Hindsight"],
                      state="readonly", width=14).pack(side="left", padx=6)
         lb = tk.Frame(t2, bg=BG)
         lb.pack(fill="both", expand=True)
@@ -6376,6 +6442,14 @@ class App:
             "   • A scalper with 8+ winning scalps on a day becomes an ELDER, nudging future scalp eggs.\n"
             "   • A new scalper that beats all of yours there (10+ scalps, in profit) joins your farm as a 'Free roam scalp "
             "graduate'. For scalp roams, the % shown is the scalps' profit on the premium paid.\n\n"
+            "HINDSIGHT  (every fifth study)  Looking back at a stretch, about 50 instincts and settings are tried on its "
+            "first 70%; the 12 most promising are then checked on the last 30% they never saw. The ones that made money on "
+            "both 'would have worked': they go into your farm's hindsight book, the best one hatches on your farm as a "
+            "'Hindsight egg', and from then on most new eggs start from the book instead of at random. What worked before "
+            "is tried again, tweaked, so good finds get refined. (Settings > Learning > Hindsight.)\n\n"
+            "KAMIKAZES  Throwaway bots with all-or-nothing bets. Each one carries one or two rules the farm knows least about; "
+            "when a kamikaze leaves, what its rules did goes into the farm's trial book (shown in Farm knowledge), and the "
+            "never-rules that kept saving money become more likely in ordinary eggs.\n\n"
             "THE NUMBERS  Avg return: what a bot made or lost on average per test (for scalp roams, the scalps' profit on "
             "what they paid). Best / Worst trade: its single best and worst trade, as % of what it paid. Win rate: the share "
             "of its trades that made money. Made money: in how many of its tests it ended up.\n\n"
@@ -6431,6 +6505,8 @@ class App:
                 return "good" if r.get("passed") else "bad"
             if r["kind"] == "Scalp roam":
                 return "good" if r.get("pl", 0) > 0 else "bad"
+            if r["kind"] == "Hindsight":
+                return "good" if r.get("passed") else "bad"
             good = sum(1 for x in res if self.roam_result(r, x)["ret"] > 0)
             return "good" if good * 2 > len(res) else "bad" if good == 0 else "mixed"
 
@@ -6441,7 +6517,7 @@ class App:
                 v_ = verdict(r)
                 if (f_ == "Good finds" and v_ != "good") or (f_ == "Bad results" and v_ != "bad") or \
                         (f_ == "Self-tests" and r["kind"] != "Self-test") or (f_ == "Practice farms" and r["kind"] != "Practice farm") or \
-                        (f_ == "Scalp roams" and r["kind"] != "Scalp roam"):
+                        (f_ == "Scalp roams" and r["kind"] != "Scalp roam") or (f_ == "Hindsight" and r["kind"] != "Hindsight"):
                     continue
                 ex = r["summary"] + (":  " + ",  ".join(f"{x['name']} {x['ret']:+.1f}%" for x in (self.roam_result(r, x) for x in r.get("results", [])[:4]))
                                      if r.get("results") else "")
@@ -10189,7 +10265,8 @@ class App:
             tx = x + port + 8
             c.create_text(tx, y + 40, anchor="w", text=star + nick + ball, fill=gold if t == "beast" else TEXT,
                           font=("", 12 if big else 10, "bold"), tags="card")
-            c.create_text(tx, y + 58, anchor="w", text=STRAT_LABELS.get(v.name, v.name), fill=MUTED, font=("", 8), tags="card")
+            c.create_text(tx, y + 58, anchor="w", text=("\u2604 Kamikaze \u00b7 " if E.is_kami(v) else "") + STRAT_LABELS.get(v.name, v.name),
+                          fill="#f97316" if E.is_kami(v) else MUTED, font=("", 8), tags="card")
             sub = "hatching..." if t == "egg" else f"every {E.fmt_bar(v.tf * self.session_bar)}  |  {rar}"
             if v.classic:
                 sub = f"\u272a Classic: {v.classic}" + ("  \u26a0" if any(cl.get("controversial") and cl["title"] == v.classic
@@ -10228,7 +10305,7 @@ class App:
                 chips.append((f"{len(r['vetoes'])} never-rule{'s' if len(r['vetoes']) != 1 else ''}"
                               + (f", {good} proven" if good else ""), "#38bdf8"))
             self._chips(c, x + 10, y + ch - 17, x + cw - 8, chips)
-            self.grid_cards.append((x, y, x + cw, y + ch, v, r["status"], t, v.name))
+            self.grid_cards.append((x, y, x + cw, y + ch, v, r["status"], t, (KAMI_MARK + v.name) if E.is_kami(v) else v.name))
         nrows = (len(items) + per - 1) // per
         c.configure(scrollregion=(0, 0, W, nrows * (ch + g) + g))
         c.tag_raise("anim")  # keep the animated layer on top so nothing flickers when the cards are redrawn
