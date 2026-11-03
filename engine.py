@@ -1976,6 +1976,7 @@ DEFAULT_SETTINGS = {
     "luck_check": True,          # a bot's score counts for less when it rests on only a few trades
     "exam_gate": True,           # a bot that fails its exams (days it never trained on) can't be a BEAST
     "cond_aware": True,          # each bot's say depends on its record in today's conditions (wild/calm, time, news)
+    "think_between": True,       # a few times a minute the bots also decide on the candle that's still forming
     "long_holds": True,          # include slow, longer-holding bots from the start
     "show_broker_value": True,   # a tile with your Alpaca account's own value (logged in)
     "hindsight": True,           # bots learn from what would have worked (hindsight studies), and new eggs start from it
@@ -3288,10 +3289,11 @@ def is_exam_day(d):
     return int(hashlib.md5(("obf-exam-" + d.isoformat()).encode()).hexdigest(), 16) % 5 == 0
 
 
-def add_exam(v, kind, edge, n, when=None):
-    """Records one exam (edge: % result on unseen prices, vs the market where there is one; n: its trades)."""
+def add_exam(v, kind, edge, n, when=None, gran=None):
+    """Records one exam (edge: % result on unseen prices, vs the market where there is one; n: its trades; gran: the
+    candle size it was tested on, which is always the candle size it lives on)."""
     ex = list(getattr(v, "exams", None) or [])
-    ex.append(dict(k=kind, edge=round(float(edge), 3), n=int(n), at=round(time.time()), when=when))
+    ex.append(dict(k=kind, edge=round(float(edge), 3), n=int(n), at=round(time.time()), when=when, g=gran))
     v.exams = ex[-EXAM_KEEP:]
 
 
@@ -4134,6 +4136,54 @@ class Tournament:
         prev_eq = v.eq[-1] if v.eq else None
         x = extra if extra is not None else self.xfull
         made = bot_step(v, closes, n, self.coins, x)
+        self._book(v, made, last, n, x)
+        e = v.sim.equity(last)
+        if is_scalp(v.name) and (not v.trade_eq or any(t_["side"] == "sell" for _, t_ in made)):
+            v.trade_eq.append((n, e))  # scalpers are judged trade by trade (the first entry is the starting point)
+        if not self.replaying:
+            if v.live_eq0 is None:
+                v.live_eq0 = prev_eq if prev_eq else v.sim.start
+            v.live_n += 1
+        v.eq.append(e)
+        v.age += 1
+        v.peak = max(v.peak, e)
+        if v.peak > 0:
+            v.maxdd = max(v.maxdd, (v.peak - e) / v.peak)
+        if mood and mood != "unknown" and prev_eq:
+            v.mood_gain[mood] = v.mood_gain.get(mood, 0.0) + (e / prev_eq - 1)
+            v.mood_n[mood] = v.mood_n.get(mood, 0) + 1
+        if prev_eq:  # its record in each condition (wild or calm, time of day, news days): who to trust when
+            g_ = e / prev_eq - 1
+            for cd in getattr(self, "conds", ()):
+                v.cond_gain[cd] = v.cond_gain.get(cd, 0.0) + g_
+                v.cond_n[cd] = v.cond_n.get(cd, 0) + 1
+        while v.sim.tbars and v.sim.tbars[0] <= n - (v.eq.maxlen - 1):
+            v.sim.tbars.popleft()
+
+    def think(self, closes, extra=None, parts=2):
+        """A decision between candles: every bot looks at the candle that's still forming (the live price) and may act
+        on it, its stops and exits included, without waiting for the minute to end. Its score still moves one candle at
+        a time, so how bots are judged doesn't change. A ticker a bot already traded on this candle is left alone until
+        the next one, so nobody flips in and out on the same candle."""
+        self.xfull = extra
+        self.thinks = getattr(self, "thinks", 0) + 1
+        last = {c: closes[c][-1] for c in self.coins}
+        n = self.n
+        half = self.thinks % 2  # half the farm thinks each time (both halves every 30 s), so the screen stays smooth
+        for i, v in enumerate(self.vars):
+            if parts > 1 and i % parts != half % parts:
+                continue
+            coins = [c for c in self.coins if not (v.log and any(x[0] == n and x[1] == c for x in list(v.log)[-4:]))]
+            if not coins:
+                continue
+            made = bot_step(v, closes, n, coins, extra)
+            if made:
+                self._book(v, made, last, n, extra)
+                if is_scalp(v.name) and any(t_["side"] == "sell" for _, t_ in made):
+                    v.trade_eq.append((n, v.sim.equity(last)))
+
+    def _book(self, v, made, last, n, x):
+        """Keeps the books on a bot's trades: counts, wins and losses, its best and worst, the lessons from its losses."""
         for c, t in made:
             v.log.append((n, c, t["side"], last[c]))
             typ_ = (t.get("contract") or {}).get("type")
@@ -4165,28 +4215,6 @@ class Tournament:
                     self.on_trade(v, c, t, data_now(x, [c]) if x else None)
                 except Exception:
                     pass
-        e = v.sim.equity(last)
-        if is_scalp(v.name) and (not v.trade_eq or any(t_["side"] == "sell" for _, t_ in made)):
-            v.trade_eq.append((n, e))  # scalpers are judged trade by trade (the first entry is the starting point)
-        if not self.replaying:
-            if v.live_eq0 is None:
-                v.live_eq0 = prev_eq if prev_eq else v.sim.start
-            v.live_n += 1
-        v.eq.append(e)
-        v.age += 1
-        v.peak = max(v.peak, e)
-        if v.peak > 0:
-            v.maxdd = max(v.maxdd, (v.peak - e) / v.peak)
-        if mood and mood != "unknown" and prev_eq:
-            v.mood_gain[mood] = v.mood_gain.get(mood, 0.0) + (e / prev_eq - 1)
-            v.mood_n[mood] = v.mood_n.get(mood, 0) + 1
-        if prev_eq:  # its record in each condition (wild or calm, time of day, news days): who to trust when
-            g_ = e / prev_eq - 1
-            for cd in getattr(self, "conds", ()):
-                v.cond_gain[cd] = v.cond_gain.get(cd, 0.0) + g_
-                v.cond_n[cd] = v.cond_n.get(cd, 0) + 1
-        while v.sim.tbars and v.sim.tbars[0] <= n - (v.eq.maxlen - 1):
-            v.sim.tbars.popleft()
 
     def hold_over(self, k):
         """What just holding the coins (equal weight) returned over the last k decisions, or None."""
@@ -4434,6 +4462,17 @@ class Tournament:
         to judge are left alone, so new eggs get their chance and the farm doesn't fill with unjudged eggs."""
         stuck = sorted((v for v in self.vars if self.score(v) is None and not self.young(v)), key=lambda v: len(v.sim.tbars))
         return [(v, None) for v in stuck] + list(reversed(self.ranking()))
+
+    def trim_to_cap(self):
+        """Brings an overfull farm back down to its size (bots that can't be judged, then the weakest). -> removed"""
+        n = 0
+        while len(self.vars) > self.cap:
+            cands = [x for x, _ in self.weakest() if x not in self.active]
+            if not cands:
+                break
+            self._remove(cands[0], "farm over its size")
+            n += 1
+        return n
 
     def nursery_full(self):
         """True when too many bots are still too young to judge (40% of the farm): extra eggs then wait."""
@@ -4806,6 +4845,11 @@ class Tournament:
                 val = dv
             p[k] = int(round(val)) if isinstance(dv, int) else round(val, 2)
         fix_params(name, p)
+        if len(self.vars) >= self.cap:  # a full farm makes room first (never for a bot too young to judge)
+            cands = [x for x, _ in self.weakest() if x not in self.active]
+            if cands:
+                self._remove(cands[0], "dropped to make room")
+                self.events.append(f"Dropped {cands[0].label}")
         v = self._new(name, p, tf, risk, traits, vetoes, layers)
         self._register(v, [], origin)
         v.size_mult = min(max(float(size), 0.25), 3.0)
@@ -5024,7 +5068,9 @@ class Tournament:
                 v.mut_kinds = list(v.mut_kinds or [])
                 v.island = int(v.island or 0) % max(1, int(self.o.get("islands", 1) or 1))
                 v.mood_gain = dict(v.mood_gain or {})
-                v.exams = [dict(x) for x in (v.exams or []) if isinstance(x, dict)][-EXAM_KEEP:]
+                # (1.20.x self-tests could use other candle sizes than the bot's own: those don't count as exams)
+                v.exams = [dict(x) for x in (v.exams or []) if isinstance(x, dict)
+                           and not (x.get("k") == "self-test" and not x.get("g"))][-EXAM_KEEP:]
                 v.cond_gain, v.cond_n = dict(v.cond_gain or {}), dict(v.cond_n or {})
                 v._key = None
                 v.mood_n = dict(v.mood_n or {})

@@ -204,6 +204,8 @@ SETTING_GROUPS = [
         ("luck_check", "Luck check: a bot's great score counts for less while it rests on only a few trades", bool),
         ("exam_gate", "Exams: bots are tested on days they never trained on; failing keeps them out of BEASTS", bool),
         ("cond_aware", "Right bot for the moment: each bot's say follows its record in today's conditions", bool),
+        ("think_between", "Think between candles: a few times a minute the bots also decide on the candle that's still "
+                          "forming (the live price), so they can act without waiting for the minute to end", bool),
         ("time_habits", "Time habits: bots can learn to skip the opening or closing rush (graded in hindsight)", bool),
         ("agree_sizing", "Crowd confidence: your account trades bigger when several different strategies agree, smaller "
                          "when the farm is split", bool),
@@ -909,7 +911,13 @@ class App:
                          opts=E.tournament_opts(self.settings), cap=int(self.settings["max_bots"]),
                          retire_steps=self.retire_steps(self.session_bar))
         try:
-            return t if t.restore(d.get("farm")) else None
+            if not t.restore(d.get("farm")):
+                return None
+            gone = t.trim_to_cap()  # Free roam could push a farm past its size before 1.21
+            if gone:
+                self.q.put(("log", (f"Your farm had grown past its size of {t.cap}; {gone} bots that couldn't be judged or "
+                                    "were weakest made room.", "info")))
+            return t
         except Exception:
             # never lose a farm to a bug: keep a copy of the file before anything could save over it
             try:
@@ -1630,13 +1638,14 @@ class App:
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
-        t0, t1, t7, t8, tm, tt, tb, ts, tf_ = (ttk.Frame(nb) for _ in range(9))
+        t0, t1, t7, t8, tm, tt, tb, ts, tf_, tsu = (ttk.Frame(nb) for _ in range(10))
         nb.add(tf_, text="  \u2630 Overview  ")
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t7, text="  \u25c7 Slow farm  ")
         nb.add(t8, text="  Options  ")
         nb.add(t1, text="  Portfolio  ")
         nb.add(tb, text="  Bot positions  ")
+        nb.add(tsu, text="  \u2605 Success  ")
         nb.add(ts, text="  \u26a1 Scalpers  ")
         nb.add(tm, text="  Markets  ")
         nb.add(tt, text="  Trades  ")
@@ -1662,6 +1671,7 @@ class App:
         self.build_portfolio(t1)
         self.build_botpos_tab(tb)
         self.build_features_tab(tf_)
+        self.build_success_tab(tsu)
         sn_ = ttk.Notebook(ts)  # Scalpers = the live scalp lab + the market scan
         sn_.pack(fill="both", expand=True, pady=(4, 0))
         sn_.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
@@ -4597,6 +4607,57 @@ class App:
         finally:
             if not self.closing():
                 self.root.after(200, self.drain)
+            if not getattr(self, "_think_started", False):
+                self._think_started = True
+                self.root.after(self.THINK_EVERY * 1000, self.think_tick)
+
+    THINK_EVERY = 10  # seconds between looks at the forming candle (half the farm each time)
+
+    def think_tick(self):
+        """Thinking between candles: every few seconds, while the farm runs and the market is open, half the bots look at
+        the candle that's still forming (the live price) and may act on it instead of waiting for the minute to end."""
+        if self.closing():
+            return
+        try:
+            self._think()
+        except Exception:
+            note = self._record_error("thinking between candles")
+            if note:
+                self.write(note, "bad")
+        self.root.after(self.THINK_EVERY * 1000, self.think_tick)
+
+    def _think(self):
+        t, coins = self.tourn, list(self.session_coins)
+        if not (self.settings.get("think_between", True) and self.session and self.running and self.wild and t is not None
+                and coins and float(self.session_bar or 0) >= 1):
+            return
+        if self.market is not None and not self.market.get("is_open", True):
+            return  # nothing moves while the market is closed
+        since = time.time() - getattr(self, "_bar_at", 0)
+        if since < 8 or since > self.session_bar * 60 - 4:
+            return  # a candle has just closed, or is about to: that decision is coming anyway
+        if self.moving():
+            return  # the window is being moved or resized: wait, so it stays smooth
+        if not all(self.hist.get(c) and self.last.get(c) for c in coins):
+            return
+        now = time.time()
+        closes, extra = {}, {}
+        for c in coins:
+            px = self.last[c]
+            closes[c] = self.hist[c] + [px]
+            x = self.hx.get(c) or {}
+            hi, lo = self.bar_hl.get(c, [px, px])
+            if len(x.get("t", [])) == len(self.hist[c]):
+                extra[c] = dict(h=x["h"] + [max(hi, px)], l=x["l"] + [min(lo, px)],
+                                v=x["v"] + [float(self.cur_vol.get(c, 0.0))], t=x["t"] + [now])
+        if self.ctx_hist:
+            extra[E.CTX_KEY] = {k: list(q) + [q[-1]] for k, q in self.ctx_hist.items() if q}
+        if t.coins != coins:
+            return
+        t.think(closes, extra or None)
+        self.collect_shadow()
+        for e in t.pop_events():
+            self.write("Wildcard: " + friendly_text(e[0].lower() + e[1:]))
 
     def closing(self):
         """True once the main window has been destroyed (the app is quitting or restarting)."""
@@ -4784,6 +4845,7 @@ class App:
             self.write(f"The farm's coins were out of step with the session; it now trades {', '.join(fixed)}.", "warn")
         if self.wild and self.tourn:
             self.save_farm()
+            self._bar_at = time.time()
             self.tourn.step({c: self.hist[c] for c in self.session_coins}, self.extra_now())
             self.collect_shadow()
             for fn in (self.shadow_live_step, self.record_farm, self.maybe_retest):
@@ -5806,7 +5868,11 @@ class App:
         b_lib.config(command=save_lib)
 
     # ---------------- free roam (self-study) ----------------
-    ROAM_CANDLES = (300, 900, 3600, 86400)  # 5 min, 15 min, 1 hr, 1 day: the farm picks one each study
+    ROAM_CANDLES = (60, 300, 900, 3600, 86400)  # 1 min to 1 day: studies use the farm's own candle size when they can
+
+    def farm_gran(self):
+        """The candle size the farm lives on (seconds), which is what its bots must be studied and examined on."""
+        return E.candle_gran(float(getattr(self, "session_bar", 0) or self.settings.get("bar_minutes", 1)))
 
     # ---------------- farm knowledge: see, save and share what the farms have learned ----------------
     KNOW_TEXT = {"Never-rule": "Things bots refuse to do", "Study": "Extra reasons for and against",
@@ -6066,7 +6132,7 @@ class App:
         if self.roam_watching():
             time.sleep(0.03 if kind == "test" else 0.004)  # someone's watching: let the trades scroll by
 
-    def _roam_pick(self, rng, min_bars=400):
+    def _roam_pick(self, rng, min_bars=400, prefer=None):
         """The farm chooses where to learn: a candle size, then a stretch of history it has studied least, but only
         stretches where every ticker really traded (checked against each ticker's daily history first)."""
         coins = list(self.session_coins)
@@ -6108,7 +6174,9 @@ class App:
                     break
                 dset = set(days)
                 fits = [g for g in self.ROAM_CANDLES if room(days) * E.bars_per_day(g) / (7 / 5 * 1.04 / 1.0) * 0.9 >= min_bars]
-            gran = rng.choice(fits or self.ROAM_CANDLES[:1])
+            # the farm's own candle size first: a bot that decides every 15 one-minute candles learns nothing true
+            # about itself on daily candles (it would be deciding every 15 days)
+            gran = prefer if prefer in fits and _attempt < 6 else rng.choice(fits or self.ROAM_CANDLES[:1])
             most = int(room(days) * E.bars_per_day(gran) / (7 / 5 * 1.04) * 0.9)  # never longer than the shared history
             n = rng.randint(min(min_bars, most), max(min(min_bars, most), min(1500, most)))
             span = n / E.bars_per_day(gran) * 7 / 5 * 1.04 * 86400
@@ -6174,7 +6242,7 @@ class App:
         vars_ = list(t.vars)
         if not vars_:
             return
-        closes, extra, info = self._roam_pick(rng)
+        closes, extra, info = self._roam_pick(rng, prefer=self.farm_gran())
         ranked = [v for v, _ in t.ranking()]
         extra_picks = [next((v for v in ranked if E.is_kami(v)), None)]  # every self-test includes a kamikaze...
         if info["gran"] <= 300:  # ...and, on short candles, a scalper (they trade inside one day)
@@ -6208,17 +6276,22 @@ class App:
             if self.tourn is not t:
                 return
             res = []
+            taught = dict(bots=0, exams=0, elders=len(t.elders))
             for v, r in out:
                 if v in t.vars:
                     E.remember_backtest(v, r, t)
-                    if not E.is_kami(v):  # a stretch it never trained on: an exam
-                        E.add_exam(v, "self-test", r["edge"] * 100, r.get("closed", r["trades"]), info["start"])
+                    taught["bots"] += 1
+                    if not E.is_kami(v) and info["gran"] == self.farm_gran():  # unseen prices, its own candles: an exam
+                        E.add_exam(v, "self-test", r["edge"] * 100, r.get("closed", r["trades"]), info["start"], info["gran"])
+                        taught["exams"] += 1
                 res.append((E.bot_nickname(v.key()), round(r["ret"] * 100, 2), r["trades"], round(r["ret"] * 100, 2),
                             r.get("closed", 0), r.get("wins", 0), r.get("best_trade"), r.get("worst_trade")))
             good = sum(1 for x in res if x[1] > 0)
             rec = dict(time=time.time(), kind="Self-test", start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=res,
-                       summary=f"{good} of {len(res)} made money")
+                       summary=f"{good} of {len(res)} made money; taught: {taught['bots']} bots' rule evidence and memory"
+                               + (f", {taught['exams']} exams" if taught["exams"] else "")
+                               + (f", {len(t.elders) - taught['elders']} new elders" if len(t.elders) > taught["elders"] else ""))
             self._roam_finish(rec, cur)
             if False:
                 self.write(f"◇ Free roam: {len(res)} bots tested themselves on {self._when(info['start'], True)} to "
@@ -6230,7 +6303,7 @@ class App:
         part after it they didn't see). What worked goes into the farm's hindsight book, which new eggs start from, and
         the best find hatches on your farm."""
         rng = random.Random()
-        closes, extra, info = self._roam_pick(rng, 600)
+        closes, extra, info = self._roam_pick(rng, 600, prefer=self.farm_gran())
         self.roam_now = dict(info, kind="Hindsight", phase="study", text="Looking back: which instincts would have worked here?",
                              bots=[], done=0, total=1, t0=time.time())
         cur = self.roam_now
@@ -6424,7 +6497,7 @@ class App:
                     v.roam_scan = [round(rs[0] * 0.9 + b[0], 2), round(rs[1] * 0.9 + b[1], 2), rs[2] * 0.9 + b[2], rs[3] * 0.9 + b[3]]
                     if exam and not E.is_kami(v):  # a held-back day: an exam, and nothing is learned from it
                         if b[0]:
-                            E.add_exam(v, "day", pct, b[0], day.isoformat())
+                            E.add_exam(v, "day", pct, b[0], day.isoformat(), 60)
                         continue
                     if b[0] >= 8 and b[2] > 0:  # a scalper that paid on a day it never saw: an elder for future eggs
                         t.elders.append(dict(name=v.name, params=dict(v.params), tf=v.tf, edge=b[2] / b[3]))
@@ -6472,7 +6545,7 @@ class App:
         lessons and adopts its best graduate."""
         import random as _r
         rng = _r.Random()
-        closes, extra, info = self._roam_pick(rng, 700)
+        closes, extra, info = self._roam_pick(rng, 700, prefer=self.farm_gran())
         lead = t.active[:4] or t.vars[:4]
         seeds = [E._genes(v) for v in lead]
         self.roam_now = dict(info, kind="Practice farm", phase="study", text="A practice farm is living through this stretch",
@@ -6567,7 +6640,7 @@ class App:
         """Every bot Free roam has tested, best first: its tests, how many made money, its average return, trades,
         win rate and its single best and worst trade."""
         agg = {}
-        for r in self.roam_log:
+        for r in getattr(self, "roam_log", []) or []:
             if r.get("kind") == "Hindsight":
                 continue
             for x in (self.roam_result(r, x) for x in r.get("results", [])):
@@ -6595,6 +6668,39 @@ class App:
             a["farm"] = a["name"] in alive
             out.append(a)
         return sorted(out, key=lambda a: (-(a["avg"] > 0 and a["made"] * 2 >= a["n"]), -a["avg"]))
+
+    def roam_book(self):
+        """Everything Free roam has learned, as plain data: its findings per bot, the farm's hindsight book, exams,
+        elders, days studied, and the best bots it found (as a bot file other OBF copies can import)."""
+        t = self.tourn
+        good = [a["name"] for a in self.roam_bots() if a["farm"] and a["avg"] > 0 and a["made"] * 2 >= a["n"]]
+        rows = [r for r in (t.board() if t else []) if E.bot_nickname(r["v"].key()) in set(good)]
+        data = E.export_bots([dict(r, bar_minutes=self.session_bar) for r in rows], self.version,
+                             note="Free roam: made money in at least half its tests") if rows else dict(bots=[])
+        data["free_roam"] = dict(
+            made=datetime.now().isoformat(timespec="seconds"), studies=getattr(self, "roam_n", 0),
+            findings=[{k: (sorted(x) if isinstance(x, set) else x) for k, x in a.items()} for a in self.roam_bots()],
+            hindsight=getattr(t, "hindsight", {}) if t else {}, elders=list(getattr(t, "elders", []) if t else []),
+            exams={E.bot_nickname(v.key()): dict(verdict=E.exam_verdict(v, t.serial)[0], exams=v.exams)
+                   for v in (t.vars if t else []) if v.exams},
+            days_trained=sorted(getattr(self, "roam_days", set()) or []), log=list(getattr(self, "roam_log", []))[-150:])
+        return data
+
+    def export_roam(self, parent=None):
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(parent=parent, title="Export what Free roam learned", defaultextension=".json",
+                                            initialfile=f"OBF-free-roam-{datetime.now():%Y-%m-%d}.json",
+                                            filetypes=[("OBF bot file", "*.json")])
+        if not path:
+            return
+        try:
+            data = self.roam_book()
+            E.save_json(path, data)
+            self.write(f"Free roam's lessons saved to {path} ({len(data['bots'])} of its best bots inside; File > Import "
+                       "bots... loads them).", "good")
+        except Exception as e:
+            self._record_error("exporting Free roam")
+            messagebox.showerror("Export", f"Couldn't save it: {e}", parent=parent)
 
     def open_roam(self, parent=None):
         """The Free roam screen: an in-session banner, where in the past it's learning, the trades as they happen,
@@ -6670,6 +6776,22 @@ class App:
         nb.add(t1, text="  Bots it tested: best to worst  ")
         nb.add(t2, text="  Study log  ")
         nb.add(t3, text="  What the results do  ")
+        brow = tk.Frame(t1, bg=BG)
+        brow.pack(fill="x", pady=(4, 4))
+
+        def catch_picked():
+            names = [bots.item(i, "values")[0] for i in bots.selection()]
+            if not names:  # nothing picked: the green ones (made money in at least half their tests) still on the farm
+                names = [a["name"] for a in self.roam_bots() if a["farm"] and a["avg"] > 0 and a["made"] * 2 >= a["n"]]
+            rows = [r for r in (self.tourn.board() if self.tourn else []) if E.bot_nickname(r["v"].key()) in set(names)]
+            if not rows:
+                return messagebox.showinfo("Catch", "None of those bots are on your farm any more (only bots still on the "
+                                                    "farm can be caught). Pick one marked 'on your farm'.", parent=w)
+            caught = self.catch_rows(rows, "Free roam")
+            messagebox.showinfo("Catch", f"{len(caught) or len(rows)} bot(s) saved to your Library.", parent=w)
+        ttk.Button(brow, text="Catch to Library (the picked bots, or every green one on your farm)",
+                   command=catch_picked).pack(side="left")
+        ttk.Button(brow, text="Export what Free roam learned...", command=lambda: self.export_roam(w)).pack(side="left", padx=8)
         bots = self.make_tree(t1, ("who", "n", "wins", "avg", "best", "worst", "mode", "why"),
                               (130, 50, 90, 90, 70, 70, 90, 420),
                               ("Bot", "Tests", "Made money", "Avg return", "Trades", "Win rate", "Best trade", "Worst trade", "Now",
@@ -11250,7 +11372,27 @@ class App:
 
         s_ = lambda k: (lambda: bool(st.get(k, True)), lambda on: self._set_flag("settings", k, on))
         c_ = lambda k, d=False: (lambda: bool(self.cfg.get(k, d)), lambda on: self._set_flag("cfg", k, on))
+        def think_status():
+            t = self.tourn
+            n = getattr(t, "thinks", 0) if t else 0
+            on = st.get("think_between", True)
+            return (f"{'On' if on else 'Off'}: {n:,} looks at the forming candle this run (each bot gets about "
+                    f"{60 // (self.THINK_EVERY * 2) - 1} extra decisions a minute while the market is open).")
+
+        def succ_status():
+            t = self.tourn
+            if not t:
+                return "No farm yet."
+            live = self.success_rows(t, "live")
+            up = sum(1 for x in live if x[1] > 0)
+            return f"{up} of {len(live)} bots are up on fresh prices" + (
+                f"; best: {E.bot_nickname(live[0][0].key())} {live[0][1]:+.1f}%" if live else "") + "."
         return [
+            ("\u2605", "Success", "How every bot is doing, five ways: live, lifetime, Free roam tests, exams and day replays.",
+             succ_status, None, lambda: self.show_tab("Success")),
+            ("\u23f1", "Think between candles", "A few times a minute the bots also decide on the candle that's still "
+                                                "forming, so they can get in or out without waiting for the minute to end.",
+             think_status, s_("think_between"), lambda: self.open_settings() if hasattr(self, "open_settings") else None),
             ("\u25c7", "Free roam", "The farm goes back in time by itself: bots test themselves on stretches of the past, "
                                    "practice farms live through them, and every lesson comes home.",
              roam_status, (lambda: bool(self.cfg.get("roam_on")), lambda on: self.toggle_roam(on)), self.open_roam),
@@ -11294,6 +11436,136 @@ class App:
              lambda: f"{sum(1 for k, v in st.items() if isinstance(v, bool) and v)} learning options on.", None,
              lambda: self._settings_tab("Learning")),
         ]
+
+    SUCCESS_MODES = (
+        ("live", "Live", "On fresh prices since each bot was born (what it's doing right now)"),
+        ("life", "Lifetime", "Everything since it was born, including the recent past it replayed when it hatched"),
+        ("roam", "Free roam tests", "Its self-tests on stretches of the past (average return per test)"),
+        ("exam", "Exams", "Days and stretches it never trained on (average result; passing needs to beat luck)"),
+        ("day", "Day replays", "Scalpers and kamikazes: whole past trading days on 1-minute prices (profit on what they paid)"))
+
+    def success_rows(self, t, mode):
+        """[(bot, result %, how many (tests / decisions), trades, win rate, best, worst, detail)] for one view, best first."""
+        out = []
+        for v in list(t.vars):
+            best, worst = v.best_tr, v.worst_tr
+            closed = v.wins + v.losses
+            wr = v.wins / closed if closed else None
+            if mode == "live":
+                if not v.live_n or not v.live_eq0 or not v.eq:
+                    continue
+                out.append((v, (v.eq[-1] / v.live_eq0 - 1) * 100, f"{v.live_n} decisions", v.ntrades, wr, best, worst,
+                            "on prices that came in after it hatched"))
+            elif mode == "life":
+                lf = t.life(v)
+                out.append((v, lf["ret"] * 100, f"{v.age} decisions", lf["trades"], lf["winrate"], best, worst,
+                            "" if lf["edge"] is None else f"{lf['edge'] * 100:+.1f}% vs the market"))
+            elif mode == "roam":
+                bts = [b for b in (v.backtests or []) if b.get("trades")]
+                if not bts:
+                    continue
+                rets = [b["ret"] for b in bts]
+                wrs = [b["winrate"] for b in bts if b.get("winrate") is not None]
+                out.append((v, sum(rets) / len(rets), f"{len(bts)} tests, {sum(1 for x in rets if x > 0)} made money",
+                            sum(b["trades"] for b in bts), (sum(wrs) / len(wrs) / 100) if wrs else None, max(rets), min(rets),
+                            f"{sum(b['edge'] for b in bts) / len(bts):+.1f}% vs the market on average"))
+            elif mode == "exam":
+                ex = [x for x in (v.exams or []) if x.get("n", 0) > 0]
+                if not ex:
+                    continue
+                e = [x["edge"] for x in ex]
+                out.append((v, sum(e) / len(e), f"{len(ex)} exams, {sum(1 for x in e if x > 0)} won", sum(x["n"] for x in ex),
+                            None, max(e), min(e), E.exam_verdict(v, t.serial)[0]))
+            elif mode == "day":
+                rs = getattr(v, "roam_scan", None)
+                if not rs or not rs[0] or not rs[3]:
+                    continue
+                out.append((v, rs[2] / rs[3] * 100, f"{rs[0]:.0f} scalps", int(round(rs[0])), rs[1] / rs[0] if rs[0] else None,
+                            best, worst, "older days count a little less"))
+        return sorted(out, key=lambda x: -x[1])
+
+    def build_success_tab(self, parent):
+        """How well each bot is doing, in different views: live, lifetime, Free roam tests, exams and day replays."""
+        top = tk.Frame(parent, bg=BG)
+        top.pack(fill="x", padx=6, pady=(6, 2))
+        tk.Label(top, text="\u2605 Success", bg=BG, fg=TEXT, font=("", 12, "bold")).pack(side="left")
+        self.succ_farm = tk.StringVar(value="Bot Farm")
+        ttk.Combobox(top, textvariable=self.succ_farm, values=["Bot Farm", "Slow farm", "Scalp lab"], state="readonly",
+                     width=11).pack(side="left", padx=(12, 6))
+        self.succ_mode = tk.StringVar(value=self.cfg.get("succ_mode", "live"))
+        self.succ_btns = {}
+        for key, lab, tip in self.SUCCESS_MODES:
+            b = tk.Button(top, text=lab, relief="flat", bd=0, padx=10, pady=3, cursor="hand2", font=("", 9, "bold"),
+                          command=lambda k=key: (self.succ_mode.set(k), self.cfg.__setitem__("succ_mode", k), self.refresh_success()))
+            b.pack(side="left", padx=2)
+            Tip(b, tip)
+            self.succ_btns[key] = b
+        self.succ_farm.trace_add("write", lambda *a: self.refresh_success())
+        self.succ_note = tk.Label(parent, text="", bg=BG, fg=MUTED, anchor="w", font=("", 8), padx=8)
+        self.succ_note.pack(fill="x")
+        self.succ_cv = tk.Canvas(parent, bg=CARD, height=170, highlightthickness=0)
+        self.succ_cv.pack(fill="x", padx=6, pady=(2, 4))
+        self.succ_cv.bind("<Configure>", lambda e: self.later(self.refresh_success, 200))
+        fr = tk.Frame(parent, bg=BG)
+        fr.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.succ_tree = self.make_tree(fr, ("bot", "breed", "status", "res", "n", "trades", "wr", "best", "worst", "det"),
+                                        (130, 150, 80, 80, 170, 60, 70, 80, 80, 260),
+                                        ("Bot", "Breed", "Status", "Result", "Based on", "Trades", "Win rate", "Best", "Worst",
+                                         "Notes"))
+        self.succ_tree.tag_configure("good", foreground=GREEN)
+        self.succ_tree.tag_configure("bad", foreground=RED)
+        self._succ_tick()
+
+    def _succ_tick(self):
+        try:
+            if "Success" in self.cur_tab() and not self.in_bg():
+                self.refresh_success()
+        except Exception:
+            pass
+        self.root.after(5000, self._succ_tick)
+
+    def refresh_success(self):
+        if not hasattr(self, "succ_tree"):
+            return
+        mode = self.succ_mode.get()
+        for k, b in self.succ_btns.items():
+            on = k == mode
+            b.config(bg=ACCENT if on else CARD, fg="white" if on else TEXT, activebackground=ACCENT)
+        t = {"Bot Farm": self.tourn, "Slow farm": getattr(self, "slow", {}).get("t"),
+             "Scalp lab": getattr(self, "lab", {}).get("t")}.get(self.succ_farm.get())
+        tree, cv = self.succ_tree, self.succ_cv
+        tree.delete(*tree.get_children())
+        cv.delete("all")
+        lab = dict((k, (l, tip)) for k, l, tip in self.SUCCESS_MODES)[mode]
+        if t is None:
+            self.succ_note.config(text=f"{self.succ_farm.get()}: not running yet.")
+            return
+        rows = self.success_rows(t, mode)
+        self.succ_note.config(text=f"{lab[1]}. {len(rows)} of {len(t.vars)} bots have results here."
+                                   + ("" if rows else "  (Nothing yet: Free roam fills the test, exam and replay views.)"))
+        pc = lambda x: "-" if x is None else f"{x:+.1f}%"
+        for v, res, n, trades, wr, best, worst, det in rows:
+            d = t.info.get(id(v), {})
+            tree.insert("", "end", tags=("good" if res > 0 else "bad" if res < 0 else "",), values=(
+                E.bot_nickname(v.key()), STRAT_LABELS.get(v.name, v.name), STATUS_TEXT.get(d.get("status"), d.get("status") or "-"),
+                pc(res), n, trades, "-" if wr is None else f"{wr * 100:.0f}%", pc(best), pc(worst), det))
+        W, H = max(200, cv.winfo_width()), int(cv.cget("height"))
+        top = rows[:12]
+        if not top:
+            return
+        hi = max(abs(x[1]) for x in top) or 1
+        mid = W * 0.45
+        bh = (H - 10) / len(top)
+        cv.create_line(mid, 4, mid, H - 4, fill=LINE)
+        for i, (v, res, *_x) in enumerate(top):
+            y = 6 + i * bh
+            L = (W * 0.5 - 70) * abs(res) / hi
+            x0, x1 = (mid, mid + L) if res >= 0 else (mid - L, mid)
+            cv.create_rectangle(x0, y + 1, x1, y + bh - 2, fill=GREEN if res >= 0 else RED, outline="")
+            cv.create_text(mid - 6 if res >= 0 else x0 - 6, y + bh / 2, anchor="e", fill=TEXT, font=("", 8),
+                           text=E.bot_nickname(v.key()))
+            cv.create_text((x1 + 6) if res >= 0 else (mid + 6), y + bh / 2, anchor="w", fill=MUTED, font=("", 8),
+                           text=f"{res:+.1f}%")
 
     def build_features_tab(self, parent):
         sf = ScrollFrame(parent, BG, width=900)

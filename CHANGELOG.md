@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.21.0
+- **Free roam now studies your farm's own candle size.** It often tested 1-minute bots on 5-minute, hourly or daily
+  candles. A bot that decides every 15 candles was being tested as if it decided every 15 days, so the lessons
+  (self-tests, hindsight eggs, practice-farm graduates) didn't fit. Studies now use the farm's candle size (1-minute
+  candles were added). Only tests on the bot's own candles count as exams; older mismatched self-test exams are
+  dropped once, so bots that "failed" them get a fair new start.
+- **The farm keeps to its size.** Free roam graduates and hindsight eggs could push a farm well past its size (one
+  report showed 127 bots on a 60-bot farm). New bots now make room first, never by dropping a bot too young to judge.
+  An overfull saved farm is trimmed back when it loads.
+- **Think between candles**: a few times a minute, the bots also decide on the candle that's still forming (the live
+  price), so they can get in or out without waiting for the minute to end. Their scores still move one candle at a
+  time, and a bot that traded a ticker on the current candle leaves it alone until the next one. Half the farm thinks
+  each time, so the screen stays smooth. On by default (Settings, and the Overview's feature list).
+- **Success tab**: how every bot is doing, in five views: Live (fresh prices), Lifetime, Free roam tests, Exams and Day
+  replays, for the Bot Farm, Slow farm or Scalp lab, with a chart of the best and worst.
+- **Keep what Free roam learned**: the Free roam screen can now catch its best bots into your Library (the ones you
+  pick, or every green one still on your farm), and **Export what Free roam learned...** saves its findings,
+  hindsight book, exams, elders and best bots to a file that File > Import bots... can load.
+- Each self-test now says what it taught (whose rule evidence and memory was updated, exams taken, new elders).
+
 ## 1.20.2
 - **Fix: the farm was filling up with eggs that never got judged.** Free roam hatches eggs often (hindsight eggs,
   graduates), and every new egg made room by dropping the weakest bot that already had a score. Bots too new to have
