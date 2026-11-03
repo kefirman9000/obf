@@ -3089,6 +3089,7 @@ class Variant:
         self.live_n = 0          # decisions made on prices that came in after the bot was created
         self.live_eq0 = None     # its equity when it started trading live (after any replay)
         self.log = deque(maxlen=300)  # (decision number, coin, side, price) of this bot's own trades, for charts
+        self.best_tr = self.worst_tr = None  # its best and worst finished trade, % of what it paid
         self.log_ct = {}  # (decision, ticker) -> "call" / "put" of the contract traded there
         self.roam_scan = None  # scalpers: [trades, wins, pl, paid] from Free roam's scalp roams on past days (fading)
         self.trade_eq = deque(maxlen=SCALP_JUDGE + 1)  # scalpers: (decision, equity) after each finished trade
@@ -3641,6 +3642,11 @@ class Tournament:
                     v.wins += 1
                 else:
                     v.losses += 1
+                paid_ = t["usd"] - t["pl"]
+                if paid_ > 0:
+                    pc_ = t["pl"] / paid_ * 100
+                    v.best_tr = pc_ if v.best_tr is None else max(v.best_tr, pc_)
+                    v.worst_tr = pc_ if v.worst_tr is None else min(v.worst_tr, pc_)
                 if t.get("flags") and not self.replaying:
                     for k in t["flags"]:
                         self.review.setdefault(k, [0, 0])[0 if t["pl"] <= 0 else 1] += 1
@@ -4627,7 +4633,8 @@ def backtest_bot(g, closes, extra=None, start_cash=1000.0, fee=0.006, pct=0.1, s
     wins = sum(1 for r in rets if r > 0)
     return dict(
         ret=ret, hold=hold, edge=ret - hold, maxdd=dd, trades=len(marks), winrate=wins / len(rets) if rets else None,
-        closed=len(rets), sortino=sortino, eq=eq, hold_eq=[x * start_cash for x in hold_eq], marks=marks, start=start,
+        closed=len(rets), wins=wins, best_trade=max(rets) * 100 if rets else None,
+        worst_trade=min(rets) * 100 if rets else None, sortino=sortino, eq=eq, hold_eq=[x * start_cash for x in hold_eq], marks=marks, start=start,
         by_coin=by_coin, by_mood=by_mood, layer_stats={k: list(v) for k, v in b.layer_stats.items()},
         veto_stats={k: list(v) for k, v in b.veto_stats.items()}, coin_pl={k: list(v) for k, v in b.coin_pl.items()},
         segments=segs, mc_dd95=dds[int(len(dds) * 0.95)] if dds else None, fees2x=f2, review=review,
@@ -4786,6 +4793,8 @@ def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes
     for v in picked[:max(12, cap // 3)]:
         lf = t.life(v)
         r = dict(v=v, genes=_genes(v), train_ret=lf["ret"], train_edge=lf["edge"], trades=lf["trades"], winrate=lf["winrate"],
+                 closed=lf["wins"] + lf["losses"], wins=lf["wins"], best_trade=getattr(v, "best_tr", None),
+                 worst_trade=getattr(v, "worst_tr", None),
                  exam_ret=None, exam_edge=None, passed=None, layer_stats={k: list(x) for k, x in v.layer_stats.items()},
                  veto_stats={k: list(x) for k, x in v.veto_stats.items()})
         if cut < L:
@@ -5148,7 +5157,7 @@ def _scan_one(g, sym, bars, day_start, ctx=None, feed=None):
     v.sim.genes = v.traits
     c, L = bars["c"], len(bars["c"])
     ctx = ctx or {}
-    out = dict(trades=0, wins=0, pl=0.0, paid=0.0, now=None, open=None)
+    out = dict(trades=0, wins=0, pl=0.0, paid=0.0, now=None, open=None, best=None, worst=None)
     for i in range(max(WARM, 1), L):
         x = {sym: {k: View(bars[k], i + 1) for k in ("h", "l", "v", "t")}}
         cl = {sym: View(c, i + 1)}
@@ -5168,6 +5177,10 @@ def _scan_one(g, sym, bars, day_start, ctx=None, feed=None):
                 out["wins"] += t["pl"] > 0
                 out["pl"] += t["pl"]
                 out["paid"] += t["usd"] - t["pl"]
+                if t["usd"] - t["pl"] > 0:
+                    pc_ = t["pl"] / (t["usd"] - t["pl"]) * 100
+                    out["best"] = pc_ if out["best"] is None else max(out["best"], pc_)
+                    out["worst"] = pc_ if out["worst"] is None else min(out["worst"], pc_)
             elif t["side"] == "buy" and i == L - 1:  # a setup firing on the newest bar: it's happening right now
                 out["now"] = dict(kind=(t.get("contract") or {}).get("type", ""), price=c[-1], why=v.why.get(sym, ""))
     q = v.sim.pos.get(sym, 0)
@@ -5212,11 +5225,14 @@ def scan_scalps(job):
             tk_["pl"] += pl
             tk_["paid"] += paid
             tk_["setups"] += r["trades"] + (1 if r["open"] else 0)
-            b = res["bots"].setdefault(g.get("uid", 0), [0, 0, 0.0, 0.0])
+            b = res["bots"].setdefault(g.get("uid", 0), [0, 0, 0.0, 0.0, None, None])  # trades, wins, P/L, paid, best %, worst %
             b[0] += r["trades"]
             b[1] += r["wins"]
             b[2] += r["pl"]
             b[3] += r["paid"]
+            if r["best"] is not None:
+                b[4] = r["best"] if b[4] is None else max(b[4], r["best"])
+                b[5] = r["worst"] if b[5] is None else min(b[5], r["worst"])
             if r["trades"] and (tk_["best_pl"] is None or r["pl"] > tk_["best_pl"]):
                 tk_["best"], tk_["best_pl"] = g["name"], r["pl"]
             if r["now"]:
