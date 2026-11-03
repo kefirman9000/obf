@@ -56,6 +56,7 @@ import time
 import tkinter as tk
 import uuid
 import zipfile
+import collections
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -1611,7 +1612,7 @@ class App:
         nb.pack(fill="both", expand=True, pady=(8, 0))
         nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
         t0, t1, t7, t8, tm, tt, tb, ts, tf_ = (ttk.Frame(nb) for _ in range(9))
-        nb.add(tf_, text="  \u2630 Features  ")
+        nb.add(tf_, text="  \u2630 Overview  ")
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t7, text="  \u25c7 Slow farm  ")
         nb.add(t8, text="  Options  ")
@@ -5829,7 +5830,7 @@ class App:
                     k += 1
                     if self.settings.get("hindsight", True) and k % 5 == 4:
                         self._roam_hindsight(t)
-                    elif self.cfg.get("roam_scalp", True) and t.scalpers() and k % 4 == 2:
+                    elif self.cfg.get("roam_scalp", True) and (t.scalpers() or t.kamikazes()) and k % 4 == 2:
                         self._roam_scalp(t)
                     elif k % 3 == 0:
                         self._roam_camp(t)
@@ -5980,8 +5981,13 @@ class App:
         vars_ = list(t.vars)
         if not vars_:
             return
-        picks = list(dict.fromkeys(([t.active[0]] if t.active else []) + rng.sample(vars_, min(3, len(vars_)))))
         closes, extra, info = self._roam_pick(rng)
+        ranked = [v for v, _ in t.ranking()]
+        extra_picks = [next((v for v in ranked if E.is_kami(v)), None)]  # every self-test includes a kamikaze...
+        if info["gran"] <= 300:  # ...and, on short candles, a scalper (they trade inside one day)
+            extra_picks.append(next((v for v in ranked if E.is_scalp(v.name)), None))
+        picks = list(dict.fromkeys(([t.active[0]] if t.active else []) + [v for v in extra_picks if v]
+                                   + rng.sample(vars_, min(3, len(vars_)))))[:6]
         names = [E.bot_nickname(v.key()) for v in picks]
         self.roam_now = dict(info, kind="Self-test", phase="study", text=f"{len(picks)} bots are testing themselves",
                              bots=names, done=0, total=len(picks), t0=time.time())
@@ -6078,9 +6084,12 @@ class App:
         except Exception:
             pass
         uni = self.scan_universe()
-        tickers = list(dict.fromkeys(list(self.session_coins) + rng.sample(uni, min(len(uni), 14))))[:16]
+        real_ok = bool(self.client)  # Alpaca's real option history (from February 2024) needs the login
+        tickers = list(dict.fromkeys(list(self.session_coins) + rng.sample(uni, min(len(uni), 8 if real_ok else 14))))[:10 if real_ok else 16]
         covered = {r.get("day") for r in self.roam_log if r.get("kind") == "Scalp roam" and not r.get("live")}
         earliest = max(E.HIST_START, datetime(int(self.settings.get("roam_from", 2016)), 1, 4).timestamp())
+        if real_ok:  # days with real option prices to trade against
+            earliest = max(earliest, E.ny_time(E.OPT_HIST_START, 9, 30))
         self.roam_now = dict(kind="Scalp roam", phase="download", gran=60, coins=tickers, start=None, end=None,
                              text="Choosing a trading day for the scalpers", t0=time.time(), done=0, total=1)
         cur = self.roam_now
@@ -6114,7 +6123,22 @@ class App:
         if live and E.ivx_today():
             ctx[E.IVX_KEY] = dict(c=[x[1] for x in E.ivx_today()], t=[x[0] for x in E.ivx_today()])
         trade = {c: b for c, b in bars.items() if c in tickers}
+        books = {}
+        if real_ok and not live and day.isoformat() >= E.OPT_HIST_START:
+            for i, sym in enumerate(trade):
+                self.roam_check_on(t)
+                b = trade[sym]
+                S0 = next((p for p, tt in zip(b["c"], b["t"]) if tt >= E.ny_time(day.isoformat(), 9, 30)), b["c"][-1])
+                cur.update(text=f"Loading the real option prices of {day:%b %d %Y}: {sym} ({i + 1} of {len(trade)})")
+                try:
+                    bk = E.day_option_book(sym, day.isoformat(), S0)
+                    if bk:
+                        books[sym] = bk
+                except Exception:
+                    continue
         genes = self.scan_genes()
+        kamis = [v for v, _ in t.ranking() if E.is_kami(v)][:3] or t.kamikazes()[:3]  # kamikazes try the day too
+        genes += [dict(E._genes(v), uid=v.uid) for v in kamis]
         ranked = [v for v, _ in t.ranking() if E.is_scalp(v.name)]
         newbies = []
         for j in range(4):  # a few new scalpers try out too: two tweaked from your best, two brand new
@@ -6140,9 +6164,10 @@ class App:
                    preview_t=[tday[i] for i in range(0, min(n_, len(tday)), step)], bots=[who[g["uid"]] for g in allg],
                    total=1, done=0, text=f"{len(allg)} scalpers are trading {len(trade)} tickers through {day:%a %b %d %Y}"
                                          + (" (today, live)" if live else ""))
-        self.roam_feed.append(dict(kind="sep", text=f"Scalp roam on {day:%b %d %Y}" + (" (today)" if live else "")
+        self.roam_feed.append(dict(kind="sep", text=f"Day replay on {day:%b %d %Y}" + (" (today)" if live else "")
+                                                    + (" with real option prices" if books else "")
                                                     + f": {len(allg)} scalpers x {len(trade)} tickers (1-minute candles)"))
-        job = dict(bars=trade, genes=allg, day=day.isoformat(), ctx=ctx, feed=True,
+        job = dict(bars=trade, genes=allg, day=day.isoformat(), ctx=ctx, feed=True, opt=books,
                    spread={k: list(v) for k, v in E.SPREAD_FIT.items()}, sspread=E.SCALP_SPREAD[0], iv=dict(E.IV_HINT))
         res = self._scan_run(job)
         self.roam_check_on(t)
@@ -6183,6 +6208,8 @@ class App:
                     v.roam_scan = [b[0], b[1], b[2], b[3]]
                     self.refresh_board()
             tot = [sum(b[k] for _, b, _ in rows) for k in range(4)]
+            rf = sum(x.get("real", 0) for x in res["tickers"].values())
+            ef = sum(x.get("est", 0) for x in res["tickers"].values())
             best_t = max(res["tickers"].items(), key=lambda kv: kv[1]["pl"] / kv[1]["paid"] if kv[1]["paid"] else -1e9, default=None)
             top = sorted(rows, key=lambda x: -x[2])[:6]
             rec = dict(time=time.time(), kind="Scalp roam", day=day.isoformat(), live=live, start=day0, end=close, gran=60,
@@ -6193,7 +6220,10 @@ class App:
                                 f"{tot[2] / tot[3] * 100 if tot[3] else 0:+.1f}% on premium"
                                 + (f"; best ticker {best_t[0]} ({best_t[1]['pl'] / best_t[1]['paid'] * 100:+.1f}%)"
                                    if best_t and best_t[1]["paid"] else "")
-                                + (f"; {grad} joined your farm" if grad else "")))
+                                + (f"; {grad} joined your farm" if grad else "")
+                                + (f"; real option prices for {rf / (rf + ef) * 100:.0f}% of fills" if rf + ef and books else
+                                   "; option prices estimated" if not books else "")),
+                       real=round(rf / (rf + ef), 3) if rf + ef else None)
             self._roam_finish(rec, cur)
         self.q.put(("call", apply))
 
@@ -6435,10 +6465,13 @@ class App:
             "graduate' (it still has to prove itself on live prices).\n"
             "   • Your farm also learns the practice farm's memory: its elders, season champions, post-trade review and "
             "which kinds of mutation made winners.\n\n"
-            "SCALP ROAM  (\u26a1, every fourth study when your farm has scalpers)  Your best scalpers and four new ones "
-            "(two tweaked from your best, two brand new) trade a whole day on 1-minute prices across about 16 tickers, "
-            "with VIXY and SPY for their volatility gates and real bid/ask costs. While the market is open the day is "
-            "today; otherwise it's a past day they haven't studied.\n"
+            "DAY REPLAY / SCALP ROAM  (\u26a1, every fourth study when your farm has scalpers or kamikazes)  Your best "
+            "scalpers, four new ones (two tweaked from your best, two brand new) and your best kamikazes trade a whole day "
+            "on 1-minute prices across up to 10 tickers, with VIXY and SPY for their volatility gates. While the market is "
+            "open the day is today; otherwise it's a past day they haven't studied. Logged in, past days come from "
+            "February 2024 on and the contracts are REAL: each trade uses a contract that was actually listed that day, "
+            "at the price it really traded at minute by minute (Alpaca's option history), and only falls back to an "
+            "estimate when a contract has no real price (the study log says what share of fills were real).\n"
             "   • Each scalper's results across past days build up (older days count a little less): ones that keep paying "
             "on tickers and days they never saw get a bigger say on your farm, ones that don't get less.\n"
             "   • A scalper with 8+ winning scalps on a day becomes an ELDER, nudging future scalp eggs.\n"
@@ -10866,7 +10899,7 @@ class App:
             self.opt_load(quiet=True)
         elif tab == "Bot positions":
             self.refresh_botpos()
-        elif "Features" in tab:
+        elif "Overview" in tab:
             self.refresh_features()
         elif "Scalp scan" in tab:
             self.refresh_scan()
@@ -11023,15 +11056,47 @@ class App:
         ]
 
     def build_features_tab(self, parent):
-        top = tk.Frame(parent, bg=BG, padx=10, pady=6)
-        top.pack(fill="x")
-        tk.Label(top, text="\u2630 Features", bg=BG, fg=TEXT, font=("", 13, "bold")).pack(side="left")
-        tk.Label(top, text="   What each one is, what it's learning right now, a switch, and a way to jump to it.",
-                 bg=BG, fg=MUTED, font=("", 9)).pack(side="left")
         sf = ScrollFrame(parent, BG, width=900)
         sf.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.feat_rows = []
-        grid = sf.inner
+        # --- every farm at a glance
+        ov = tk.Frame(sf.inner, bg=BG, padx=4, pady=4)
+        ov.pack(fill="x")
+        tk.Label(ov, text="\u2630 Overview", bg=BG, fg=TEXT, font=("", 13, "bold")).pack(anchor="w")
+        tk.Label(ov, text="Every farm and everything they're learning, in one place. Updated every few seconds.", bg=BG,
+                 fg=MUTED, font=("", 9)).pack(anchor="w")
+        ff = tk.Frame(ov, bg=BG)
+        ff.pack(fill="x", pady=(6, 4))
+        cols = ("farm", "bots", "winning", "gen", "best", "breeds", "learned", "state")
+        self.ov_tree = ttk.Treeview(ff, columns=cols, show="headings", height=4)
+        for c_, lab, wd in (("farm", "Farm", 120), ("bots", "Dragons", 70), ("winning", "Winning", 70), ("gen", "Generation", 80),
+                            ("best", "Best right now", 230), ("breeds", "Breeds", 230), ("learned", "Learned (proven)", 120),
+                            ("state", "Doing now", 330)):
+            self.ov_tree.heading(c_, text=lab)
+            self.ov_tree.column(c_, width=wd, anchor="w", stretch=c_ in ("best", "state"))
+        self.ov_tree.pack(fill="x")
+        self.ov_tree.bind("<Double-1>", lambda e: (lambda sel: self.show_tab({"Bot Farm": "Bot Farm", "Slow farm": "Slow farm",
+                                                                             "Scalp lab": "Scalp lab"}.get(sel[0], "Bot Farm"))
+                                                  if sel else None)(self.ov_tree.selection()))
+        prog = tk.Frame(ov, bg=BG)
+        prog.pack(fill="x", pady=(4, 8))
+        self.ov_stats = {}
+        for i, (key, lab) in enumerate((("roam", "Free roam studies"), ("replay", "Days replayed"), ("real", "Real option prices"),
+                                        ("hind", "What would have worked"), ("trial", "Rules tested by kamikazes"),
+                                        ("grads", "Graduates adopted"), ("lib", "Library / Hall of Fame"), ("know", "Things learned"))):
+            card = tk.Frame(prog, bg=CARD, highlightthickness=1, highlightbackground=LINE, padx=10, pady=6)
+            card.grid(row=i // 4, column=i % 4, sticky="nsew", padx=3, pady=3)
+            prog.columnconfigure(i % 4, weight=1, uniform="ov")
+            tk.Label(card, text=lab.upper(), bg=CARD, fg=MUTED, font=("", 7, "bold")).pack(anchor="w")
+            big = tk.Label(card, text="-", bg=CARD, fg=TEXT, font=("", 13, "bold"))
+            big.pack(anchor="w")
+            sub = tk.Label(card, text="", bg=CARD, fg=MUTED, font=("", 7), wraplength=330, justify="left")
+            sub.pack(anchor="w")
+            self.ov_stats[key] = (big, sub)
+        tk.Label(sf.inner, text="FEATURES  \u2014  what each one is, what it's learning right now, a switch, and a way to jump to it",
+                 bg=BG, fg=ACCENT, font=("", 8, "bold"), padx=8).pack(anchor="w", pady=(4, 0))
+        grid = tk.Frame(sf.inner, bg=BG)
+        grid.pack(fill="x")
         for col in (0, 1):
             grid.columnconfigure(col, weight=1, uniform="feat")
         for i, (icon, name, what, status, switch, opener) in enumerate(self.features()):
@@ -11064,13 +11129,84 @@ class App:
 
     def _feat_tick(self):
         try:
-            if "Features" in self.cur_tab() and not self.in_bg():
+            if "Overview" in self.cur_tab() and not self.in_bg():
                 self.refresh_features()
         except Exception:
             pass
         self.root.after(3000, self._feat_tick)
 
+    def overview_rows(self):
+        """One row per farm: (name, dragons, winning, generation, best now, breeds, learned, doing now)."""
+        out = []
+        lab = getattr(self, "lab", {})
+        for name, t, state in (("Bot Farm", self.tourn, ("running" if self.running else "paused") if self.session else "not started"),
+                               ("Slow farm", getattr(self, "slow", {}).get("t"), (getattr(self, "slow", {}).get("status") or
+                                                                                   ("running" if self.cfg.get("slow_on") else "paused"))),
+                               ("Scalp lab", lab.get("t"), lab.get("status") or "")):
+            if t is None:
+                out.append((name, "-", "-", "-", "-", "-", "-", state or "off"))
+                continue
+            vs = list(t.vars)
+            win = sum(1 for v in vs if t.info.get(id(v), {}).get("status") == "active")
+            gen = max((v.gen for v in vs), default=0)
+            r = [x for x in t.ranking() if x[1] is not None]
+            best = f"{E.bot_nickname(r[0][0].key())} ({STRAT_LABELS.get(r[0][0].name, r[0][0].name)}) {r[0][1] * 100:+.1f}%" if r else "-"
+            sc = sum(1 for v in vs if E.is_scalp(v.name))
+            ka = sum(1 for v in vs if E.is_kami(v))
+            breeds = f"{len(vs) - sc - ka} regular, {sc} scalpers, {ka} kamikazes"
+            try:
+                items = E.farm_knowledge(t)
+                learned = f"{len(items)} ({sum(1 for x in items if x.get('strong'))})"
+            except Exception:
+                learned = "-"
+            out.append((name, len(vs), win, gen, best, breeds, learned, str(state)[:120]))
+        return out
+
+    def refresh_overview(self):
+        if not hasattr(self, "ov_tree"):
+            return
+        t = self.ov_tree
+        t.delete(*t.get_children())
+        for row in self.overview_rows():
+            t.insert("", "end", iid=row[0], values=row)
+        log = list(getattr(self, "roam_log", []) or [])
+        kinds = collections.Counter(r.get("kind") for r in log)
+        day = time.time() - 86400
+        set_ = lambda k, big, sub="": (self.ov_stats[k][0].config(text=big), self.ov_stats[k][1].config(text=sub))
+        set_("roam", f"{getattr(self, 'roam_n', 0):,}", "  |  ".join(x for x in (
+            ", ".join(f"{n} {k.lower()}" for k, n in kinds.most_common()),
+            f"{sum(1 for r in log if r.get('time', 0) >= day)} in the last 24 h") if x))
+        reps = [r for r in log if r.get("kind") == "Scalp roam"]
+        set_("replay", f"{len(reps)}", f"last: {reps[-1].get('day', '')}  {reps[-1].get('summary', '')[:90]}" if reps else "none yet")
+        reals = [r["real"] for r in reps if r.get("real") is not None]
+        set_("real", f"{sum(reals) / len(reals) * 100:.0f}% of fills" if reals else "-",
+             f"over {len(reals)} replayed days since Feb 2024" if reals else "log in to Alpaca: past days then trade real contracts")
+        tf = self.tourn
+        hb = getattr(tf, "hindsight", {}) if tf else {}
+        worked = [n for n, e in hb.items() if e.get("best")]
+        set_("hind", f"{len(worked)} instincts", ("best: " + ", ".join(STRAT_LABELS.get(n, n) for n in sorted(
+            worked, key=lambda n: -hb[n]["wins"])[:4])) if worked else "nothing recorded yet")
+        tb = getattr(tf, "trial_book", {}) if tf else {}
+        good = [k for k, x in tb.items() if x[0] >= 5 and x[1] > 0]
+        set_("trial", f"{sum(1 for x in tb.values() if x[0] >= 3)}", f"{len(good)} proved useful" if tb else "none yet")
+        g_roam = sum(1 for r in log if r.get("graduate"))
+        g_lab = len((getattr(self, "lab", {}) or {}).get("grads", []))
+        set_("grads", f"{g_roam + g_lab}", f"{g_roam} from Free roam, {g_lab} from the Scalp lab")
+        try:
+            set_("lib", f"{len(self.library())} / {len(self.hof())}", "caught dragons / your champions")
+        except Exception:
+            pass
+        try:
+            items = E.farm_knowledge(tf) if tf else []
+            set_("know", f"{len(items)}", f"{sum(1 for x in items if x.get('strong'))} proven by their own evidence (Bot Farm)")
+        except Exception:
+            pass
+
     def refresh_features(self):
+        try:
+            self.refresh_overview()
+        except Exception:
+            self._record_error("updating the overview")
         for btn, switch, lbl, status in getattr(self, "feat_rows", []):
             try:
                 if btn is not None:
