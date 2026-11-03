@@ -707,6 +707,8 @@ def day_option_book(under, day, S, exp_days=8, width=0.06, per=12, note=None):
             if not token:
                 break
     book = dict(contracts=[x for x in keep if x["symbol"] in bars], bars=bars)
+    if keep and not book["contracts"]:
+        return None  # contracts listed but no prices came back (a hiccup): don't remember the day as empty
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         save_json(path, book)

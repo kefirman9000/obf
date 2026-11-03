@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.19.1
+- **Reset account**: a new button on the left that simply puts the account back to its starting money, with no
+  positions and no trades. Your farms, bots and everything they've learned are kept. The old Reset is now
+  **More reset options** for resetting the farm too.
+- **Smoother resizing**: resizing the window no longer sends every widget's resize through the app, so dragging the
+  window edge is lighter.
+- **Real option prices while the market is open**: Free roam now alternates between watching today live and replaying a
+  past day on real option prices, so real-price replays keep happening during trading hours. The Overview no longer says
+  "log in to Alpaca" when you are logged in; it says what it's waiting for instead. A day whose option prices failed to
+  download is tried again later instead of being remembered as empty.
+- **Overview cards stay one size**: the status text on every card has a fixed three lines of room and wraps to the
+  card's width, so the cards no longer jump as the news changes.
+
 ## 1.19.0
 - **Day replays trade real contracts at their real prices**: when Free roam replays a past trading day (scalp roams,
   now called day replays), it loads that day's real option history from Alpaca: the contracts that were actually
