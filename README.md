@@ -65,6 +65,8 @@ Each layer is graded on its own, and children inherit the evidence.
 - **Training camp**: send a whole farm through a long journey several times over, then give the best a final exam
   on ground they've never seen. Graduates can join your farm or your Library.
 - **Trials**: put any single dragon to the test, with a bad-luck test and a tougher-conditions test.
+- **Exams**: one day in five is held back. Dragons are examined on days they never trained on, and only the ones
+  that clearly beat luck can rise to the top.
 - **The slow farm**: a second, separate farm of slow, patient dragons that think in days instead of minutes.
 
 ## Everything the farm has learned

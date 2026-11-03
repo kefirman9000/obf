@@ -202,6 +202,8 @@ SETTING_GROUPS = [
         ("vetoes", "Never-rules: things a bot refuses to do, each graded in hindsight", bool),
         ("adapt_exits", "Adaptive stops: wider in wild markets, tighter in calm ones", bool),
         ("luck_check", "Luck check: a bot's great score counts for less while it rests on only a few trades", bool),
+        ("exam_gate", "Exams: bots are tested on days they never trained on; failing keeps them out of BEASTS", bool),
+        ("cond_aware", "Right bot for the moment: each bot's say follows its record in today's conditions", bool),
         ("time_habits", "Time habits: bots can learn to skip the opening or closing rush (graded in hindsight)", bool),
         ("agree_sizing", "Crowd confidence: your account trades bigger when several different strategies agree, smaller "
                          "when the farm is split", bool),
@@ -1758,6 +1760,7 @@ class App:
         m.add_command(label="Back up everything...", command=self.backup_all)
         m.add_command(label="Restore from a backup...", command=self.restore_all)
         m.add_command(label="Open data folder", command=self.open_data_folder)
+        m.add_command(label="Export a report for Claude...", command=self.export_report)
         m.add_separator()
         m.add_command(label="Reset...", command=self.open_reset)
         m.add_command(label="Run in the background (icon by the clock)", command=self.go_background)
@@ -3665,6 +3668,10 @@ class App:
                 status = "Shaky (not beating the market)"
             elif r["status"] == "slowed" and r.get("proving"):
                 status = "Proving itself (live prices)"
+            elif r["status"] == "slowed" and r.get("exam") == "failed":
+                status = "Failed its exams (unseen days)"
+            elif r["status"] == "active" and r.get("exam") == "passed":
+                status += " \u2713 exams"
             lf = r["life"]
             in_hof = r["v"].key() in hofk
             star = "\u2605 " if in_hof else ""
@@ -4404,6 +4411,125 @@ class App:
             info.append("(not found)")
         return "\n".join(info)
 
+    SECRET_WORDS = ("key", "secret", "token", "password", "pass", "account", "acct", "email", "user")
+
+    def _scrub(self, d):
+        """Settings with anything that could be a login, key or account number taken out."""
+        if isinstance(d, dict):
+            return {k: ("(hidden)" if any(w in str(k).lower() for w in self.SECRET_WORDS) else self._scrub(x)) for k, x in d.items()}
+        if isinstance(d, list):
+            return [self._scrub(x) for x in d]
+        return d
+
+    def _bot_rows(self, t, n=25):
+        out = []
+        for v, sc in t.ranking()[:n]:
+            d = t.info.get(id(v), {})
+            lf = t.life(v)
+            out.append(dict(
+                nickname=E.bot_nickname(v.key()), uid=v.uid, gen=v.gen, origin=v.origin, strategy=v.name, params=v.params,
+                tf=v.tf, scalper=E.is_scalp(v.name), kamikaze=E.is_kami(v), status=d.get("status"),
+                score_pct=None if sc is None else round(sc * 100, 2), consistency=d.get("cons"), weight=round(d.get("weight", 0) or 0, 4),
+                exam=E.exam_verdict(v, t.serial), exams=v.exams, good_at=[(c, round(x, 4)) for c, x in E.good_at(v)],
+                lifetime=dict(ret_pct=round(lf["ret"] * 100, 2), edge_pct=None if lf["edge"] is None else round(lf["edge"] * 100, 2),
+                              trades=lf["trades"], winrate=lf["winrate"], maxdd_pct=round(lf["maxdd"] * 100, 2), fees=round(lf["fees"], 2)),
+                best_trade_pct=v.best_tr, worst_trade_pct=v.worst_tr, power=round(v.power, 2), twin=v.twin,
+                risk=v.risk, traits=v.traits, vetoes=v.vetoes, veto_stats=v.veto_stats, layers=v.layers,
+                layer_stats=v.layer_stats, roam_scan=v.roam_scan, backtests=v.backtests[-5:],
+                rules=E.rule_stack(v)))
+        return out
+
+    def report_data(self):
+        """Everything worth knowing about what OBF is doing and learning, as plain data (no keys or account numbers)."""
+        def tail(name, n):
+            try:
+                with open(os.path.join(E.HOME_DIR, name), encoding="utf-8", errors="replace") as f:
+                    return f.readlines()[-n:]
+            except OSError:
+                return []
+        farms = {}
+        for name, t in (("Bot Farm", self.tourn), ("Slow farm", getattr(self, "slow", {}).get("t")),
+                        ("Scalp lab", getattr(self, "lab", {}).get("t"))):
+            if t is None:
+                continue
+            vs = list(t.vars)
+            try:
+                know = [dict(kind=x.get("kind"), title=x.get("title"), detail=x.get("detail"), evidence=x.get("evidence"),
+                             score=x.get("score"), strong=x.get("strong")) for x in E.farm_knowledge(t)]
+            except Exception:
+                know = []
+            farms[name] = dict(
+                bots=len(vs), tried=t.serial, decisions=t.n, cap=t.cap, coins=t.coins, mood=t.mood, conditions=getattr(t, "conds", []),
+                status=dict(collections.Counter(t.info.get(id(v), {}).get("status") for v in vs)),
+                breeds=dict(collections.Counter(STRAT_LABELS.get(v.name, v.name) for v in vs)),
+                exams=dict(collections.Counter(E.exam_verdict(v, t.serial)[0] for v in vs if not E.is_kami(v))),
+                exam_bar=round(E.exam_bar(t.serial), 2),
+                hindsight={k: dict(tries=round(e.get("tries", 0), 2), wins=round(e.get("wins", 0), 2), forward=e.get("fwd"),
+                                   best=[b.get("score") for b in e.get("best", [])]) for k, e in (getattr(t, "hindsight", {}) or {}).items()},
+                hindsight_share=t.hindsight_share(), trial_book=getattr(t, "trial_book", {}),
+                rule_review=t.review, mutation_stats=t.mut_stats, elders=len(t.elders), knowledge=know,
+                top_bots=self._bot_rows(t), events=list(getattr(t, "events", []))[-40:])
+        trades = [dict(x) for x in self.trades[-300:]]
+        for x in trades:
+            for k in list(x):
+                if not isinstance(x[k], (str, int, float, bool, type(None), list, dict)):
+                    x[k] = str(x[k])
+        return dict(
+            made=datetime.now().isoformat(timespec="seconds"), version=self.version, python=sys.version.split()[0],
+            platform=sys.platform, account=dict(name=self.acct_name(), session=self.session, live=self.live, running=self.running,
+                                                start_cash=self.start_cash, cash=round(self.cash, 2), positions=dict(self.pos),
+                                                options=self.opt, trades=len(self.trades), coins=self.session_coins,
+                                                bar_minutes=self.session_bar, logged_in=bool(self.client)),
+            settings=self._scrub(dict(self.settings)), switches=self._scrub({k: self.cfg.get(k) for k in self.cfg if k.endswith("_on")}),
+            farms=farms, free_roam=dict(on=bool(self.cfg.get("roam_on")), studies=getattr(self, "roam_n", 0),
+                                        days_trained=sorted(getattr(self, "roam_days", set()) or []),
+                                        holidays=sorted(getattr(self, "roam_dead", set()) or []),
+                                        log=list(getattr(self, "roam_log", []) or [])[-80:],
+                                        error=getattr(self, "roam_err", None)),
+            spreads={k: list(x) for k, x in E.SPREAD_FIT.items()}, recent_trades=trades,
+            errors_this_run=getattr(self, "err_count", 0), crash_log=tail("crash.log", 300), activity_log=tail("activity.log", 300))
+
+    def export_report(self):
+        """Saves a .zip with everything worth knowing about what OBF is doing (no keys, passwords or account numbers),
+        ready to attach in a chat with Claude."""
+        from tkinter import filedialog
+        import zipfile
+        name = f"OBF-report-{datetime.now():%Y-%m-%d-%H%M}.zip"
+        start = os.path.join(os.path.expanduser("~"), "Desktop")
+        path = filedialog.asksaveasfilename(title="Export a report for Claude", initialfile=name, defaultextension=".zip",
+                                            initialdir=start if os.path.isdir(start) else os.path.expanduser("~"),
+                                            filetypes=[("Zip file", "*.zip")])
+        if not path:
+            return
+        try:
+            data = self.report_data()
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+                z.writestr("README.txt", "OBF report: what the app is doing and learning, for analysis.\n"
+                                         "report.json = everything (farms, top bots and their rules, exams, Free roam log, "
+                                         "settings, recent trades, logs). summary.txt = the short version. "
+                                         "No API keys, passwords or account numbers are included.\n")
+                z.writestr("report.json", json.dumps(data, indent=1, default=str))
+                z.writestr("summary.txt", self.diagnostics_text() + "\n\n" + self._report_summary(data))
+            self.write(f"Report saved: {path}. Attach it in your chat with Claude.")
+            messagebox.showinfo("Report saved", f"Saved to:\n{path}\n\nAttach this file in your chat with Claude. It has no API "
+                                                "keys, passwords or account numbers.")
+        except Exception as e:
+            self._record_error("exporting the report")
+            messagebox.showerror("Report", f"Couldn't save the report: {e}")
+
+    @staticmethod
+    def _report_summary(d):
+        out = [f"--- account ---", json.dumps(d["account"], default=str)]
+        for name, f in d["farms"].items():
+            out += [f"--- {name} ---", f"{f['bots']} bots ({f['tried']} tried), status {f['status']}, exams {f['exams']} "
+                                       f"(bar {f['exam_bar']}), conditions now {f['conditions']}", "top bots:"]
+            out += [f"  {b['nickname']} {b['strategy']} {b['status']} score {b['score_pct']}% exam {b['exam'][0]} "
+                    f"trades {b['lifetime']['trades']} winrate {b['lifetime']['winrate']}" for b in f["top_bots"][:10]]
+        fr = d["free_roam"]
+        out += ["--- Free roam ---", f"on {fr['on']}, {fr['studies']} studies, {len(fr['days_trained'])} days trained"]
+        out += [f"  {r.get('kind')} {r.get('day') or ''} {r.get('summary', '')}" for r in fr["log"][-25:]]
+        return "\n".join(out)
+
     def show_diagnostics(self, parent=None):
         if parent is None:  # it lives as a tab in the system window
             return self.open_hub('system', 'Diagnostics')
@@ -4417,8 +4543,11 @@ class App:
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
             btn.config(text="Copied")
-        btn = ttk.Button(w, text="Copy all", command=copy)
-        btn.pack(pady=(0, 8))
+        row = ttk.Frame(w)
+        row.pack(pady=(0, 8))
+        btn = ttk.Button(row, text="Copy all", command=copy)
+        btn.pack(side="left", padx=4)
+        ttk.Button(row, text="Export a full report for Claude...", command=self.export_report).pack(side="left", padx=4)
 
     def on_cb_error(self, exc, val, tb):
         import traceback
@@ -5854,6 +5983,8 @@ class App:
         saved = E.load_json(self.roam_path(), {}) or {}
         self.roam_log = list(saved.get("log") or [])[-300:]
         self.roam_n = int(saved.get("n", len(self.roam_log)))
+        self.roam_days = set(saved.get("days") or [])   # past days the scalpers have trained on (day replays)
+        self.roam_dead = set(saved.get("dead") or [])   # weekdays nobody traded (holidays)
         self.roam_now = None
         self.roam_err = None
         self.roam_feed = deque(maxlen=400)
@@ -6013,7 +6144,8 @@ class App:
         if cur is None or self.roam_now is cur:  # a newer study may already be under way: leave its status alone
             self.roam_now = None
         try:
-            E.save_json(self.roam_path(), dict(n=self.roam_n, log=self.roam_log))
+            E.save_json(self.roam_path(), dict(n=self.roam_n, log=self.roam_log, days=sorted(self.roam_days),
+                                               dead=sorted(self.roam_dead)))
         except OSError:
             pass
 
@@ -6029,8 +6161,10 @@ class App:
         extra_picks = [next((v for v in ranked if E.is_kami(v)), None)]  # every self-test includes a kamikaze...
         if info["gran"] <= 300:  # ...and, on short candles, a scalper (they trade inside one day)
             extra_picks.append(next((v for v in ranked if E.is_scalp(v.name)), None))
-        picks = list(dict.fromkeys(([t.active[0]] if t.active else []) + [v for v in extra_picks if v]
-                                   + rng.sample(vars_, min(3, len(vars_)))))[:6]
+        # the ones that most need an exam first: BEASTS and the top of the ranking that haven't proven themselves yet
+        need = [v for v in list(t.active) + ranked[:12] if not E.is_kami(v) and E.exam_verdict(v, t.serial)[0] == "untested"]
+        picks = list(dict.fromkeys(([t.active[0]] if t.active else []) + need[:3] + [v for v in extra_picks if v]
+                                   + rng.sample(vars_, min(2, len(vars_)))))[:6]
         names = [E.bot_nickname(v.key()) for v in picks]
         self.roam_now = dict(info, kind="Self-test", phase="study", text=f"{len(picks)} bots are testing themselves",
                              bots=names, done=0, total=len(picks), t0=time.time())
@@ -6059,6 +6193,8 @@ class App:
             for v, r in out:
                 if v in t.vars:
                     E.remember_backtest(v, r, t)
+                    if not E.is_kami(v):  # a stretch it never trained on: an exam
+                        E.add_exam(v, "self-test", r["edge"] * 100, r.get("closed", r["trades"]), info["start"])
                 res.append((E.bot_nickname(v.key()), round(r["ret"] * 100, 2), r["trades"], round(r["ret"] * 100, 2),
                             r.get("closed", 0), r.get("wins", 0), r.get("best_trade"), r.get("worst_trade")))
             good = sum(1 for x in res if x[1] > 0)
@@ -6103,6 +6239,7 @@ class App:
                                   note="Hindsight egg:", tf=g["tf"], origin="hindsight", risk=g["risk"], traits=g["traits"],
                                   vetoes=g["vetoes"], layers=g["layers"])
                 if v:
+                    v.hs_src = g["name"]  # graded later on days it didn't look back at
                     grad = E.bot_nickname(v.key())
                     self.refresh_board()
             rows = [(STRAT_LABELS.get(r["genes"]["name"], r["genes"]["name"]) + " (" + ", ".join(f"{k}={x}" for k, x in r["genes"]["params"].items()) + ")",
@@ -6131,20 +6268,34 @@ class App:
         real_ok = bool(self.client)  # Alpaca's real option history (from February 2024) needs the login
         tickers = list(dict.fromkeys(list(self.session_coins) + rng.sample(uni, min(len(uni), 8 if real_ok else 14))))[:10 if real_ok else 16]
         covered = {r.get("day") for r in self.roam_log if r.get("kind") == "Scalp roam" and not r.get("live")}
+        covered |= self.roam_days
         earliest = max(E.HIST_START, datetime(int(self.settings.get("roam_from", 2016)), 1, 4).timestamp())
         if real_ok:  # days with real option prices to trade against
             earliest = max(earliest, E.ny_time(E.OPT_HIST_START, 9, 30))
+        # every third replay is an exam on a held-back day (one in five, never trained on); the others work through
+        # the training days in order, oldest first, so every day gets its turn
+        self.roam_scalp_n = getattr(self, "roam_scalp_n", 0) + 1
+        exam = not live and self.roam_scalp_n % 3 == 0 and bool(self.scan_genes())
+        days = [d for d in E.trading_days(earliest, time.time() - 86400) if d.isoformat() not in self.roam_dead]
+        if live:
+            order = [E.ny_date(time.time())]
+        elif exam:
+            order = [d for d in days if E.is_exam_day(d)]
+            rng.shuffle(order)
+        elif real_ok:
+            order = [d for d in days if not E.is_exam_day(d) and d.isoformat() not in covered]
+        else:
+            order = [d for d in days if not E.is_exam_day(d) and d.isoformat() not in covered]
+            rng.shuffle(order)
         self.roam_now = dict(kind="Scalp roam", phase="download", gran=60, coins=tickers, start=None, end=None,
-                             text="Choosing a trading day for the scalpers", t0=time.time(), done=0, total=1)
+                             text="Choosing a trading day for the scalpers", t0=time.time(), done=0, total=1, exam=exam)
         cur = self.roam_now
         day = None
-        for _attempt in range(8):
-            d = E.ny_date(time.time()) if live else E.ny_date(rng.uniform(earliest, time.time() - 86400))
-            if d.weekday() >= 5 or (not live and d.isoformat() in covered):
-                continue
+        for d in order[:8]:
             day0 = E.ny_time(d.isoformat(), 9, 30)
             close = day0 + 390 * 60
             bars = {}
+            got_any = False
             for i, sym in enumerate(tickers + ["VIXY", "SPY"]):
                 self.roam_check_on(t)
                 cur.update(start=day0, end=close, text=f"Loading 1-minute prices for {d:%b %d %Y}: {sym} ({i + 1} of {len(tickers) + 2})")
@@ -6153,14 +6304,19 @@ class App:
                          else E.fetch_range(sym, 60, day0 - 4 * 86400, close + 60, self.quote))
                 except Exception:
                     continue
+                got_any = got_any or bool(x.get("t"))
                 keep = [j for j, tt in enumerate(x.get("t") or []) if tt <= close + 60][-470:]
                 if sum(1 for j in keep if x["t"][j] >= day0) >= (20 if live else 200):  # it really traded that day
                     bars[sym] = {k: [x[k][j] for j in keep] for k in ("c", "h", "l", "v", "t")}
             if len([c for c in bars if c not in ("VIXY",)]) >= 4:
                 day = d
+                if not live and not exam:  # taken: the next replay moves on to the next day
+                    self.roam_days.add(d.isoformat())
                 break
             if live:
                 break
+            if got_any and not bars:  # prices came back but nobody traded: a holiday, never ask again
+                self.roam_dead.add(d.isoformat())
         if day is None:
             raise E.NoHistory("no trading day with enough 1-minute prices for the scalp roam")
         ctx = {k: dict(c=bars[k]["c"], t=bars[k]["t"]) for k in ("VIXY", "SPY") if k in bars}
@@ -6180,12 +6336,27 @@ class App:
                         books[sym] = bk
                 except Exception:
                     continue
+        if real_ok:  # what each ticker's options really cost to trade (bid/ask), from today's quotes, refreshed weekly
+            for sym in list(trade)[:10]:
+                fit = E.SPREAD_FIT.get(sym)
+                if fit and len(fit) > 2 and time.time() - fit[2] < 7 * 86400:
+                    continue
+                self.roam_check_on(t)
+                cur.update(text=f"Checking what {sym}'s options cost to trade (bid / ask)")
+                try:
+                    S = trade[sym]["c"][-1]
+                    today = datetime.now()
+                    rows = E.option_chain(sym, today.strftime("%Y-%m-%d"), (today + timedelta(days=12)).strftime("%Y-%m-%d"),
+                                          None, S * 0.9, S * 1.1)
+                    E.learn_spreads(sym, rows, S)
+                except Exception:
+                    continue
         genes = self.scan_genes()
         kamis = [v for v, _ in t.ranking() if E.is_kami(v)][:3] or t.kamikazes()[:3]  # kamikazes try the day too
         genes += [dict(E._genes(v), uid=v.uid) for v in kamis]
         ranked = [v for v, _ in t.ranking() if E.is_scalp(v.name)]
         newbies = []
-        for j in range(4):  # a few new scalpers try out too: two tweaked from your best, two brand new
+        for j in range(0 if exam else 4):  # a few new scalpers try out too: two tweaked from your best, two brand new
             par = (ranked[0] if j == 0 else rng.choice(ranked[:4])) if ranked and j < 2 else None
             nv = (t._new(par.name, t.mutate(par.name, par.params, 0.3), t.mutate_tf(par.tf), t.mutate_risk(par.risk),
                          t.mutate_traits(par.traits), dict(par.vetoes), json.loads(json.dumps(par.layers)))
@@ -6208,7 +6379,7 @@ class App:
                    preview_t=[tday[i] for i in range(0, min(n_, len(tday)), step)], bots=[who[g["uid"]] for g in allg],
                    total=1, done=0, text=f"{len(allg)} scalpers are trading {len(trade)} tickers through {day:%a %b %d %Y}"
                                          + (" (today, live)" if live else ""))
-        self.roam_feed.append(dict(kind="sep", text=f"Day replay on {day:%b %d %Y}" + (" (today)" if live else "")
+        self.roam_feed.append(dict(kind="sep", text=("Exam day" if exam else "Day replay") + f" on {day:%b %d %Y}" + (" (today)" if live else "")
                                                     + (" with real option prices" if books else "")
                                                     + f": {len(allg)} scalpers x {len(trade)} tickers (1-minute candles)"))
         job = dict(bars=trade, genes=allg, day=day.isoformat(), ctx=ctx, feed=True, opt=books,
@@ -6233,6 +6404,10 @@ class App:
                 if v is not None and not live:  # its record across past days (older days slowly count for less)
                     rs = v.roam_scan or [0, 0, 0.0, 0.0]
                     v.roam_scan = [round(rs[0] * 0.9 + b[0], 2), round(rs[1] * 0.9 + b[1], 2), rs[2] * 0.9 + b[2], rs[3] * 0.9 + b[3]]
+                    if exam and not E.is_kami(v):  # a held-back day: an exam, and nothing is learned from it
+                        if b[0]:
+                            E.add_exam(v, "day", pct, b[0], day.isoformat())
+                        continue
                     if b[0] >= 8 and b[2] > 0:  # a scalper that paid on a day it never saw: an elder for future eggs
                         t.elders.append(dict(name=v.name, params=dict(v.params), tf=v.tf, edge=b[2] / b[3]))
                         del t.elders[:-40]
@@ -6241,7 +6416,9 @@ class App:
             new = sorted(((g, b, pct) for g, b, pct in rows if g["uid"] < 0 and b[0] >= 10 and pct > 0 and pct > best_mine),
                          key=lambda x: -x[2])
             grad = ""
-            if new and self.seeded and len(t.vars) < t.cap + 2:
+            if not live and not exam:
+                self.roam_days.add(day.isoformat())
+            if new and self.seeded and len(t.vars) < t.cap + 2 and not exam:
                 g = new[0][0]
                 v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
                                   note="Free roam scalp graduate:", tf=g["tf"], origin="free roam", risk=g["risk"],
@@ -6255,12 +6432,13 @@ class App:
             rf = sum(x.get("real", 0) for x in res["tickers"].values())
             ef = sum(x.get("est", 0) for x in res["tickers"].values())
             best_t = max(res["tickers"].items(), key=lambda kv: kv[1]["pl"] / kv[1]["paid"] if kv[1]["paid"] else -1e9, default=None)
-            top = sorted(rows, key=lambda x: -x[2])[:6]
-            rec = dict(time=time.time(), kind="Scalp roam", day=day.isoformat(), live=live, start=day0, end=close, gran=60,
+            top = sorted(rows, key=lambda x: (not x[1][0], -x[2]))[:6]  # bots that traded first
+            rec = dict(time=time.time(), kind="Scalp roam", day=day.isoformat(), live=live, exam=exam, start=day0, end=close, gran=60,
                        bars=n_, hold=round(hold * 100, 2), mood=mood, pl=tot[2], paid=tot[3], graduate=grad, passed=1 if grad else 0,
                        results=[(who[g["uid"]], round(pct, 2), int(b[0]), round(pct, 2), int(b[0]), int(b[1]),
                                  b[4] if len(b) > 4 else None, b[5] if len(b) > 5 else None) for g, b, pct in top if b[0]],
-                       summary=(f"{int(tot[0])} scalps, {tot[1] / tot[0] * 100 if tot[0] else 0:.0f}% won, "
+                       summary=(("Exam on a held-back day: " if exam else "")
+                                + f"{int(tot[0])} scalps, {tot[1] / tot[0] * 100 if tot[0] else 0:.0f}% won, "
                                 f"{tot[2] / tot[3] * 100 if tot[3] else 0:+.1f}% on premium"
                                 + (f"; best ticker {best_t[0]} ({best_t[1]['pl'] / best_t[1]['paid'] * 100:+.1f}%)"
                                    if best_t and best_t[1]["paid"] else "")
@@ -11106,7 +11284,13 @@ class App:
         # --- every farm at a glance
         ov = tk.Frame(sf.inner, bg=BG, padx=4, pady=4)
         ov.pack(fill="x")
-        tk.Label(ov, text="\u2630 Overview", bg=BG, fg=TEXT, font=("", 13, "bold")).pack(anchor="w")
+        top_ = tk.Frame(ov, bg=BG)
+        top_.pack(fill="x")
+        tk.Label(top_, text="\u2630 Overview", bg=BG, fg=TEXT, font=("", 13, "bold")).pack(side="left")
+        eb = ttk.Button(top_, text="Export a report for Claude...", style="Plain.TButton", command=self.export_report)
+        eb.pack(side="right")
+        Tip(eb, "Saves a .zip of what every farm is doing and learning (no keys, passwords or account numbers) to attach "
+                "in a chat with Claude for analysis.")
         tk.Label(ov, text="Every farm and everything they're learning, in one place. Updated every few seconds.", bg=BG,
                  fg=MUTED, font=("", 9)).pack(anchor="w")
         ff = tk.Frame(ov, bg=BG)
@@ -11127,7 +11311,9 @@ class App:
         self.ov_stats = {}
         for i, (key, lab) in enumerate((("roam", "Free roam studies"), ("replay", "Days replayed"), ("real", "Real option prices"),
                                         ("hind", "What would have worked"), ("trial", "Rules tested by kamikazes"),
-                                        ("grads", "Graduates adopted"), ("lib", "Library / Hall of Fame"), ("know", "Things learned"))):
+                                        ("grads", "Graduates adopted"), ("lib", "Library / Hall of Fame"), ("know", "Things learned"),
+                                        ("exam", "Exams on unseen days"), ("order", "Days trained, in order"),
+                                        ("hsfwd", "Hindsight lessons that held up"), ("cond", "Bots that know their moment"))):
             card = tk.Frame(prog, bg=CARD, highlightthickness=1, highlightbackground=LINE, padx=10, pady=6)
             card.grid(row=i // 4, column=i % 4, sticky="nsew", padx=3, pady=3)
             prog.columnconfigure(i % 4, weight=1, uniform="ov")
@@ -11265,6 +11451,23 @@ class App:
             set_("know", f"{len(items)}", f"{sum(1 for x in items if x.get('strong'))} proven by their own evidence (Bot Farm)")
         except Exception:
             pass
+        if tf is not None:
+            vs = [v for v in tf.vars if not E.is_kami(v)]
+            ver = collections.Counter(E.exam_verdict(v, tf.serial)[0] for v in vs)
+            set_("exam", f"{ver['passed']} passed", f"{ver['failed']} failed, {ver['untested']} not proven yet; the bar for "
+                                                    f"beating luck is {E.exam_bar(tf.serial):.1f} after {tf.serial:,} bots tried")
+            n_cond = sum(1 for v in vs if E.good_at(v))
+            here = ", ".join(E.COND_TEXT.get(c, c) for c in getattr(tf, "conds", []))
+            set_("cond", f"{n_cond}", "have a record for each kind of market" + (f"; right now: {here}" if here else ""))
+            fw = [(e.get("fwd") or [0, 0]) for e in (getattr(tf, "hindsight", {}) or {}).values()]
+            fn, fw_ = sum(x[0] for x in fw), sum(x[1] for x in fw)
+            set_("hsfwd", f"{fw_} of {fn}" if fn else "-",
+                 f"hindsight eggs that did well later; {tf.hindsight_share() * 100:.0f}% of new eggs come from hindsight"
+                 if fn else "graded once its eggs take their exams")
+        days = sorted(getattr(self, "roam_days", set()) or [])
+        exams = [r for r in reps if r.get("exam")]
+        set_("order", f"{len(days)}", (f"up to {days[-1]}; " if days else "") + f"{len(exams)} exams on held-back days "
+             "(1 day in 5 is never trained on)")
 
     def refresh_features(self):
         try:
@@ -13189,7 +13392,7 @@ class App:
         for i, key in enumerate(("Status", "Recent gain", "vs the market (recent)", "Lifetime return", "Lifetime vs the market",
                                  "Win rate", "Trades", "Worst drop", "Time winning", "Best market", "Own stops",
                                  "Family", "Traits", "Fees paid", "Health / power", "Never-rules", "Twin test", "Skips coins",
-                                 "Badges", "Island", "Backtests")):
+                                 "Badges", "Island", "Backtests", "Exams", "Good at")):
             ttk.Label(stats, text=key, foreground=MUTED).grid(row=i // 3, column=(i % 3) * 2, sticky="w", padx=(0, 6), pady=2)
             l = ttk.Label(stats, text="-", font=("", 10, "bold"), wraplength=230)
             l.grid(row=i // 3, column=(i % 3) * 2 + 1, sticky="w", padx=(0, 22), pady=2)
@@ -13237,6 +13440,9 @@ class App:
                     (f"passed ({v.twin * 100:+.1f}% vs the market on older prices)" if v.twin > 0 else
                      f"failed ({v.twin * 100:+.1f}%): maybe just lucky, counts for less"),
                     "Skips coins": ", ".join(c_ for c_, x in v.coin_pl.items() if x[0] >= 3 and x[1] < -1.5) or "none",
+                    "Exams": E.exam_text(v, self.tourn.serial),
+                    "Good at": ("; ".join(f"{n_} ({x_:+.3f}% a decision)" for n_, x_ in E.good_at(v)[:3])
+                                or "still learning when it does best"),
                     "Badges": ", ".join(f"{n}" for n, _ in self.achievements(v, lf)) or "none yet",
                     "Island": f"{v.island + 1} of {int(self.tourn.o.get('islands', 1) or 1)}",
                     "Backtests": ("; ".join(f"{b_['ret']:+.1f}% ({b_['edge']:+.1f}% vs market, {b_['segments_passed']}/{b_['segments']} parts)"
