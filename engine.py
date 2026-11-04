@@ -4459,8 +4459,7 @@ class Tournament:
             edge = None if hold is None else sc - hold
             behind = bool(o["beat_hold"] and edge is not None and edge <= 0)
             failing = (o["fail_drop"] > 0 and self.drawdown(v) * 100 > o["fail_drop"]) or self.health(v) < 0.1
-            self.update_power(v, None if self.hold_ret is None else sc - (self.hold_over(span)
-                                                                          if hasattr(self, "hold_curve") else self.hold_ret))
+            self.update_power(v, None if self.hold_ret is None or hold is None else sc - hold)
             base = edge if (o["beat_hold"] and edge is not None and edge > 0) else sc
             proving = bool(o.get("prove_live", True)) and (
                 v.live_n < max(10, (v.eq.maxlen - 1) // 4) or (v.eq and v.live_eq0 and v.eq[-1] < v.live_eq0))
