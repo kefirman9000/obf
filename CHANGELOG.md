@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.23.1
+- **Detailed reports for Claude**: Tools > Export a detailed report for Claude... (or tick "Detailed reports" in
+  Settings to make every report detailed). On top of the usual report it adds:
+  - every bot's recent trades with what explains them: the contract, how far out of the money, the stock's price, the
+    volatility it was priced with and where that came from (the market's own, real past prices, or measured), how
+    long it was held, and the result (detail.json, and bot_trades.csv to open as a table);
+  - how the results spread out (by price source and by strategy), what a typical contract costs next to the bots'
+    trade size, each farm's instinct records and departures, the feature tests, the full Free roam log, errors.log;
+  - checks.txt: plain-English warnings for things that look wrong, such as trades over +1000%, farms where few bots
+    can be judged, contracts the bots can't afford, or holes in today's prices.
+- **Fix: charts had holes** when prices stopped for a while (the bot stopped or halted, the computer asleep, the
+  connection down, or one ticker's price not coming back), and nothing filled them in afterwards. Now, when the feed
+  sees the last candle is more than 3 candles old while the market is open, it fetches the missing candles from
+  Alpaca's history and adds them, so the charts and the bots' indicators have the real prices. (The bots don't trade
+  those minutes after the fact.)
+
 ## 1.23.0
 - **Fix: practice option prices were wildly optimistic, and the farm learned to chase that.** When the market's own
   (implied) volatility isn't known (Free roam's days in the past, tickers outside your session, the first minutes

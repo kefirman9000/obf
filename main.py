@@ -258,6 +258,8 @@ SETTING_GROUPS = [
                        "famous strategies silver)", "eggs"),
         ("daily_recap", "Daily recap: once a day, how the bots did against the market (in the log, and as a note on the "
                         "icon by the clock)", bool),
+        ("report_detail", "Detailed reports for Claude: Export a report also adds every bot's recent trades (with the "
+                          "prices and volatility behind them), the price feed's gaps, errors and automatic checks", bool),
         ("auto_backup", "Weekly backup: keep a copy of your bots, farms and settings in the data folder (last 4 kept, no keys)", bool),
         ("bg_mode", "Background mode: while OBF is minimized, skip all drawing and check watchlist prices less often", bool),
         ("tray_autotrain", "Icon by the clock: start training on practice prices as soon as OBF starts in the background "
@@ -1784,6 +1786,7 @@ class App:
         m.add_command(label="Restore from a backup...", command=self.restore_all)
         m.add_command(label="Open data folder", command=self.open_data_folder)
         m.add_command(label="Export a report for Claude...", command=self.export_report)
+        m.add_command(label="Export a detailed report for Claude...", command=lambda: self.export_report(detailed=True))
         m.add_separator()
         m.add_command(label="Reset...", command=self.open_reset)
         m.add_command(label="Run in the background (icon by the clock)", command=self.go_background)
@@ -4376,6 +4379,11 @@ class App:
                 elif now - last_warn >= 600:
                     last_warn = now
                     self.q.put(("log", (f"Still no prices after {(now - down_since) / 60:.0f} min. Still trying.", "warn")))
+                if prices and all(c in prices for c in coins):
+                    try:
+                        self._find_gap(coins, bar_min, gran)
+                    except Exception:
+                        E.note_error("backfill")
                 if prices:
                     self.q.put(("prices", prices))
                 if self.live and self.client and time.time() - self.last_bal > 30:
@@ -4396,6 +4404,70 @@ class App:
                 if not alive():
                     return
                 time.sleep(0.2)
+
+    # ---------------- filling holes in the price history ----------------
+    def _find_gap(self, coins, bar_min, gran):
+        """(Price feed thread.) If the last candle is more than 3 candles old while the market is open (the bot was
+        stopped, the computer slept, the connection dropped or one ticker's price didn't come back), the missing
+        candles are fetched from Alpaca's history and handed over before the next new candle, so the charts and the
+        bots' indicators have the real prices instead of a hole. The farm doesn't trade them after the fact."""
+        step = max(60.0, bar_min * 60)
+        try:
+            last = min(float(self.hx[c]["t"][-1]) for c in coins)
+        except (KeyError, IndexError, ValueError, TypeError):
+            return
+        now = time.time()
+        if now - last < 3 * step or last == getattr(self, "_gap_tried", None):
+            return
+        self._gap_tried = last  # one try per hole
+        start = max(last + 1, now - 6.5 * 3600)  # (at most one trading day back)
+        data = {}
+        for c in coins:
+            d = E.fetch_range(c, gran, start, now - step, self.quote)
+            if not d.get("t"):
+                return
+            data[c] = d
+        closes, extra = E.common_stretch(data)
+        ts = (next(iter(extra.values()), {}) or {}).get("t") or []
+        if ts:
+            self.q.put(("backfill", (closes, extra, last)))
+
+    def on_backfill(self, closes, extra, since):
+        """Adds the fetched candles (only ones newer than the last candle there is) to each ticker's history."""
+        coins = list(self.session_coins)
+        if not coins or set(closes) != set(coins):
+            return
+        try:
+            last = min(float(self.hx[c]["t"][-1]) for c in coins)
+        except (KeyError, IndexError, ValueError, TypeError):
+            return
+        ts = extra[coins[0]]["t"]
+        new = [i for i, t_ in enumerate(ts) if t_ > last + 1]
+        if not new:
+            return
+        keep = min(8000, max(2400, int(1440 / self.session_bar) + 20))
+        for c in coins:
+            h, x = self.hist[c], self.hx[c]
+            for i in new:
+                h.append(closes[c][i])
+                x["h"].append(extra[c]["h"][i])
+                x["l"].append(extra[c]["l"][i])
+                x["v"].append(extra[c]["v"][i])
+                x["t"].append(ts[i])
+            del h[:-keep]
+            for k in ("h", "l", "v", "t"):
+                del x[k][:-keep]
+        for sym, q in self.ctx_hist.items():  # watched tickers stay lined up (flat over the hole: no move read into it)
+            if q:
+                q.extend([q[-1]] * len(new))
+                del q[:-len(self.hist[coins[0]])]
+        a, b = datetime.fromtimestamp(since), datetime.fromtimestamp(ts[new[-1]])
+        self.write(f"Filled in {len(new)} missing candle{'s' if len(new) != 1 else ''} from Alpaca's history "
+                   f"({a:%H:%M} to {b:%H:%M}), so the charts have no hole. The bots didn't trade them after the fact.", "info")
+        try:
+            self.draw_chart()
+        except Exception:
+            E.note_error("on_backfill")
 
     def watchdog(self):
         """Every 5 seconds: restart the price feed if it died, and say so if prices have gone stale."""
@@ -4561,12 +4633,15 @@ class App:
             spreads={k: list(x) for k, x in E.SPREAD_FIT.items()}, recent_trades=trades,
             errors_this_run=getattr(self, "err_count", 0), crash_log=tail("crash.log", 300), activity_log=tail("activity.log", 300))
 
-    def export_report(self):
+    def export_report(self, detailed=None):
         """Saves a .zip with everything worth knowing about what OBF is doing (no keys, passwords or account numbers),
-        ready to attach in a chat with Claude."""
+        ready to attach in a chat with Claude. detailed (or the 'Detailed reports' setting) adds detail.json and
+        checks.txt: every bot's recent trades with what explains them, the price feed's gaps, errors, and checks."""
+        if detailed is None:
+            detailed = bool(self.settings.get("report_detail", False))
         from tkinter import filedialog
         import zipfile
-        name = f"OBF-report-{datetime.now():%Y-%m-%d-%H%M}.zip"
+        name = f"OBF-{'detailed-' if detailed else ''}report-{datetime.now():%Y-%m-%d-%H%M}.zip"
         start = os.path.join(os.path.expanduser("~"), "Desktop")
         path = filedialog.asksaveasfilename(title="Export a report for Claude", initialfile=name, defaultextension=".zip",
                                             initialdir=start if os.path.isdir(start) else os.path.expanduser("~"),
@@ -4579,15 +4654,163 @@ class App:
                 z.writestr("README.txt", "OBF report: what the app is doing and learning, for analysis.\n"
                                          "report.json = everything (farms, top bots and their rules, exams, Free roam log, "
                                          "settings, recent trades, logs). summary.txt = the short version. "
+                                         + ("detail.json = the detailed part (every bot's recent trades with the prices "
+                                            "and volatility behind them, the price feed's gaps, errors, learning records); "
+                                            "bot_trades.csv = those trades as a table; checks.txt = automatic checks "
+                                            "for things that look wrong. " if detailed else "") +
                                          "No API keys, passwords or account numbers are included.\n")
                 z.writestr("report.json", json.dumps(data, indent=1, default=str))
                 z.writestr("summary.txt", self.diagnostics_text() + "\n\n" + self._report_summary(data))
+                if detailed:
+                    det = self.report_detail()
+                    z.writestr("detail.json", json.dumps(det, indent=1, default=str))
+                    z.writestr("checks.txt", self._report_checks(det))
+                    z.writestr("bot_trades.csv", self._trades_csv(det["bot_trades"]))
             self.write(f"Report saved: {path}. Attach it in your chat with Claude.")
             messagebox.showinfo("Report saved", f"Saved to:\n{path}\n\nAttach this file in your chat with Claude. It has no API "
                                                 "keys, passwords or account numbers.")
         except Exception as e:
             self._record_error("exporting the report")
             messagebox.showerror("Report", f"Couldn't save the report: {e}")
+
+    def report_detail(self):
+        """The detailed part of a report: what's needed to see WHY the bots do what they do."""
+        import statistics as _st
+
+        def tail(name, n):
+            try:
+                with open(os.path.join(E.HOME_DIR, name), encoding="utf-8", errors="replace") as f:
+                    return f.readlines()[-n:]
+            except OSError:
+                return []
+        names = {}
+        for t_ in (self.tourn, getattr(self, "slow", {}).get("t"), getattr(self, "lab", {}).get("t")):
+            for v in (t_.vars if t_ else []):
+                names[v.uid] = E.bot_nickname(v.key())
+        trades = []
+        for r in list(getattr(self, "shadow_trades", []) or [])[-3000:]:
+            x = {k: r.get(k) for k in ("time", "side", "coin", "qty", "price", "usd", "pl", "who", "strategy", "under_px",
+                                        "vol", "vol_src", "held", "why")}
+            x["bot"] = names.get(r.get("bot"), r.get("bot"))
+            o = r.get("contract") or {}
+            if o:
+                x["contract"] = f"{tick_of(r.get('coin', ''))} {o.get('K', 0):g}{'C' if o.get('type') == 'call' else 'P'}"
+                x["expires"] = datetime.fromtimestamp(o["exp"]).strftime("%Y-%m-%d") if o.get("exp") else None
+                if r.get("under_px") and o.get("K"):
+                    x["otm_pct"] = round((o["K"] / r["under_px"] - 1) * 100 * (1 if o.get("type") == "call" else -1), 2)
+            try:
+                paid = float(r["usd"]) - float(r["pl"])
+                x["pl_pct"] = round(float(r["pl"]) / paid * 100, 2) if r.get("side") == "sell" and paid > 0 else None
+            except (TypeError, ValueError, KeyError):
+                x["pl_pct"] = None
+            trades.append(x)
+        sells = [x for x in trades if x.get("pl_pct") is not None]
+
+        def dist(xs):
+            xs = sorted(xs)
+            if not xs:
+                return None
+            q = lambda f: xs[min(len(xs) - 1, int(f * len(xs)))]
+            return dict(n=len(xs), median=round(_st.median(xs), 2), p10=round(q(0.1), 2), p90=round(q(0.9), 2),
+                        best=round(xs[-1], 2), worst=round(xs[0], 2), won=sum(1 for v in xs if v > 0),
+                        over_1000=sum(1 for v in xs if v > 1000))
+        by_src = {k: dist([x["pl_pct"] for x in sells if x.get("vol_src") == k]) for k in {x.get("vol_src") for x in sells}}
+        by_strat = {}
+        for x in sells:
+            by_strat.setdefault(STRAT_LABELS.get(x.get("strategy"), x.get("strategy")), []).append(x["pl_pct"])
+        feed = {}
+        for c in list(self.session_coins or []):
+            ts = list((self.hx.get(c) or {}).get("t") or [])
+            if len(ts) < 3:
+                feed[c] = dict(bars=len(ts))
+                continue
+            step = sorted(b - a for a, b in zip(ts[-200:-1], ts[-199:]) if b > a)
+            step = step[len(step) // 2] if step else 60
+            day = time.time() - 86400
+            gaps = [(datetime.fromtimestamp(a).strftime("%m-%d %H:%M"), datetime.fromtimestamp(b).strftime("%H:%M"),
+                     round((b - a) / 60, 1)) for a, b in zip(ts[:-1], ts[1:]) if b >= day and b - a > 3 * step
+                    and E.minutes_to_close(a) > 0 and datetime.fromtimestamp(a).date() == datetime.fromtimestamp(b).date()]
+            feed[c] = dict(bars=len(ts), candle_s=step, first=datetime.fromtimestamp(ts[0]).isoformat(timespec="minutes"),
+                           last=datetime.fromtimestamp(ts[-1]).isoformat(timespec="minutes"),
+                           last_age_s=round(time.time() - ts[-1]), gaps_today=gaps[-30:], implied_vol=E.IV_HINT.get(c),
+                           pricing_vol=round(E.pricing_vol(self.hist.get(c) or [1], ts), 4))
+        afford = {}
+        size = self.start_cash * float(self.settings.get("trade_pct", 10)) / 100
+        for c in list(self.session_coins or []):
+            S = self.last.get(c) or (self.hist.get(c) or [0])[-1]
+            if not S:
+                continue
+            vol = E.IV_HINT.get(c) or E.pricing_vol(self.hist.get(c) or [S], (self.hx.get(c) or {}).get("t"))
+            exp = E.next_expiry(time.time(), 14)
+            K = round(S * 1.02 / E.strike_step(S)) * E.strike_step(S)
+            cost = E.bs_price(S, K, max(0, exp - time.time()) / E.YEAR, vol, "call") * E.CONTRACT
+            afford[c] = dict(price=round(S, 2), vol=round(vol, 3), contract_2pct_otm_14d=round(cost, 2),
+                             trade_size=round(size, 2), affordable=cost <= size)
+        farms = {}
+        for name, t_ in (("Bot Farm", self.tourn), ("Slow farm", getattr(self, "slow", {}).get("t")),
+                         ("Scalp lab", getattr(self, "lab", {}).get("t"))):
+            if t_ is None:
+                continue
+            sc = [t_.score(v) for v in t_.vars]
+            farms[name] = dict(bots=len(t_.vars), scored=sum(1 for x in sc if x is not None),
+                               no_trades_yet=sum(1 for v in t_.vars if not v.ntrades),
+                               score_pct=dist([x * 100 for x in sc if x is not None]),
+                               instincts={k: dict(record_pct=round(r[0] * 100, 2), reviews=r[1])
+                                          for k, r in (getattr(t_, "instincts", {}) or {}).items()},
+                               departures=dict(collections.Counter(r.get("why") for r in t_.lineage.values()
+                                                                   if r.get("died") is not None)))
+        return dict(bot_trades=trades, sells_pl_pct=dist([x["pl_pct"] for x in sells]), sells_by_price_source=by_src,
+                    sells_by_strategy={k: dist(v) for k, v in by_strat.items()}, price_feed=feed, contract_costs=afford,
+                    farms=farms, feature_tests=getattr(self, "roam_features", {}),
+                    free_roam_log=list(getattr(self, "roam_log", []) or [])[-300:],
+                    account_trades=[dict(x) for x in self.trades[-300:]], errors_log=tail("errors.log", 300))
+
+    @staticmethod
+    def _trades_csv(rows):
+        import io as _io
+        cols = ["time", "bot", "who", "side", "contract", "expires", "otm_pct", "qty", "price", "usd", "pl", "pl_pct",
+                "under_px", "vol", "vol_src", "held", "why"]
+        buf = _io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k) for k in cols})
+        return buf.getvalue()
+
+    @staticmethod
+    def _report_checks(d):
+        """Plain-English checks for things that look wrong, at the top of a detailed report."""
+        out = ["Automatic checks (things that look wrong, and what was seen)", ""]
+        sp = d.get("sells_pl_pct")
+        if sp:
+            out.append(f"- Bot trades closed: {sp['n']}, {sp['won']} won; median {sp['median']}%, best {sp['best']}%, "
+                       f"worst {sp['worst']}%.")
+            if sp["over_1000"]:
+                out.append(f"  ! {sp['over_1000']} single trades made over +1000%. Real options rarely do that in a "
+                           "short hold: check how they were priced (sells_by_price_source).")
+        for src, x in (d.get("sells_by_price_source") or {}).items():
+            if x:
+                out.append(f"  priced with {src} volatility: {x['n']} trades, median {x['median']}%, best {x['best']}%")
+        for name, f in (d.get("farms") or {}).items():
+            out.append(f"- {name}: {f['bots']} bots, {f['scored']} have a score, {f['no_trades_yet']} haven't traded yet.")
+            if f["bots"] and f["scored"] < 0.25 * f["bots"]:
+                out.append(f"  ! Under a quarter of {name}'s bots can be judged, so the farm learns slowly.")
+        for c, x in (d.get("contract_costs") or {}).items():
+            if not x["affordable"]:
+                out.append(f"  ! {c}: a typical contract costs ${x['contract_2pct_otm_14d']:,.0f}, more than the bots' "
+                           f"trade size (${x['trade_size']:,.0f}), so they skip it or buy only the cheapest far-out ones.")
+        for c, x in (d.get("price_feed") or {}).items():
+            if x.get("gaps_today"):
+                g = x["gaps_today"]
+                out.append(f"  ! {c}: {len(g)} gap(s) in today's prices while the market was open, the longest "
+                           f"{max(y[2] for y in g):.0f} min (e.g. {g[-1][0]} to {g[-1][1]}).")
+            if x.get("last_age_s", 0) > 600:
+                out.append(f"  ! {c}: no new candle for {x['last_age_s'] // 60} min.")
+        if d.get("errors_log"):
+            out.append(f"- errors.log: {sum(1 for l in d['errors_log'] if l.startswith('---'))} recent entries.")
+        if len(out) == 2:
+            out.append("Nothing looks wrong.")
+        return "\n".join(out) + "\n"
 
     @staticmethod
     def _report_summary(d):
@@ -4727,6 +4950,9 @@ class App:
         elif kind == "prices":
             if self.running:
                 self.on_prices(data)
+        elif kind == "backfill":
+            if self.running:
+                self.on_backfill(*data)
         elif kind == "connected":
             self.client, self.balances = data
             self.usd_avail = self.avail()
@@ -9301,7 +9527,10 @@ class App:
                     time=stamp, mode="bot", side=t["side"], coin=t["coin"], qty=round(t["qty"], 8),
                     price=round(t["price"], 6), usd=round(t["usd"], 2),
                     pl="" if t["pl"] is None else round(t["pl"], 2), reason="bot-test",
-                    who=friendly_label(t["name"], t["params"], t.get("tf", 1), self.session_bar)))
+                    who=friendly_label(t["name"], t["params"], t.get("tf", 1), self.session_bar),
+                    bot=t.get("uid"), strategy=t.get("name"), under_px=t.get("under_px"), vol=t.get("vol"),
+                    vol_src=t.get("vol_src"), held=t.get("held"), why=str(t.get("why") or "")[:160],
+                    contract={k: t["contract"].get(k) for k in ("type", "K", "exp", "symbol")} if t.get("contract") else None))
             del self.shadow_trades[:-4000]
             if new:
                 if self.cur_tab() == "Trades":

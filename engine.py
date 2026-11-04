@@ -2165,6 +2165,7 @@ DEFAULT_SETTINGS = {
     "free_roam_running": False,  # ...also while the bot runs (uses a little more computer power and network)
     "roam_reuse": 3,             # Free roam studies each downloaded stretch this many times before fetching a new one
     "feature_tests": True,       # Free roam tests what each learning switch is worth (reported, never changed for you)
+    "report_detail": False,      # Export a report also adds the detailed part (bot trades, price feed, checks)
     "slow_trades_account": False,  # the slow farm (hourly candles) may also trade your account
     "slow_size": 30,             # bots on the slow farm
     "coin_prefs": True,          # bots learn which coins they're bad at and skip them (re-checked in hindsight)
@@ -3469,6 +3470,15 @@ def bot_step(v, closes, n, coins, extra=None):
                 sim.act(c, s, last[c], n)
         t = sim.last
         if t:
+            # what explains this trade, for reports: the stock's price, the volatility the contract was priced with
+            # (implied = the market's own, measured = from past candles) and, for a sale, how long it was held
+            t["under_px"] = last[c]
+            if hasattr(sim, "_vol"):
+                t["vol"] = round(sim._vol(c), 4)
+                t["vol_src"] = ("real prices" if (t.get("contract") or {}).get("symbol") and getattr(sim, "book", None)
+                                else "implied" if IV_HINT.get(c) else "measured")
+            if t["side"] != "buy" and c in v.since:
+                t["held"] = n - v.since[c]
             if t["side"] == "buy":
                 if v.review and c not in v.entry_flags:  # which never-rules WOULD have blocked this buy (for the review)
                     v.entry_flags[c] = [k for k, spec in VETOES.items() if spec["side"] in ("buy", "open") and k not in v.vetoes
