@@ -2415,6 +2415,24 @@ def realized_vol(p, times=None, n=120):
     return v
 
 
+def pricing_vol(p, times=None):
+    """The volatility practice contracts are priced with when the market's own (implied) volatility isn't known: about
+    a week of candles (a few months on daily candles), not the last 120. On short candles the last 120 can jump from
+    calm to wild in minutes, which repriced cheap contracts hundreds of times over on a move of a few percent: a gain
+    that only existed in the model, which the farm then learned to chase."""
+    step = 60.0
+    if times is not None and len(times) >= 3:
+        diffs = [times[-k] - times[-k - 1] for k in range(1, min(20, len(times) - 1)) if times[-k] > times[-k - 1]]
+        if diffs:
+            step = max(1.0, sorted(diffs)[len(diffs) // 2])
+    n = 120 if step >= 86400 else int(min(2400, max(120, 5 * 6.5 * 3600 / step)))
+    return max(PRICING_VOL_FLOOR, realized_vol(p, times, n))
+
+
+PRICING_VOL_FLOOR = 0.12  # (no listed option trades below about this volatility for long)
+MIN_PREMIUM = 5.0          # $ per contract: real far-out options rarely sell for less than $0.05 a share
+
+
 CONTRACT_FEE = [0.04]    # $ per contract per side (commission + regulatory fees), set from the broker
 
 
@@ -2606,7 +2624,7 @@ class OptionSim(Sim):
             if not prem_ok(prem / CONTRACT):
                 self.opt.pop(c, None)
                 return False
-        if prem <= 0.5:
+        if prem < MIN_PREMIUM:  # (real contracts this cheap hardly ever trade)
             self.opt.pop(c, None)
             return False
         slip = self.slip
@@ -3268,7 +3286,7 @@ def bot_step(v, closes, n, coins, extra=None):
         v.sim.now = data_now(extra, coins)
         v.sim.genes = tr
         for c in coins:  # each coin's recent swing (computed once per bar and shared by every bot)
-            v.sim.vol_src[c] = realized_vol(closes[c], ((extra or {}).get(c) or {}).get("t"))
+            v.sim.vol_src[c] = pricing_vol(closes[c], ((extra or {}).get(c) or {}).get("t"))
     if v.veto_wait:
         _grade_vetoes(v, closes, n)
     for c in coins:

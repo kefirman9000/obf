@@ -3468,7 +3468,7 @@ class App:
             qty = self.pos.get(coin, 0)
             return self.cost.get(coin, 0) / qty if qty else 0.0
         T = max(0.0, o["exp"] - time.time()) / E.YEAR
-        vol = E.IV_HINT.get(t) or E.realized_vol(self.hist.get(t) or [S], (self.hx.get(t) or {}).get("t"))
+        vol = E.IV_HINT.get(t) or E.pricing_vol(self.hist.get(t) or [S], (self.hx.get(t) or {}).get("t"))
         return E.bs_price(S, o["K"], T, vol, o["type"]) * E.CONTRACT
 
     def ctx_list(self, coins=None):
@@ -9530,7 +9530,7 @@ class App:
         exp = E.next_expiry(time.time(), dte)
         o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(t_, exp, typ, K))
         T = max(0.0, exp - time.time()) / E.YEAR
-        vol = E.IV_HINT.get(t_) or E.realized_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
+        vol = E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
         prem = E.bs_price(S, K, T, vol, typ) * E.CONTRACT
         if (E.PREM_RANGE[0] or E.PREM_RANGE[1]) and not E.prem_ok(prem / E.CONTRACT):
             cheaper = 1 if typ == "call" else -1  # walk the strike into the price range
@@ -9556,7 +9556,7 @@ class App:
                                f"scalpers' limit ({E.SCALP_SPREAD[0]:g}%). Settings > Learning", "warn")
                 return
         fill = prem * (1 + half)
-        if fill <= 1:
+        if fill < E.MIN_PREMIUM:  # (real contracts this cheap hardly ever trade)
             return
         qty = int(spend // fill)
         if qty < 1 and fill <= min(self.cash * 0.3, spend * 2.5):
@@ -13369,7 +13369,7 @@ class App:
         t_ = tick_of(c)
         S = self.last.get(t_) or (self.hist.get(t_) or [0])[-1]
         T = max(0.0, o["exp"] - time.time()) / E.YEAR
-        vol = E.IV_HINT.get(t_) or E.realized_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
+        vol = E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
         d, g, th, vg = E.bs_greeks(S, o["K"], T, vol, o["type"])
         q = self.pos[c]
         val = self.position_price(c)
@@ -13446,7 +13446,7 @@ class App:
             step = E.strike_step(S)
             K = round((S * (1 + otm / 100) if typ == "call" else S * (1 - otm / 100)) / step) * step
             exp = E.next_expiry(time.time(), dte)
-            vol = E.IV_HINT.get(c) or E.realized_vol(self.hist.get(c) or [S], (self.hx.get(c) or {}).get("t"))
+            vol = E.IV_HINT.get(c) or E.pricing_vol(self.hist.get(c) or [S], (self.hx.get(c) or {}).get("t"))
             prem = E.bs_price(S, K, max(0, exp - time.time()) / E.YEAR, vol, typ) * E.CONTRACT
             n = int(a // prem) if prem > 0 else 0
             est.config(text=(f"{c} at {fmt_px(S)}: a {datetime.fromtimestamp(exp):%b %d} {K:g} {typ} costs about "

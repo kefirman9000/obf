@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.23.0
+- **Fix: practice option prices were wildly optimistic, and the farm learned to chase that.** When the market's own
+  (implied) volatility isn't known (Free roam's days in the past, tickers outside your session, the first minutes
+  after starting), practice contracts were priced with the volatility of the last 120 candles. On short candles that
+  can jump from calm to wild in minutes, so a cheap contract bought as a stock started to move was repriced hundreds
+  of times over on a move of a few percent: one report showed single trades of +46,000%, and scalp roams with
+  estimated prices showing +6,000% while the days with real option prices came out between -35% and +28%. Breakout
+  bots won every time, became BEASTS, and your account followed them into real losses.
+  - Contracts are now priced with about a week of candles (a few months on daily ones), so a short burst barely moves
+    the price of volatility. Live implied volatility is still used whenever it's known.
+  - Contracts under $5 ($0.05 a share) can't be bought any more: real far-out options hardly ever sell that cheap.
+  - Expect your bots' scores to drop a lot over the next ~100 decisions as their windows roll past the inflated
+    trades. That's the farm seeing them as they really are. BEASTS may fall back to Rising, and that's correct.
+
 ## 1.22.4
 - **Alpaca account tab**: what's really in your Alpaca account (paper or live, whichever your key belongs to), read
   straight from Alpaca, with a Refresh button (it also refreshes itself every 30 seconds while you look at it). Each
