@@ -5250,10 +5250,11 @@ class Tournament:
             d = {k: getattr(v, k) for k in self._VFIELDS}
             d.update(eq=list(v.eq), eq_max=v.eq.maxlen, log=list(v.log), bad=getattr(v, "bad", 0),
                      sim=dict(cash=v.sim.cash, pos=v.sim.pos, cost=v.sim.cost, fees=v.sim.fees, tbars=list(v.sim.tbars),
-                              opt=getattr(v.sim, "opt", {})))
+                              opt=getattr(v.sim, "opt", {}), vols=dict(getattr(v.sim, "vol_src", {}) or {})))
             bots.append(d)
         lineage = dict(list(self.lineage.items())[-600:])
         return dict(version=1, n=self.n, serial=self.serial, cap=self.cap, coins=self.coins, start_cash=self.start_cash,
+                    last_px={c: float(x) for c, x in (self.last_px or {}).items() if x},
                     elders=self.elders[-40:], champions=self.champions, season=self.season,
                     review=self.review, mut_stats=self.mut_stats, evolves=self.evolves,
                     seasons_log=self.seasons_log[-50:], hindsight=getattr(self, "hindsight", {}),
@@ -5261,6 +5262,27 @@ class Tournament:
                     trial_book=getattr(self, "trial_book", {}),
                     hold_curve=list(getattr(self, "hold_curve", []))[-(self.W * 10 + 2):], bots=bots,
                     lineage={str(k): v for k, v in lineage.items()})
+
+    def close_positions(self, prices=None):
+        """Closes every bot's open pretend contracts at what they're worth right now, as if they had never been
+        bought: the money goes back to the bot's cash, so its equity, score and record don't change, and no trade is
+        counted. `prices` (ticker -> price) are used first, then the farm's own last prices; with no price at all
+        the bot simply gets back what it paid. Used when you reset the practice account. -> contracts closed."""
+        n = 0
+        for v in self.vars:
+            for c, q in list(v.sim.pos.items()):
+                if q > 0:
+                    S = (prices or {}).get(c) or self.last_px.get(c)
+                    v.sim.cash += v.sim.value_of(c, S) if S else v.sim.cost.get(c, 0.0)
+                    n += 1
+                v.sim.pos.pop(c, None)
+                v.sim.cost.pop(c, None)
+                if hasattr(v.sim, "opt"):
+                    v.sim.opt.pop(c, None)
+                for d in (v.entries, v.since, v.hi, v.entry_flags):
+                    d.pop(c, None)
+            v.sim.last = None
+        return n
 
     def align_coins(self, coins, last=None):
         """Makes the farm trade exactly these coins (a safety net if they ever get out of step with the session).
@@ -5305,6 +5327,7 @@ class Tournament:
                 v.sim.tbars = deque(s.get("tbars", []))
                 if isinstance(v.sim, OptionSim):
                     v.sim.opt = {c: dict(o) for c, o in (s.get("opt") or {}).items()}
+                    v.sim.vol_src = {c: float(x) for c, x in (s.get("vols") or {}).items() if isinstance(x, (int, float))}
                     v.sim.genes = v.traits
                 v.vetoes = clean_vetoes(v.vetoes)
                 v.veto_stats = {k: list(s) for k, s in (v.veto_stats or {}).items() if k in v.vetoes}
@@ -5343,6 +5366,7 @@ class Tournament:
         self.season = st.get("season")
         self.seasons_log = [tuple(x) for x in st.get("seasons_log") or []]
         self.hindsight = dict(st.get("hindsight") or {})
+        self.last_px = {c: float(x) for c, x in (st.get("last_px") or {}).items() if isinstance(x, (int, float)) and x > 0}
         self.instincts = {k: [float(x[0]), int(x[1]), float(x[2]) if len(x) > 2 else float(x[0])]
                           for k, x in (st.get("instincts") or {}).items() if isinstance(x, (list, tuple)) and len(x) >= 2}
         self.instinct_best = {k: g for k, g in (st.get("instinct_best") or {}).items() if isinstance(g, dict)}

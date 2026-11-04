@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.22.2
+- **Resetting the practice account now clears Bot positions too**: the bots' own pretend contracts are closed at what
+  they're worth now, from Reset account and from the account box in Reset... (Bot Farm and Slow farm). No trade is
+  counted and every bot's money, score and learning stay as they were, so the farm carries on where it was.
+- **Fix: after a restart, Bot positions showed every contract as worthless** (a huge pretend loss). A restarted farm
+  didn't keep its last prices or the volatility it had measured, so contracts were valued at $0 (or at a rough guess)
+  until it ran again. Both are saved with the farm now, and the tab uses today's prices first; a contract with no price
+  yet says so instead of counting as a loss.
+- The Bot positions total now says plainly that it adds up all the bots' separate pretend money. None of it is yours.
+
 ## 1.22.1
 - **Instincts keep a lasting record**: Farm knowledge's "Main instincts" meter used to count only instincts with a bot
   winning right now, so it bounced around and never built up, however much the farm learned. Each instinct now keeps a

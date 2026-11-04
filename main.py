@@ -3940,7 +3940,8 @@ class App:
         farm = tk.BooleanVar(value=False)
         what = "LIVE session tracking" if self.live else "practice account"
         ttk.Checkbutton(f, text=f"The {what}: cash, positions and trades"
-                                + ("" if self.live else " (you start again with the practice money on the left)"),
+                                + ("" if self.live else " (you start again with the practice money on the left), and "
+                                                        "the bots' own practice contracts"),
                         variable=acct).pack(anchor="w", pady=(10, 0))
         ttk.Checkbutton(f, text="The farm: fresh eggs hatch at the next Start", variable=farm).pack(anchor="w", pady=(4, 0))
         # which dens to keep when the farm is reset
@@ -3997,10 +3998,15 @@ class App:
                 if kept:
                     self.cfg["carry_bots"] = kept
                     E.save_json(CONFIG_PATH, self.cfg)
+            closed = 0
             if acct.get():
+                if not self.live and not farm.get():  # (a farm reset clears the bots anyway)
+                    closed = self.close_bot_positions()
                 self.reset(ask=False)
             self.write("Reset " + " and ".join(x for x, on in ((what, acct.get()), ("the farm", farm.get())) if on)
-                       + (f", keeping {len(kept)} bots for the new farm" if kept else "") + "." + (f" {note}" if note else "")
+                       + (f", keeping {len(kept)} bots for the new farm" if kept else "")
+                       + (f", and closed the bots' {closed} open practice contract{'s' if closed != 1 else ''}" if closed else "")
+                       + "." + (f" {note}" if note else "")
                        + " Press Start to begin again.", "good")
 
         def bring_back():
@@ -4067,6 +4073,24 @@ class App:
         self.refresh_board()
         self.write("The farm was reset: fresh eggs hatch when you press Start.", "good")
 
+    def close_bot_positions(self):
+        """Practice reset: the bots' own open pretend contracts (Bot positions) close at what they're worth now, on the
+        Bot Farm and the Slow farm. Their scores and learning don't change. -> how many were closed."""
+        n = 0
+        for t_ in (self.tourn, (getattr(self, "slow", None) or {}).get("t")):
+            if t_ is not None:
+                n += t_.close_positions(dict(self.last or {}))
+        if n:
+            try:
+                self.save_farm(force=True)
+            except Exception:
+                E.note_error("close_bot_positions")
+        try:
+            self.refresh_botpos()
+        except Exception:
+            E.note_error("close_bot_positions")
+        return n
+
     def reset_account(self):
         """Reset account: starting money again, no positions, no trades. The farm and everything it learned stay."""
         if self.pending:
@@ -4077,6 +4101,8 @@ class App:
             cash = self.start_cash or 1000.0
         msg = (f"Reset the {self.acct_name()} account to ${cash:,.2f}?\n\nOpen positions and the trade list are cleared. "
                "Your farms, bots and everything they've learned are kept.")
+        if not self.live:
+            msg += "\n\nThe bots' own practice contracts (Bot positions) are closed too, at what they're worth now."
         if self.session and self.live and any(q > 0 for q in self.pos.values()):
             msg += ("\n\nThis only resets what OBF tracks: positions it bought stay in your broker account, "
                     "and you can close them there.")
@@ -4101,7 +4127,9 @@ class App:
                 fn()
             except Exception:
                 E.note_error("reset_account")
-        self.write(f"Account reset to ${cash:,.2f}. The farm and its learning are kept.")
+        closed = 0 if self.live else self.close_bot_positions()
+        self.write(f"Account reset to ${cash:,.2f}. The farm and its learning are kept"
+                   + (f"; the bots' {closed} open practice contract{'s' if closed != 1 else ''} were closed." if closed else "."))
 
     def reset(self, ask=True):
         if ask and (self.trades or self.pos):
@@ -11997,7 +12025,8 @@ class App:
         if self.bp_farm.get() in ("Both farms", "Slow farm") and sl:
             farms.append(("Slow farm", sl, self.SLOW_GRAN / 60))
         breed = self.bp_breed.get()
-        rows, paid_all, worth_all, n_bots = [], 0.0, 0.0, set()
+        rows, paid_all, worth_all, n_bots, unpriced = [], 0.0, 0.0, set(), 0
+        live_px = dict(getattr(self, "last", None) or {})
         for farm, tr, bar_min in farms:
             for v in list(tr.vars):
                 sc = E.is_scalp(v.name)
@@ -12007,9 +12036,17 @@ class App:
                     o = (getattr(v.sim, "opt", {}) or {}).get(c)
                     if q <= 0 or not o:
                         continue
-                    S = tr.last_px.get(c)
-                    worth = v.sim.value_of(c, S) if S else 0.0
+                    S = live_px.get(c) or tr.last_px.get(c)
                     paid = v.sim.cost.get(c, 0.0)
+                    if not S:  # no price for this ticker yet: don't show it as worthless
+                        unpriced += 1
+                        n_bots.add((farm, v.uid))
+                        rows.append(((farm, 0.0), (E.bot_nickname(v.key()), STRAT_LABELS.get(v.name, v.name),
+                                     STATUS_TEXT.get(tr.info.get(id(v), {}).get("status"), ""), c,
+                                     E.contract_text(dict(o, under=c)), f"{q:g}", f"${paid:,.2f}", "no price yet", "-", "-",
+                                     "-", "-", f"{tr.life(v)['ret'] * 100:+.1f}%"), ""))
+                        continue
+                    worth = v.sim.value_of(c, S)
                     pl = worth - paid
                     bars = max(0, tr.n - v.since.get(c, tr.n))
                     mins = bars * bar_min
@@ -12033,8 +12070,10 @@ class App:
             t.insert("", "end", values=vals, tags=(tag,))
         pl_all = worth_all - paid_all
         self.bp_sum.config(text=(f"{len(n_bots)} bot{'s' if len(n_bots) != 1 else ''} holding {len(rows)} contract"
-                                 f"{'s' if len(rows) != 1 else ''}   |   paid ${paid_all:,.2f}   |   worth ${worth_all:,.2f}   |   "
-                                 f"P/L {pl_all:+,.2f} ({(pl_all / paid_all * 100) if paid_all else 0:+.1f}%)")
+                                 f"{'s' if len(rows) != 1 else ''}   |   all bots' pretend money together: paid "
+                                 f"${paid_all:,.2f}, worth ${worth_all:,.2f}, P/L {pl_all:+,.2f} "
+                                 f"({(pl_all / paid_all * 100) if paid_all else 0:+.1f}%)"
+                                 + (f"   |   {unpriced} waiting for a price" if unpriced else ""))
                            if rows else ("No bot holds a contract right now." if farms else "The farms haven't started yet."),
                            fg=(GREEN if pl_all >= 0 else RED) if rows else MUTED)
 
