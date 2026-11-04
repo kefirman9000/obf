@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.23.2
+- **Default practice money**: a Default box next to Practice money. Tick it and that amount is filled in whenever OBF
+  starts (and on the welcome screen), and used for new sessions and resets. Untick it to go back to $10,000. The box
+  shows ticked only while the amount typed is your saved default.
+
 ## 1.23.1
 - **Detailed reports for Claude**: Tools > Export a detailed report for Claude... (or tick "Detailed reports" in
   Settings to make every report detailed). On top of the usual report it adds:

@@ -1438,8 +1438,17 @@ class App:
                            "trades is also copied to your Alpaca paper account (labelled ALPACA PAPER). Never real money.")
         self.budget_lbl = tk.Label(c, text="Practice money (pretend, USD)", bg=CARD, fg=MUTED)
         self.budget_lbl.pack(anchor="w", pady=(8, 0))
-        self.cash_var = tk.StringVar(value="10000")
-        ttk.Entry(c, textvariable=self.cash_var).pack(fill="x")
+        self.cash_var = tk.StringVar(value=self.default_cash_text())
+        cash_row = tk.Frame(c, bg=CARD)
+        cash_row.pack(fill="x")
+        self.cash_default = tk.BooleanVar(value=bool(self.cfg.get("default_cash")))
+        cd = ttk.Checkbutton(cash_row, text="Default", variable=self.cash_default, style="Card.TCheckbutton",
+                             command=self.toggle_default_cash)
+        cd.pack(side="right", padx=(6, 0))
+        ttk.Entry(cash_row, textvariable=self.cash_var).pack(side="left", fill="x", expand=True)
+        Tip(cd, "Tick to make this amount your default practice money: it's filled in here whenever OBF starts, and used "
+                "for new sessions and resets. Untick to go back to $10,000.")
+        self.cash_var.trace_add("write", lambda *a: self._sync_default_cash())
         tk.Label(c, text="Risk style", bg=CARD, fg=MUTED).pack(anchor="w", pady=(8, 0))
         self.style_var = tk.StringVar(value=self.settings.get("style", "Balanced"))
         cb = ttk.Combobox(c, textvariable=self.style_var, values=list(E.STYLES) + ["Custom"], state="readonly")
@@ -2946,7 +2955,7 @@ class App:
             "breed, compete and learn as they go. You'll start in Practice mode with pretend money, so nothing real "
             "is at risk. Real trading only happens if you switch to Live and log in.")).pack(anchor="w", pady=(6, 12))
         ttk.Label(f, text="How much pretend money do you want to practice with?").pack(anchor="w")
-        cash = tk.StringVar(value="10000")
+        cash = tk.StringVar(value=self.default_cash_text())
         ttk.Entry(f, textvariable=cash, width=14).pack(anchor="w", pady=(2, 10))
         ttk.Label(f, text="What kind of trader should it be?").pack(anchor="w")
         style = tk.StringVar(value="Balanced")
@@ -4099,6 +4108,45 @@ class App:
         except Exception:
             E.note_error("close_bot_positions")
         return n
+
+    # ---------------- default practice money ----------------
+    def default_cash_text(self):
+        """The practice money OBF fills in: your saved default, or $10,000."""
+        v = self.cfg.get("default_cash")
+        try:
+            return f"{float(v):g}" if v and float(v) > 0 else "10000"
+        except (TypeError, ValueError):
+            return "10000"
+
+    def toggle_default_cash(self):
+        """The Default box next to Practice money: ticked saves the amount as the default, unticked clears it."""
+        if self.cash_default.get():
+            try:
+                v = float(str(self.cash_var.get()).replace(",", "").replace("$", ""))
+                assert v > 0
+            except (ValueError, AssertionError):
+                self.cash_default.set(False)
+                return messagebox.showinfo("Practice money", "Type an amount first (like 25000), then tick Default.")
+            self.cfg["default_cash"] = v
+            self.write(f"${v:,.2f} is now your default practice money.", "good")
+        else:
+            self.cfg.pop("default_cash", None)
+            self.write("Practice money is back to the usual default ($10,000).")
+        try:
+            E.save_json(CONFIG_PATH, self.cfg)
+        except OSError:
+            E.note_error("toggle_default_cash")
+
+    def _sync_default_cash(self):
+        """The box shows ticked only while the amount typed is your saved default."""
+        if not hasattr(self, "cash_default"):
+            return
+        try:
+            v = float(str(self.cash_var.get()).replace(",", "").replace("$", ""))
+        except ValueError:
+            v = None
+        d = self.cfg.get("default_cash")
+        self.cash_default.set(bool(d) and v is not None and abs(v - float(d)) < 1e-9)
 
     def reset_account(self):
         """Reset account: starting money again, no positions, no trades. The farm and everything it learned stay."""
