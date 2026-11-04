@@ -3755,6 +3755,8 @@ class Tournament:
         self.seasons_log = []   # (decision, mood) whenever the season changed
         self.review = {}        # never-rule -> [losing buys it would have blocked, winning buys it would have blocked]
         self.mut_stats = {}     # kind of change -> [children born with it, children that went on to win]
+        self.instincts = {}     # instinct -> [record: slow average of its bots' edge over holding, reviews, best edge]
+        self.instinct_best = {}  # instinct -> genes of the best bot it has had (kept after its family is gone)
         self.births, self.deaths = deque(maxlen=3000), deque(maxlen=3000)  # decision numbers (farm pulse)
         self.evolves = 0
         self.spawn_i = 0
@@ -4813,7 +4815,41 @@ class Tournament:
             self.recording = rec
             self.replaying = False
 
+    def instinct_tick(self):
+        """At each review, every instinct's scored bots (averaged per instinct, so a big family counts no more than a
+        small one) feed that instinct's lasting record: how far it beats just holding, on average, over time. Unlike
+        'winning right now', the record builds up, so the farm keeps what it learned about an instinct even after a
+        bad week or after its family has died out. Scalpers and kamikazes are left out (they're judged their own way)."""
+        by = {}
+        for v in self.vars:
+            if v.name not in STRATS or is_kami(v) or is_scalp(v.name):
+                continue
+            sc = (self.info.get(id(v)) or {}).get("score")
+            if sc is None:
+                continue
+            x = max(-1.0, min(1.0, sc - self.hold_ret if self.hold_ret is not None else sc))
+            by.setdefault(v.name, []).append((x, v))
+        for name, xs in by.items():
+            obs = sum(x for x, _ in xs) / len(xs)
+            top, tv = max(xs, key=lambda p: p[0])
+            r = self.instincts.get(name)
+            if r is None:
+                self.instincts[name] = r = [obs, 1, top]
+            else:
+                a = max(INSTINCT_ALPHA, 1.0 / (r[1] + 1))  # the first reviews count fully, then a slow average
+                r[0] += a * (obs - r[0])
+                r[1] += 1
+            if top >= r[2] or name not in self.instinct_best:
+                r[2] = max(r[2], top)
+                self.instinct_best[name] = _genes(tv)
+
+    def instinct_proven(self, name):
+        """Has this instinct earned its place here? Enough reviews, and on average its bots beat just holding."""
+        r = self.instincts.get(name)
+        return bool(r and r[1] >= INSTINCT_PROVEN and r[0] > 0)
+
     def evolve(self, closes):
+        self.instinct_tick()
         for v in self.vars:  # strikes: checks spent benched (slowed counts half, standby none)
             st = self.info[id(v)]["status"]
             if st == "active":
@@ -4851,7 +4887,7 @@ class Tournament:
         k_isl = int(self.o.get("islands", 1) or 1)
         moved = 0
         for i in range(k_isl):
-            best = next((v for v, _ in self.ranking() if v.island == i), None)
+            best = next((v for v, _ in self.ranking() if v.island == i and not (is_kami(v) and self.kami_full())), None)
             if not best:
                 continue
             if len(self.vars) >= self.cap:
@@ -4973,17 +5009,22 @@ class Tournament:
         if gone:
             self._rate()
 
+    def kami_full(self):
+        """The farm already has its share of kamikazes, so more would only be culled again."""
+        return len(self.kamikazes()) >= self.kami_target()
+
     def _spawn(self, closes):
         k_isl = int(self.o.get("islands", 1) or 1)
-        pool = self.active
+        no_kami = self.kami_full()  # eggs of kamikazes past their share were culled at once, wasting the farm's eggs
+        pool = [v for v in self.active if not (no_kami and is_kami(v))]
         if k_isl > 1:  # islands take turns breeding, each from its own winners (or its own best)
             isl = self.spawn_i % k_isl
             self.spawn_i += 1
-            pool = [v for v in self.active if v.island == isl]
+            pool = [v for v in self.active if v.island == isl and not (no_kami and is_kami(v))]
             if not pool:
-                own = [v for v, _ in self.ranking() if v.island == isl]
+                own = [v for v, _ in self.ranking() if v.island == isl and not (no_kami and is_kami(v))]
                 pool = own[:1]
-        if pool and (pool is not self.active or self.active):
+        if pool:
             # fitness sharing: a family's weight is shared among its members, so one lucky family can't take over
             fam_n = {}
             for x in self.vars:
@@ -4991,7 +5032,7 @@ class Tournament:
             parent = self.rng.choices(pool, weights=[max(1e-9, self.info.get(id(v), {}).get("weight", 0)) / fam_n[v.name]
                                                      * (1 + v.power / 10) for v in pool])[0]
         else:
-            r = self.ranking()
+            r = [x for x in self.ranking() if not (no_kami and is_kami(x[0]))]
             if not r:
                 return
             parent = r[0][0]
@@ -5008,6 +5049,7 @@ class Tournament:
         mate = None
         if self.o.get("crossbreed", True) and self.rng.random() < 0.4:
             good = [v for v in self.vars if v is not parent and v.name == parent.name and v.island == parent.island
+                    and is_kami(v) == is_kami(parent)
                     and self.info.get(id(v), {}).get("status") in ("active", "standby", "slowed")]
             if good:
                 mate = self.rng.choice(good)
@@ -5215,6 +5257,7 @@ class Tournament:
                     elders=self.elders[-40:], champions=self.champions, season=self.season,
                     review=self.review, mut_stats=self.mut_stats, evolves=self.evolves,
                     seasons_log=self.seasons_log[-50:], hindsight=getattr(self, "hindsight", {}),
+                    instincts={k: list(x) for k, x in self.instincts.items()}, instinct_best=dict(self.instinct_best),
                     trial_book=getattr(self, "trial_book", {}),
                     hold_curve=list(getattr(self, "hold_curve", []))[-(self.W * 10 + 2):], bots=bots,
                     lineage={str(k): v for k, v in lineage.items()})
@@ -5300,6 +5343,9 @@ class Tournament:
         self.season = st.get("season")
         self.seasons_log = [tuple(x) for x in st.get("seasons_log") or []]
         self.hindsight = dict(st.get("hindsight") or {})
+        self.instincts = {k: [float(x[0]), int(x[1]), float(x[2]) if len(x) > 2 else float(x[0])]
+                          for k, x in (st.get("instincts") or {}).items() if isinstance(x, (list, tuple)) and len(x) >= 2}
+        self.instinct_best = {k: g for k, g in (st.get("instinct_best") or {}).items() if isinstance(g, dict)}
         self.trial_book = {k: list(x) for k, x in (st.get("trial_book") or {}).items()}
         hc = st.get("hold_curve") or [1.0]
         self.hold_curve = deque(hc, maxlen=self.W * 10 + 2)
@@ -5633,6 +5679,11 @@ def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes
     return dict(tourn=t, results=results, train_bars=cut, exam_bars=L - cut, passes_done=passes, exam_hold=exam_hold)
 
 
+INSTINCT_ALPHA = 0.1   # how fast an instinct's record follows new reviews (about the last 10 count most)
+INSTINCT_MIN = 3       # reviews before an instinct's record is shown
+INSTINCT_PROVEN = 10   # reviews before a positive record counts as proven
+
+
 def teach_from(dst, src):
     """Passes a trained farm's memory to another farm: elders, post-trade review, mutation memory and season champions."""
     dst.elders = (dst.elders + [e for e in src.elders])[-40:]
@@ -5644,6 +5695,17 @@ def teach_from(dst, src):
         d = dst.mut_stats.setdefault(k, [0, 0])
         d[0] += x[0]
         d[1] += x[1]
+    for k, x in (getattr(src, "instincts", None) or {}).items():  # what it learned about instincts, at half weight
+        d = dst.instincts.get(k)
+        if d is None:
+            dst.instincts[k] = [x[0], max(1, x[1] // 2), x[2]]
+        else:
+            d[0] += 0.5 * x[1] / (x[1] + d[1]) * (x[0] - d[0])
+            d[1] += max(1, x[1] // 4)
+        if k in getattr(src, "instinct_best", {}) and (k not in dst.instinct_best or x[2] > (d or [0, 0, -9])[2]):
+            dst.instinct_best[k] = src.instinct_best[k]
+            if d is not None:
+                d[2] = max(d[2], x[2])
     for m, ch in src.champions.items():
         if ch.get("fit", 0) > dst.champions.get(m, {}).get("fit", 0):
             dst.champions[m] = dict(ch, uid=-1)  # not on this farm: woken up from its genes when its season comes
@@ -5866,19 +5928,31 @@ def farm_knowledge(t):
                           detail="graded every time it changed a decision", evidence=f"{n:.0f} decisions, {avg:+.2f}% each",
                           score=round(avg, 3), strong=n >= 5 and avg > 0,
                           data=dict(key=k, n=n, saved=saved, genes=_genes(carrier) if carrier else None)))
-    # instincts: how each main strategy is doing here, with its best bot
+    # instincts: each one's lasting record on this farm (it builds up over time), plus how its bots are doing now
     by = {}
     for v in t.vars:
         by.setdefault(v.name, []).append(v)
-    for nm, vs in by.items():
+    rec = getattr(t, "instincts", None) or {}
+    for nm in list(by) + [n for n in rec if n not in by and n in STRATS]:
+        vs = by.get(nm, [])
         scored = [(sc_of.get(id(v)), v) for v in vs if sc_of.get(id(v)) is not None]
-        best = max(scored, key=lambda x: x[0]) if scored else (None, vs[0])
+        best = max(scored, key=lambda x: x[0]) if scored else ((None, vs[0]) if vs else (None, None))
         win = sum(1 for v in vs if t.info.get(id(v), {}).get("status") == "active")
+        r = rec.get(nm)
+        now = f"{len(vs)} bots, {win} winning" if vs else "no bots on the farm now"
+        if r and r[1] >= INSTINCT_MIN:
+            evidence = f"record {r[0] * 100:+.2f}% vs holding over {r[1]} reviews; {now}"
+            score = r[0] * 100
+        else:
+            evidence = now + (f"; best {best[0] * 100:+.1f}%" if best[0] is not None else "") + \
+                (f" (record starts after {INSTINCT_MIN} reviews)" if vs else "")
+            score = (best[0] or 0) * 100
+        genes = _genes(best[1]) if best[1] is not None else (getattr(t, "instinct_best", {}) or {}).get(nm)
         items.append(dict(id=f"instinct:{nm}", kind="Instinct", title=nm + (" (scalper)" if is_scalp(nm) else ""),
-                          detail=f"best: {best[1].label}"[:160],
-                          evidence=f"{len(vs)} bots, {win} winning" + (f"; best {best[0] * 100:+.1f}%" if best[0] is not None else ""),
-                          score=round((best[0] or 0) * 100, 3), strong=bool(win),
-                          data=dict(name=nm, genes=_genes(best[1]))))
+                          detail=(f"best: {best[1].label}" if best[1] is not None else "best bot it had is kept in the book")[:160],
+                          evidence=evidence, score=round(score, 3),
+                          strong=bool(win) or (t.instinct_proven(nm) if hasattr(t, "instinct_proven") else False),
+                          data=dict(name=nm, genes=genes)))
     # scalpers' volatility gates: which gate the winning scalpers use
     gates = {}
     for v in t.vars:

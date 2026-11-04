@@ -5988,8 +5988,8 @@ class App:
                                             fill=(GREEN if level >= 7 else ACCENT if level >= 4 else "#f59e0b") if j < level else LINE)
             tot = sum(1 for x in items if x.get("strong"))
             meters.create_text(10, 154, anchor="w", fill=MUTED, font=("", 8),
-                               text=f"{len(items)} things learned, {tot} proven by their own evidence. "
-                                    "Meters fill as more of each kind is proven.")
+                               text=f"{len(items)} things learned, {tot} proven by their own evidence. Meters fill "
+                                    "as more are proven (instincts: winning now, or a record that beats holding).")
 
         def fill():
             items = st["items"]
