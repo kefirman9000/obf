@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.23.6
+- **Success tab: act on the bots it lists.** Pick one or more bots (Ctrl+click for several) and use the buttons under
+  the chart: Save to Library, Add to Hall of Fame, Add to my Bot Farm (copies Slow farm or Scalp lab bots into your
+  Bot Farm as eggs, with their rule evidence; a Slow farm bot's pace is turned into the nearest pace on your farm's
+  candles), or Details (also by double-clicking). What you picked stays picked when the tab refreshes.
+- **Fix: bots from the Slow farm or the Scalp lab couldn't be added to the Hall of Fame** (or saved to the Library,
+  added to your team or exported from their card). Those actions only looked for the bot on the Bot Farm, found
+  nothing, and still said it was added. They now work for bots on any farm, and their detail cards show their own
+  farm's figures instead of "Removed".
+
 ## 1.23.5
 - **Fix: restarting OBF made the bots "sell" for big fake profits.** After a restart, the market's own (implied)
   volatility wasn't known again until the next quote (up to 15 minutes), so contracts were priced with measured

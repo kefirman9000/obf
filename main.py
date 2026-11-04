@@ -11132,7 +11132,7 @@ class App:
         if target is self.grid_chips.get("Hall of Fame"):
             self.promote_variants([v])
         elif target is self.grid_chips.get("Caught"):
-            rows = [dict(r, bar_minutes=self.session_bar) for r in self.tourn.board() if r["v"] is v]
+            rows = self.board_rows_of([v])
             self.catch_rows(E.export_bots(rows, self.version, note="caught by you")["bots"], "caught")
             self.refresh_board()
 
@@ -12115,7 +12115,25 @@ class App:
                                          "Notes"))
         self.succ_tree.tag_configure("good", foreground=GREEN)
         self.succ_tree.tag_configure("bad", foreground=RED)
+        self.succ_tree.configure(selectmode="extended")
+        self.succ_vs = {}
+        bar = tk.Frame(parent, bg=BG)
+        bar.pack(fill="x", padx=6, pady=(0, 6), before=fr)
+        tk.Label(bar, text="Picked bots:", bg=BG, fg=MUTED, font=("", 8)).pack(side="left")
+        for lab_, fn in (("\u25c9 Save to Library", lambda vs: self.catch_rows(self.board_rows_of(vs), "success tab")),
+                         ("\u2605 Add to Hall of Fame", self.promote_variants),
+                         ("Add to my Bot Farm", self.add_to_main_farm),
+                         ("Details...", lambda vs: self.bot_detail(vs[0]))):
+            ttk.Button(bar, text=lab_, style="Plain.TButton",
+                       command=lambda fn=fn: self._succ_act(fn)).pack(side="left", padx=(6, 0))
+        self.succ_tree.bind("<Double-1>", lambda e: self._succ_act(lambda vs: self.bot_detail(vs[0])))
         self._succ_tick()
+
+    def _succ_act(self, fn):
+        vs = [self.succ_vs[i] for i in self.succ_tree.selection() if i in self.succ_vs]
+        if not vs:
+            return messagebox.showinfo("Success", "Pick one or more bots in the list first (Ctrl+click picks several).")
+        fn(vs)
 
     def _succ_tick(self):
         try:
@@ -12135,7 +12153,9 @@ class App:
         t = {"Bot Farm": self.tourn, "Slow farm": getattr(self, "slow", {}).get("t"),
              "Scalp lab": getattr(self, "lab", {}).get("t")}.get(self.succ_farm.get())
         tree, cv = self.succ_tree, self.succ_cv
+        keep = {self.succ_vs[i].uid for i in tree.selection() if i in getattr(self, "succ_vs", {})}
         tree.delete(*tree.get_children())
+        self.succ_vs = {}
         cv.delete("all")
         lab = dict((k, (l, tip)) for k, l, tip in self.SUCCESS_MODES)[mode]
         if t is None:
@@ -12147,9 +12167,12 @@ class App:
         pc = lambda x: "-" if x is None else f"{x:+.1f}%"
         for v, res, n, trades, wr, best, worst, det in rows:
             d = t.info.get(id(v), {})
-            tree.insert("", "end", tags=("good" if res > 0 else "bad" if res < 0 else "",), values=(
+            iid = tree.insert("", "end", tags=("good" if res > 0 else "bad" if res < 0 else "",), values=(
                 E.bot_nickname(v.key()), STRAT_LABELS.get(v.name, v.name), STATUS_TEXT.get(d.get("status"), d.get("status") or "-"),
                 pc(res), n, trades, "-" if wr is None else f"{wr * 100:.0f}%", pc(best), pc(worst), det))
+            self.succ_vs[iid] = v
+            if v.uid in keep:
+                tree.selection_add(iid)  # (it refreshes every few seconds: what you picked stays picked)
         W, H = max(200, cv.winfo_width()), int(cv.cget("height"))
         top = rows[:12]
         if not top:
@@ -14068,17 +14091,74 @@ class App:
         self.roster_box.config(values=[labels[k] for k in self.ROSTERS])
         self.roster_var.set(labels[self.roster()])
 
+    # ---------------- bots on any farm ----------------
+    def farms(self):
+        """[(name, farm, minutes per decision bar)] for every farm that's running."""
+        out = []
+        if self.tourn is not None:
+            out.append(("Bot Farm", self.tourn, float(self.session_bar or self.settings.get("bar_minutes", 1))))
+        sl = (getattr(self, "slow", None) or {}).get("t")
+        if sl is not None:
+            out.append(("Slow farm", sl, self.SLOW_GRAN / 60))
+        lb = (getattr(self, "lab", None) or {}).get("t")
+        if lb is not None:
+            out.append(("Scalp lab", lb, 1.0))
+        return out
+
+    def farm_of(self, v):
+        """(name, farm, minutes per bar) of the farm this bot lives on, or (None, None, None)."""
+        return next(((n, t, b) for n, t, b in self.farms() if v in t.vars), (None, None, None))
+
+    def board_rows_of(self, vs):
+        """Scoreboard rows for these bots, from whichever farm each lives on (ready for export_bots / catch_rows).
+        Before, only the Bot Farm was looked at, so a Slow farm or Scalp lab bot quietly came back as nothing."""
+        want = {id(v) for v in vs}
+        rows = []
+        for _, t, bar in self.farms():
+            rows += [dict(r, bar_minutes=bar) for r in t.board() if id(r["v"]) in want]
+        return rows
+
     # ---------------- Hall of Fame: only what you pick ----------------
     def promote_variants(self, vs):
-        if not vs or not self.tourn:
-            return
-        ids = {id(v) for v in vs}
-        rows = [dict(r, bar_minutes=self.session_bar) for r in self.tourn.board() if id(r["v"]) in ids]
+        rows = self.board_rows_of(vs or [])
+        if not rows:
+            return messagebox.showinfo("Hall of Fame", "That bot isn't on any farm any more, so it couldn't be added.")
         entries = E.export_bots(rows, self.version, note="picked by you")["bots"]
         self.catch_rows(entries, "hall of fame")  # Hall of Fame bots are always in the Library too
         E.induct(entries, self.version)
-        self.write(f"\u2605 Added {', '.join(E.bot_nickname(v.key()) for v in vs)} to the Hall of Fame.", "good")
+        self.write(f"\u2605 Added {', '.join(E.bot_nickname(r['v'].key()) for r in rows)} to the Hall of Fame.", "good")
         self.after_hof_change()
+
+    def add_to_main_farm(self, vs):
+        """Copies bots from the Slow farm or the Scalp lab into the Bot Farm as new eggs, genes and rule evidence and
+        all. A Slow farm bot's pace is turned from hourly candles into the nearest pace on your farm's candles."""
+        if not self.tourn or not self.seeded:
+            return messagebox.showinfo("Add to farm", "Start your Bot Farm first (press Start once), then add bots to it.")
+        added, skipped = [], []
+        for v in vs:
+            name, t, bar = self.farm_of(v)
+            nm = E.bot_nickname(v.key())
+            if t is None or t is self.tourn:
+                skipped.append(nm)
+                continue
+            g = E._genes(v)
+            tf = g["tf"]
+            if name == "Slow farm":
+                want = g["tf"] * bar / max(1e-9, float(self.session_bar or 1))
+                tf = min(E.TIMEFRAMES, key=lambda x: abs(x - want))
+            nv = self.tourn.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
+                                        note=f"From the {name}:", tf=tf, origin=name.lower(), risk=g["risk"],
+                                        traits=g["traits"], vetoes=g["vetoes"], layers=g["layers"])
+            if nv:
+                nv.layer_stats = {k: list(x) for k, x in (v.layer_stats or {}).items()}
+                nv.veto_stats = {k: list(x) for k, x in (v.veto_stats or {}).items()}
+                added.append(nm)
+        if added:
+            self.write(f"Added {', '.join(added)} to your Bot Farm. They start as eggs there and have to prove themselves.",
+                       "good")
+            self.refresh_board()
+        if skipped and not added:
+            messagebox.showinfo("Add to farm", "Those bots are already on your Bot Farm.")
 
     def promote_entries(self, entries):
         if not entries:
@@ -14161,7 +14241,7 @@ class App:
         self.refresh_board()
 
     def _team_from_variants(self, vs):
-        caught = self.catch_rows([r for r in self.tourn.board() if r["v"] in vs], "team")
+        caught = self.catch_rows(self.board_rows_of(vs), "team")
         size, full = E.set_team([E.bot_key(b) for b in caught], True)
         self.write(f"Team: {size}/{E.TEAM_MAX}." + (f" {full} didn't fit (the team is full)." if full else ""))
         self.update_team_label()
@@ -14503,7 +14583,9 @@ class App:
 
     def bot_detail(self, v=None, quiet=False):
         v = v or self.selected_variant()
-        if not v or not self.tourn:
+        T = self.farm_of(v)[1] if v else None  # the farm this bot lives on (the Slow farm and Scalp lab too)
+        T = T or self.tourn
+        if not v or not T:
             if quiet:
                 return None
             return messagebox.showinfo("Bot details", "Click a bot on the farm or the scoreboard first.")
@@ -14550,11 +14632,11 @@ class App:
         def paint(_=None):
             if not w.winfo_exists():
                 return
-            lf = self.tourn.life(v)
-            d = self.tourn.info.get(id(v), {})
-            st = STATUS_TEXT.get(d.get("status"), d.get("status", "removed")) if v in self.tourn.vars else "Removed"
+            lf = T.life(v)
+            d = T.info.get(id(v), {})
+            st = STATUS_TEXT.get(d.get("status"), d.get("status", "removed")) if v in T.vars else "Removed"
             hrs = v.win_steps * self.session_bar / 60
-            parents = self.tourn.lineage.get(v.uid, {}).get("parents", [])
+            parents = T.lineage.get(v.uid, {}).get("parents", [])
             fam = {"starter": "starter bot", "classic": f"famous strategy: {v.classic}", "bred": f"bred from #{' and #'.join(map(str, parents))}",
                    "tweaked": f"tweaked copy of #{parents[0]}" if parents else "tweaked copy"}.get(v.origin, v.origin or "-")
             vals = {"Status": st, "Recent gain": pct_txt(d.get("score")), "vs the market (recent)": pct_txt(d.get("edge")),
@@ -14564,17 +14646,17 @@ class App:
                     "Time winning": f"{hrs:.1f} h" if hrs >= 1 else f"{hrs * 60:.0f} min",
                     "Best market": MOOD_TEXT.get(lf["best_mood"], "not sure yet") if lf["best_mood"] else "not sure yet",
                     "Own stops": E.risk_text(v.risk) or "none", "Family": f"#{v.uid}, {fam}, generation {v.gen}",
-                    "Health / power": f"{self.tourn.health(v) * 100:.0f}% health, power {v.power:.1f} / 10",
+                    "Health / power": f"{T.health(v) * 100:.0f}% health, power {v.power:.1f} / 10",
                     "Never-rules": E.vetoes_text(v.vetoes, v.veto_stats) or "none",
                     "Twin test": "not run yet" if v.twin is None else
                     (f"passed ({v.twin * 100:+.1f}% vs the market on older prices)" if v.twin > 0 else
                      f"failed ({v.twin * 100:+.1f}%): maybe just lucky, counts for less"),
                     "Skips coins": ", ".join(c_ for c_, x in v.coin_pl.items() if x[0] >= 3 and x[1] < -1.5) or "none",
-                    "Exams": E.exam_text(v, self.tourn.serial),
+                    "Exams": E.exam_text(v, T.serial),
                     "Good at": ("; ".join(f"{n_} ({x_:+.3f}% a decision)" for n_, x_ in E.good_at(v)[:3])
                                 or "still learning when it does best"),
                     "Badges": ", ".join(f"{n}" for n, _ in self.achievements(v, lf)) or "none yet",
-                    "Island": f"{v.island + 1} of {int(self.tourn.o.get('islands', 1) or 1)}",
+                    "Island": f"{v.island + 1} of {int(T.o.get('islands', 1) or 1)}",
                     "Backtests": ("; ".join(f"{b_['ret']:+.1f}% ({b_['edge']:+.1f}% vs market, {b_['segments_passed']}/{b_['segments']} parts)"
                                             for b_ in v.backtests[-2:]) if v.backtests else "none saved"),
                     "Traits": (E.traits_text(v.traits) or "none yet") + (
@@ -14592,7 +14674,7 @@ class App:
                 cv.create_text(W // 2, H // 2, text="No price history yet", fill=MUTED)
                 return
             L = len(self.hist.get(c, []))
-            first_n = self.tourn.n - (len(h) - 1)
+            first_n = T.n - (len(h) - 1)
             marks = [(n - first_n, side, px) for n, cc, side, px in v.log if cc == c and n >= first_n]
             lo, hi = min(h + [m[2] for m in marks]), max(h + [m[2] for m in marks])
             pad = (hi - lo) * 0.08 or hi * 0.001 or 1
@@ -14625,7 +14707,7 @@ class App:
             p = filedialog.asksaveasfilename(title="Export bot", defaultextension=".json", parent=w,
                                              initialfile=f"{v.name.lower().replace(' ', '-')}-bot.json", filetypes=[("Bot file", "*.json")])
             if p:
-                rows = [dict(r, bar_minutes=self.session_bar) for r in self.tourn.board() if r["v"] is v]
+                rows = self.board_rows_of([v])
                 E.save_bots_file(p, E.export_bots(rows, self.version))
                 self.write(f"Exported {title} to {p}")
 
@@ -14635,7 +14717,7 @@ class App:
 
         def size(d):
             v.size_mult = round(min(max(v.size_mult + d, 0.25), 3.0), 2)
-            self.tourn._rate()
+            T._rate()
             self.refresh_board()
             self.write(f"{title} trade size is now {v.size_mult:.2f}x.")
         ttk.Button(b, text="Export this bot...", command=export_one).pack(side="left")
@@ -14643,7 +14725,7 @@ class App:
         ttk.Button(b, text="Backtest...", command=lambda: self.open_backtest(v)).pack(side="left", padx=(6, 0))
         ttk.Button(b, text="Add to Hall of Fame", command=to_hof).pack(side="left", padx=6)
         ttk.Button(b, text="Catch!", style="Accent.TButton", command=lambda: self.catch_rows(
-            [r for r in self.tourn.board() if r["v"] is v], "detail card")).pack(side="left", padx=(0, 6))
+            self.board_rows_of([v]), "detail card")).pack(side="left", padx=(0, 6))
         ttk.Button(b, text="Size -", command=lambda: size(-0.25)).pack(side="left")
         ttk.Button(b, text="Size +", command=lambda: size(0.25)).pack(side="left", padx=(4, 0))
         ttk.Button(b, text="Show on main chart", command=lambda: (
