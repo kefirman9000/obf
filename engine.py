@@ -2169,6 +2169,7 @@ DEFAULT_SETTINGS = {
     "proven_only": True,         # only bots with a real track record decide the account's trades
     "proven_trades": 8,          # ...finished trades a bot needs first
     "proven_exam": True,         # ...and passed exams on prices it never trained on
+    "proven_kamikazes": False,   # proven kamikazes (all-or-nothing bets) may trade the account too
     "alpaca_adopt_all": False,   # OBF manages every Alpaca option position nothing in OBF follows
     "slow_trades_account": False,  # the slow farm (hourly candles) may also trade your account
     "slow_size": 30,             # bots on the slow farm
@@ -2822,6 +2823,7 @@ def tournament_opts(settings):
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
                 proven_only=bool(settings.get("proven_only", True)), proven_exam=bool(settings.get("proven_exam", True)),
                 proven_trades=int(settings.get("proven_trades", 8) or 0),
+                proven_kamikazes=bool(settings.get("proven_kamikazes", False)),
                 prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0], sspread=_set_scalp_spread(settings))
 
 
@@ -4778,20 +4780,35 @@ class Tournament:
         pretend money until it gets there. With the gate off (Settings), every winning bot may."""
         if not self.o.get("proven_only", True):
             return True
-        if is_kami(v):
-            return False
+        return not self.proven_gaps(v)
+
+    def proven_gaps(self, v):
+        """What this bot still lacks before it may trade the account, in plain words ([] = proven)."""
         if v.origin == "team":  # bots you picked yourself to trade with (My team / Hall of Fame only)
-            return True
-        if v.wins + v.losses < int(self.o.get("proven_trades", 8) or 0):
-            return False
-        if v.age < self.window_for(v.tf):  # it has lived through at least one full scoring window of its own
-            return False
+            return []
+        kami = is_kami(v)
+        if kami and not self.o.get("proven_kamikazes", False):
+            return ["kamikazes don't trade the account (Settings > Wildcard)"]
+        gaps = []
+        need = int(self.o.get("proven_trades", 8) or 0)
+        closed = v.wins + v.losses
+        if closed < need:
+            gaps.append(f"{need - closed} more finished trade{'s' if need - closed != 1 else ''}")
+        window = self.window_for(v.tf)
+        if v.age < window:  # it has lived through at least one full scoring window of its own
+            gaps.append(f"{window - v.age} more decisions on the farm")
         lf = self.life(v)
-        if lf["ret"] <= 0 or (lf["edge"] is not None and lf["edge"] <= 0):
-            return False
-        if self.o.get("proven_exam", True) and exam_verdict(v, self.serial)[0] != "passed":
-            return False
-        return True
+        if lf["ret"] <= 0:
+            gaps.append(f"a lifetime profit (now {lf['ret'] * 100:+.1f}%)")
+        elif lf["edge"] is not None and lf["edge"] <= 0:
+            gaps.append(f"to beat just holding (now {lf['edge'] * 100:+.1f}% vs holding)")
+        if self.o.get("proven_exam", True) and not kami:  # (kamikazes aren't examined: their record is their proof)
+            verdict, d = exam_verdict(v, self.serial)
+            if verdict == "failed":
+                gaps.append("to stop failing its exams")
+            elif verdict != "passed":
+                gaps.append(f"passed exams ({d['k']} of at least {EXAM_MIN} taken)")
+        return gaps
 
     def proven_bots(self):
         return [v for v in self.vars if self.proven(v)]

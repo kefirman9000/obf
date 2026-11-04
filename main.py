@@ -158,6 +158,8 @@ SETTING_GROUPS = [
                         "record first. Every other bot keeps training on its own pretend money", bool),
         ("proven_trades", "...finished trades a bot needs before it may trade the account", int),
         ("proven_exam", "...and it must have passed its exams (Free roam tests it on days it never trained on)", bool),
+        ("proven_kamikazes", "...proven kamikazes may trade the account too (all-or-nothing bets on cheap far-out "
+                             "contracts; they need the same trades and lifetime record, but aren't examined)", bool),
         ("winner_boost", "Biggest trade size a top winner can earn (1 = normal, 2.5 = 2.5 times)", float),
         ("slow_every", "Shaky strategies may only trade every N decisions", int),
         ("fail_drop", "Stop a strategy at once if it falls this % from its peak (0 = off)", float),
@@ -1427,6 +1429,17 @@ class App:
         self.headline_lbl = tk.Label(root, text="", bg="#1e3a5f" if DARK else "#eff6ff", fg="#bfdbfe" if DARK else "#1e3a8a", anchor="w", justify="left",
                                      padx=14, pady=7, wraplength=1000, font=("", 10))
         self.headline_lbl.pack(fill="x")
+        self.proven_bar = tk.Frame(root, bg="#78350f" if DARK else "#fef3c7")
+        pb_bg, pb_fg = ("#78350f", "#fde68a") if DARK else ("#fef3c7", "#78350f")
+        self.proven_lbl = tk.Label(self.proven_bar, text="", bg=pb_bg, fg=pb_fg, anchor="w", justify="left", padx=14,
+                                   pady=6, wraplength=900, font=("", 10, "bold"))
+        self.proven_lbl.pack(side="left", fill="x", expand=True)
+        self.proven_roam_btn = ttk.Button(self.proven_bar, text="Turn on Free roam", style="Plain.TButton",
+                                          command=lambda: (self.toggle_roam(True), self.update_proven_bar(force=True)))
+        ttk.Button(self.proven_bar, text="Settings", style="Plain.TButton", command=self.open_settings).pack(
+            side="right", padx=(4, 10), pady=4)
+        ttk.Button(self.proven_bar, text="How to train them", style="Accent.TButton", command=self.show_training_help).pack(
+            side="right", padx=4, pady=4)
 
         body = self.body = tk.Frame(root, bg=BG, highlightthickness=0)
         body.pack(fill="both", expand=True, padx=10, pady=10)
@@ -3684,6 +3697,109 @@ class App:
         self.refresh_prices()
         self.chart_tick()
         self.headline_lbl.config(text=self.headline())
+        self.update_proven_bar()
+
+    # ---------------- nobody proven yet: say so, and how to train them ----------------
+    def no_proven_bots(self):
+        """(nothing can trade the account, the farm, the closest bots with what they still lack) while the bot runs."""
+        t = self.tourn
+        if not (self.running and self.seeded and self.wild and t and self.settings.get("proven_only", True)):
+            return False, t, []
+        if self.roster() != "farm" and any(v.origin == "team" for v in t.vars):
+            return False, t, []  # trading with your own team / Hall of Fame bots
+        if t.proven_bots():
+            return False, t, []
+        near = sorted(((len(g), E.bot_nickname(v.key()), g) for v in t.vars for g in [t.proven_gaps(v)]
+                       if not E.is_kami(v) or self.settings.get("proven_kamikazes", False)), key=lambda x: x[0])
+        return True, t, near[:3]
+
+    def update_proven_bar(self, force=False):
+        if not hasattr(self, "proven_bar"):
+            return
+        if not force and time.time() - getattr(self, "_pb_at", 0) < 5:
+            return
+        self._pb_at = time.time()
+        try:
+            none, t, near = self.no_proven_bots()
+        except Exception:
+            E.note_error("update_proven_bar")
+            return
+        if not none:
+            if self.proven_bar.winfo_ismapped():
+                self.proven_bar.pack_forget()
+                self.write("A bot is proven now, so the account can trade again (it follows the proven winners).", "good")
+            return
+        closest = "; ".join(f"{nm} needs {', '.join(g[:2])}" for _, nm, g in near[:2])
+        self.proven_lbl.config(text=f"No bot is proven yet, so the account won't trade. {len(t.vars)} bots are training "
+                                    f"on their own pretend money." + (f" Closest: {closest}." if closest else ""))
+        if self.cfg.get("roam_on"):
+            self.proven_roam_btn.pack_forget()
+        elif not self.proven_roam_btn.winfo_ismapped():
+            self.proven_roam_btn.pack(side="right", padx=4, pady=4)
+        if not self.proven_bar.winfo_ismapped():
+            self.proven_bar.pack(fill="x", after=self.headline_lbl)
+            if not self.cfg.get("proven_help_seen"):  # the first time ever: say it out loud, once
+                self.cfg["proven_help_seen"] = True
+                try:
+                    E.save_json(CONFIG_PATH, self.cfg)
+                except OSError:
+                    pass
+                self.notify("OBF", "No bot is proven yet, so the account won't trade. Click 'How to train them'.")
+                self.root.after(500, self.show_training_help)
+
+    def show_training_help(self):
+        """How to get bots proven: what proven means, the steps, and buttons for each."""
+        w = tk.Toplevel(self.root)
+        w.title("How to train your bots")
+        w.configure(bg=BG)
+        f = tk.Frame(w, bg=BG, padx=16, pady=12)
+        f.pack(fill="both", expand=True)
+        st = self.settings
+        need = [f"at least {int(st.get('proven_trades', 8) or 0)} finished trades",
+                "at least one full scoring window on the farm", "money made over its lifetime, and more than just holding"]
+        if st.get("proven_exam", True):
+            need.append("passed exams on days it never trained on (Free roam gives those)")
+        tk.Label(f, text="Only proven bots trade the account", bg=BG, fg=TEXT, font=("", 13, "bold")).pack(anchor="w")
+        tk.Label(f, bg=BG, fg=MUTED, justify="left", wraplength=620, anchor="w", text=(
+            "Your practice account, Alpaca paper and LIVE only follow bots with a real track record. A bot is proven "
+            "when it has: " + "; ".join(need) + ". Until then it trains on its own pretend money, which never touches "
+            "your account.")).pack(anchor="w", pady=(2, 10))
+        steps = [
+            ("Keep the bot running", "Every minute it runs, the bots trade their own pretend money on real prices and "
+                                     "build up their records. Leave it running through market hours.", None, None),
+            ("Turn on Free roam", "It tests bots on past days they never trained on: those are the exams a bot must pass. "
+                                  "It also replays past days and breeds from what worked.",
+             "Free roam is ON" if self.cfg.get("roam_on") else "Turn on Free roam", lambda: self.toggle_roam(True)),
+            ("Run the Training camp", "A whole farm lives through weeks or months of history several times over, then "
+                                      "sits a final exam. The ones that pass can join your farm straight away.",
+             "Open the Training camp", lambda: self.open_learning("Training camp")),
+            ("Give them room to trade", "Each bot spends your practice money x Trade size %. If a typical contract costs more "
+                                        "than that, bots skip it, so they hardly trade and can't build a record. More "
+                                        "practice money, or the Contract price sliders, fix that.", None, None),
+            ("Or choose who trades", "Pick bots yourself (My team or Hall of Fame only), or loosen the rules in "
+                                     "Settings > Wildcard (trades needed, exams required, proven kamikazes).",
+             "Open Settings", self.open_settings),
+        ]
+        for i, (head, body, btn, fn) in enumerate(steps, 1):
+            row = tk.Frame(f, bg=CARD, padx=10, pady=8, highlightthickness=1, highlightbackground=LINE)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=f"{i}. {head}", bg=CARD, fg=TEXT, font=("", 10, "bold"), anchor="w").pack(anchor="w")
+            tk.Label(row, text=body, bg=CARD, fg=MUTED, justify="left", wraplength=600, anchor="w").pack(anchor="w")
+            if btn:
+                b = ttk.Button(row, text=btn, style="Plain.TButton", command=lambda fn=fn: (fn(), self.update_proven_bar(True)))
+                b.pack(anchor="e", pady=(4, 0))
+                if btn == "Free roam is ON":
+                    b.state(["disabled"])
+        try:
+            _, t, near = self.no_proven_bots()
+        except Exception:
+            near = []
+        if near:
+            tk.Label(f, text="Closest to proven right now", bg=BG, fg=TEXT, font=("", 10, "bold")).pack(anchor="w", pady=(10, 2))
+            for _, nm, g in near:
+                tk.Label(f, text=f"{nm}: needs {', '.join(g)}", bg=BG, fg=MUTED, anchor="w", justify="left",
+                         wraplength=620).pack(anchor="w")
+        ttk.Button(f, text="Close", command=w.destroy).pack(anchor="e", pady=(12, 0))
 
     def refresh_board(self):
         if self.in_bg():

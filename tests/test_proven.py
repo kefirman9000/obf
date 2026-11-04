@@ -79,3 +79,26 @@ def test_old_farms_start_a_fresh_scoreboard_once():
     assert [x.key() for x in t2.vars] == [x.key() for x in t.vars]  # genes kept
     t3 = E.Tournament(t.coins, 10000.0, 0.006, 0.1, 24, cap=30)
     assert t3.restore(json.loads(json.dumps(t2.to_state()))) and not t3.scoreboard_reset
+
+
+def test_proven_kamikazes_only_with_the_toggle_and_without_exams():
+    t = farm()
+    k = next((v for v in t.vars if E.is_kami(v)), None)
+    if k is None:
+        k = t.vars[0]
+        k.traits = dict(k.traits, kami=1)
+    make_proven(t, k)
+    k.exams = []  # kamikazes aren't examined
+    assert not t.proven(k)
+    t.o["proven_kamikazes"] = True
+    assert t.proven(k)
+
+
+def test_gaps_say_what_is_missing():
+    t = farm()
+    v = next(x for x in t.vars if not E.is_kami(x))
+    v.wins = v.losses = 0
+    gaps = t.proven_gaps(v)
+    assert any("more finished trade" in g for g in gaps) and any("exams" in g for g in gaps)
+    make_proven(t, v)
+    assert t.proven_gaps(v) == []

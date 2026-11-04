@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.24.1
+- **An alert when no bot may trade.** While the bot runs and no bot is proven yet, an amber bar under the top line
+  says so: the account won't trade, how many bots are training, and what the closest ones still need ("4 more
+  finished trades", "passed exams (1 of at least 3 taken)"...). Its buttons: How to train them, Turn on Free roam
+  (while it's off) and Settings. The first time it happens you also get a notification and the guide opens by itself.
+  The bar goes away (with a note in the log) as soon as a bot is proven.
+- **How to train your bots**: a short guide to getting bots proven: keep the bot running, turn on Free roam (it gives
+  the exams), run the Training camp, give them room to trade (practice money and contract prices), or choose who
+  trades yourself, with a button for each.
+- **Proven kamikazes may trade the account** if you want: Settings > Wildcard (off by default). They need the same
+  trades and lifetime record as other bots; Free roam doesn't examine kamikazes, so their record is their proof.
+
 ## 1.24.0
 - **Only proven bots trade the account now.** Your practice account, Alpaca paper and LIVE only follow bots with a real
   track record: at least 8 finished trades, at least one full scoring window on the farm, money made over their
