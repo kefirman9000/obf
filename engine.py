@@ -2166,6 +2166,7 @@ DEFAULT_SETTINGS = {
     "roam_reuse": 3,             # Free roam studies each downloaded stretch this many times before fetching a new one
     "feature_tests": True,       # Free roam tests what each learning switch is worth (reported, never changed for you)
     "report_detail": False,      # Export a report also adds the detailed part (bot trades, price feed, checks)
+    "alpaca_adopt_all": False,   # OBF manages every Alpaca option position nothing in OBF follows
     "slow_trades_account": False,  # the slow farm (hourly candles) may also trade your account
     "slow_size": 30,             # bots on the slow farm
     "coin_prefs": True,          # bots learn which coins they're bad at and skip them (re-checked in hindsight)

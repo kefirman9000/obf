@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.23.7
+- **OBF can manage Alpaca options no bot traded.** On the Alpaca account tab, pick positions and press "Let OBF
+  manage selected": OBF then looks after them with your account's rules from Settings (safety stop, lock-in profit,
+  trailing stop, and selling before expiry), checked every minute while the market is open, with the prices Alpaca
+  shows. It works for any ticker, not just your session's. "Stop managing" hands them back (they stay open).
+  - Settings > "Let OBF manage every untracked Alpaca option": picks up every option position in your Alpaca account
+    that nothing in OBF follows, automatically. Off by default; it works with a LIVE key too, so it says so.
+  - Positions an OBF session already follows are left to that session, and shares are never touched.
+  - Copies kept from before a practice reset now follow the same rules (before, they were only sold before expiry).
+
 ## 1.23.6
 - **Success tab: act on the bots it lists.** Pick one or more bots (Ctrl+click for several) and use the buttons under
   the chart: Save to Library, Add to Hall of Fame, Add to my Bot Farm (copies Slow farm or Scalp lab bots into your

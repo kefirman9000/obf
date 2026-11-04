@@ -258,6 +258,9 @@ SETTING_GROUPS = [
                        "famous strategies silver)", "eggs"),
         ("daily_recap", "Daily recap: once a day, how the bots did against the market (in the log, and as a note on the "
                         "icon by the clock)", bool),
+        ("alpaca_adopt_all", "Let OBF manage every untracked Alpaca option: any option position in your Alpaca account "
+                             "that nothing in OBF is following is picked up and sold by your stop, target, trailing and "
+                             "expiry rules (also for a LIVE key, so only turn this on if that's what you want)", bool),
         ("report_detail", "Detailed reports for Claude: Export a report also adds every bot's recent trades (with the "
                           "prices and volatility behind them), the price feed's gaps, errors and automatic checks", bool),
         ("auto_backup", "Weekly backup: keep a copy of your bots, farms and settings in the data folder (last 4 kept, no keys)", bool),
@@ -12517,8 +12520,12 @@ class App:
         for c, m in (getattr(self, "mirror", None) or {}).items():
             if m.get("symbol") == sym:
                 return "Copy of a PRACTICE trade (sold when that trade closes)", False
-        if sym in (self.cfg.get("alpaca_kept") or {}):
-            return "Kept from before a practice reset (OBF sells it the day before it expires)", True
+        rec = (self.cfg.get("alpaca_kept") or {}).get(sym)
+        if rec:
+            if rec.get("acct", "paper") != self.alpaca_acct():
+                return f"Managed by OBF on your {rec.get('acct', 'paper')} account (log in with that key to manage it)", False
+            return "Managed by OBF: " + self.managed_rules_text() + (" (kept from before a practice reset)"
+                                                                      if rec.get("how") != "adopted" else ""), True
         cur = self.sess_tag() if self.session else None
         if cur in ("alpaca", "live") and self.broker() == "alpaca":
             if any(o.get("symbol") == sym and self.pos.get(c, 0) > 0 for c, o in self.opt.items()):
@@ -12537,6 +12544,13 @@ class App:
         ttk.Button(bar, text="\u27f3 Refresh", command=lambda: self.refresh_alpaca()).pack(side="left")
         self.al_sell = ttk.Button(bar, text="Sell selected...", style="Plain.TButton", command=self.alpaca_sell_selected)
         self.al_sell.pack(side="left", padx=6)
+        ab_ = ttk.Button(bar, text="Let OBF manage selected", style="Plain.TButton", command=self.alpaca_adopt_selected)
+        ab_.pack(side="left")
+        Tip(ab_, "OBF looks after these positions with your account's rules (Settings): the safety stop, lock-in "
+                 "profit, trailing stop and selling before expiry, using the prices Alpaca shows. Works for any "
+                 "ticker, even ones no bot traded.")
+        ttk.Button(bar, text="Stop managing", style="Plain.TButton", command=self.alpaca_release_selected).pack(
+            side="left", padx=6)
         self.al_sum = tk.Label(bar, text="", bg=CARD, fg=MUTED, anchor="w", font=("", 9, "bold"))
         self.al_sum.pack(side="left", padx=10)
         tk.Label(parent, bg=CARD, fg=MUTED, anchor="w", padx=8, font=("", 8), justify="left", wraplength=1100, text=(
@@ -12612,7 +12626,8 @@ class App:
                                               f"${paid:,.2f}", f"${worth:,.2f}", f"{pl:+,.2f}",
                                               f"{(pl / abs(paid) * 100) if paid else 0:+.1f}%", left, who),
                            tags=("up" if pl >= 0 else "down",))
-            self.al_rows[iid] = dict(symbol=sym, qty=qty, label=label, can_sell=can_sell, side=p_.get("side", "long"))
+            self.al_rows[iid] = dict(symbol=sym, qty=qty, label=label, can_sell=can_sell, side=p_.get("side", "long"),
+                                     paid=paid, exp=exp)
             paid_all += paid
             worth_all += worth
         pl_all = worth_all - paid_all
@@ -12670,7 +12685,8 @@ class App:
             row = dict(time=datetime.now().isoformat(timespec="seconds"), mode="alpaca", acct="ALPACA PAPER" if paper else "LIVE",
                        side="sell", coin=label, qty=got, price=round(avg, 6), usd=round(proceeds, 2),
                        pl="" if basis is None else round(proceeds - basis, 2), reason=reason,
-                       who="kept copy of a PRACTICE trade" if rec else "position OBF wasn't following")
+                       who=("managed by OBF (you handed it over)" if rec.get("how") == "adopted" else
+                            "kept copy of a PRACTICE trade") if rec else "position OBF wasn't following")
             if paper:
                 self.mirror_trades.append(row)
                 del self.mirror_trades[:-5000]
@@ -12715,18 +12731,144 @@ class App:
                 pass
         return n
 
-    def guard_kept_copies(self):
-        """Kept copies (from before a practice reset) are sold the day before they expire, like every other contract
-        OBF looks after, so none turns into shares. Needs the paper login; tries at most every 10 minutes."""
-        kept = self.cfg.get("alpaca_kept") or {}
-        if not kept or not self.is_paper_key() or time.time() - getattr(self, "_kept_try", 0) < 600:
+    def alpaca_acct(self):
+        """'paper' or 'live': which Alpaca account the logged-in key belongs to."""
+        return "paper" if E.ALPACA.get("paper", True) else "live"
+
+    def managed_rules_text(self):
+        st = self.settings
+        bits = [f"stop -{st.get('stop_loss', 0):g}%" if st.get("stop_loss") else "",
+                f"target +{st.get('take_profit', 0):g}%" if st.get("take_profit") else "",
+                f"trailing {st.get('trail_stop', 0):g}%" if st.get("trail_stop") else "",
+                f"sold {int(st.get('expiry_days', 2) or 2)} trading days before expiry"]
+        return ", ".join(b for b in bits if b)
+
+    def alpaca_adopt_selected(self):
+        sel = [self.al_rows[i] for i in self.al_tree.selection() if i in getattr(self, "al_rows", {})]
+        if not sel:
+            return messagebox.showinfo("Let OBF manage", "Pick one or more positions in the list first.")
+        ok = [r for r in sel if r["can_sell"] and r["side"] == "long" and r["qty"] > 0 and r.get("exp")]
+        if not ok:
+            return messagebox.showinfo("Let OBF manage", "Only long option positions that no OBF session is already "
+                                                          "looking after can be handed over.")
+        live = self.alpaca_acct() == "live"
+        if not messagebox.askyesno("Let OBF manage", ("LIVE ACCOUNT, REAL MONEY.\n\n" if live else "")
+                                   + "OBF will sell these by itself when your rules say so (" + self.managed_rules_text()
+                                   + "), using the prices Alpaca shows:\n\n" + "\n".join(f"{r['qty']:g} x {r['label']}" for r in ok)
+                                   + "\n\nYou can stop that any time with 'Stop managing'.", icon="warning" if live else "question"):
             return
-        days = max(1, int(self.settings.get("expiry_days", 2) or 2))
-        due = [s_ for s_, r in kept.items() if r.get("exp") and E.sessions_left(r["exp"]) <= days and r.get("qty", 0) > 0]
-        if due:
-            self._kept_try = time.time()
-            for s_ in due:
-                self.executor.submit(self._alpaca_close, s_, kept[s_]["qty"], "expiry (kept copy)")
+        n = self.adopt_alpaca(ok)
+        self.write(f"OBF now manages {n} Alpaca position{'s' if n != 1 else ''}: {self.managed_rules_text()}.", "good")
+        self.refresh_alpaca(quiet=True)
+
+    def adopt_alpaca(self, rows, how="adopted"):
+        """Hands Alpaca positions to OBF's care (rows from the Alpaca tab or from Alpaca itself). -> how many."""
+        kept = dict(self.cfg.get("alpaca_kept") or {})
+        n = 0
+        for r in rows:
+            sym = r["symbol"]
+            if sym in kept:
+                continue
+            root_, _, exp, typ, K = self.occ_text(sym)
+            kept[sym] = dict(symbol=sym, c=root_, qty=int(r["qty"]), cost=float(r.get("paid") or 0), K=K, exp=exp, type=typ,
+                             how=how, acct=self.alpaca_acct(), kept_at=time.time())
+            n += 1
+        self.cfg["alpaca_kept"] = kept
+        try:
+            E.save_json(CONFIG_PATH, self.cfg)
+        except OSError:
+            E.note_error("adopt_alpaca")
+        return n
+
+    def alpaca_release_selected(self):
+        sel = [self.al_rows[i] for i in self.al_tree.selection() if i in getattr(self, "al_rows", {})]
+        kept = dict(self.cfg.get("alpaca_kept") or {})
+        gone = [r["label"] for r in sel if kept.pop(r["symbol"], None)]
+        if not gone:
+            return messagebox.showinfo("Stop managing", "Pick positions marked 'Managed by OBF' first.")
+        self.cfg["alpaca_kept"] = kept
+        try:
+            E.save_json(CONFIG_PATH, self.cfg)
+        except OSError:
+            E.note_error("alpaca_release_selected")
+        self.write("OBF no longer manages " + ", ".join(gone) + ". They stay open on Alpaca.")
+        self.refresh_alpaca(quiet=True)
+
+    def guard_kept_copies(self):
+        """Every minute while the market is open: Alpaca positions OBF manages (handed over by you, or kept from before
+        a practice reset) are checked against your account's rules with the prices Alpaca shows, and sold when one
+        says so. With 'Let OBF manage every untracked option' on, options nothing in OBF follows are picked up too."""
+        kept = self.cfg.get("alpaca_kept") or {}
+        auto = bool(self.settings.get("alpaca_adopt_all", False))
+        if (not kept and not auto) or not E.ALPACA.get("key") or not self.client or getattr(self, "_kept_busy", False):
+            return
+        if not (0 < E.minutes_to_close(time.time()) <= 390) or datetime.now().weekday() >= 5:
+            return
+        if time.time() - getattr(self, "_kept_try", 0) < 55:
+            return
+        self._kept_try, self._kept_busy = time.time(), True
+
+        def work():
+            try:
+                rows = [p_ for p_ in (E.alp_positions() or []) if float(p_.get("qty") or 0) != 0]
+                self.q.put(("call", lambda: self._manage_alpaca(rows)))
+            except Exception:
+                E.note_error("guard_kept_copies")
+            finally:
+                self._kept_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _manage_alpaca(self, rows):
+        acct = self.alpaca_acct()
+        kept = dict(self.cfg.get("alpaca_kept") or {})
+        held = {str(p_.get("symbol")): p_ for p_ in rows}
+        if self.settings.get("alpaca_adopt_all", False):
+            new = []
+            for sym, p_ in held.items():
+                if sym in kept or p_.get("side", "long") != "long" or not self.occ_text(sym)[2]:
+                    continue
+                if self.alpaca_owner(sym)[0] == "Not tracked by OBF":
+                    new.append(dict(symbol=sym, qty=float(p_.get("qty") or 0), paid=float(p_.get("cost_basis") or 0)))
+            if new and self.adopt_alpaca(new, how="adopted"):
+                kept = dict(self.cfg.get("alpaca_kept") or {})
+                self.write(f"OBF picked up {len(new)} Alpaca option position{'s' if len(new) != 1 else ''} no bot was "
+                           f"following ({', '.join(self.occ_text(x['symbol'])[1] for x in new)}): {self.managed_rules_text()}.")
+        st = self.settings
+        stop = float(st.get("stop_loss", 0) or 0) / 100
+        take = float(st.get("take_profit", 0) or 0) / 100
+        trail = float(st.get("trail_stop", 0) or 0) / 100
+        days = max(1, int(st.get("expiry_days", 2) or 2))
+        changed = False
+        for sym, rec in list(kept.items()):
+            if rec.get("acct", "paper") != acct:
+                continue  # it's on the other account: only that key can see or sell it
+            p_ = held.get(sym)
+            if p_ is None:  # sold or expired on Alpaca (or by hand): nothing left to manage
+                kept.pop(sym)
+                changed = True
+                continue
+            cost, worth = float(p_.get("cost_basis") or 0), float(p_.get("market_value") or 0)
+            if cost <= 0 or time.time() - rec.get("closing", 0) < 120:
+                continue
+            pl = worth / cost - 1
+            if pl > rec.get("peak", -1):
+                rec["peak"] = pl
+                changed = True
+            why = ("expiry" if rec.get("exp") and E.sessions_left(rec["exp"]) <= days else
+                   "safety stop" if stop and pl <= -stop else
+                   "lock in profit" if take and pl >= take else
+                   "trailing stop" if trail and rec.get("peak", 0) > 0 and rec["peak"] - pl >= trail else None)
+            if why:
+                rec["closing"] = time.time()
+                changed = True
+                self.write(f"ALPACA: selling {self.occ_text(sym)[1]} ({why}, {pl * 100:+.1f}%).", "warn")
+                self.executor.submit(self._alpaca_close, sym, int(float(p_.get("qty") or 0)), why + " (managed by OBF)")
+        if changed:
+            self.cfg["alpaca_kept"] = kept
+            try:
+                E.save_json(CONFIG_PATH, self.cfg)
+            except OSError:
+                E.note_error("_manage_alpaca")
 
     # ---------------- live scalp lab: a farm of scalpers that learns on its own from live 1-minute prices ----------------
     LAB_CAP = 24          # scalpers in the lab
