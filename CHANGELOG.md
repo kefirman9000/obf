@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.22.3
+- **Alpaca account tab**: what's really in your Alpaca account (paper or live, whichever your key belongs to), read
+  straight from Alpaca, with a Refresh button (it also refreshes itself every 30 seconds while you look at it). Each
+  position says which part of OBF looks after it: a copy of a practice trade, this session, a saved session, a copy kept
+  from before a reset, or nothing. Positions nothing in OBF is following can be sold from the tab (at the bid, then at
+  market), never more than Alpaca says you hold.
+- **Resets no longer forget your Alpaca paper copies**: with "Both" on, resetting the practice account used to drop
+  OBF's record of the copies on your Alpaca paper account while they stayed open there, so nothing sold them. Now they
+  stay open and OBF keeps looking after them: they show in the Alpaca account tab, and each is sold the day before it
+  expires, like every other contract OBF holds. The history of those copies stays in Trades too.
+
 ## 1.22.2
 - **Resetting the practice account now clears Bot positions too**: the bots' own pretend contracts are closed at what
   they're worth now, from Reset account and from the account box in Reset... (Bot Farm and Slow farm). No trade is

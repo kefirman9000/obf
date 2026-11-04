@@ -1639,13 +1639,14 @@ class App:
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
-        t0, t1, t7, t8, tm, tt, tb, ts, tf_, tsu = (ttk.Frame(nb) for _ in range(10))
+        t0, t1, t7, t8, tm, tt, tb, ts, tf_, tsu, tal = (ttk.Frame(nb) for _ in range(11))
         nb.add(tf_, text="  \u2630 Overview  ")
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t7, text="  \u25c7 Slow farm  ")
         nb.add(t8, text="  Options  ")
         nb.add(t1, text="  Portfolio  ")
         nb.add(tb, text="  Bot positions  ")
+        nb.add(tal, text="  Alpaca account  ")
         nb.add(tsu, text="  \u2605 Success  ")
         nb.add(ts, text="  \u26a1 Scalpers  ")
         nb.add(tm, text="  Markets  ")
@@ -1671,6 +1672,7 @@ class App:
         self.build_options_tab(t8)
         self.build_portfolio(t1)
         self.build_botpos_tab(tb)
+        self.build_alpaca_tab(tal)
         self.build_features_tab(tf_)
         self.build_success_tab(tsu)
         sn_ = ttk.Notebook(ts)  # Scalpers = the live scalp lab + the market scan
@@ -2568,6 +2570,10 @@ class App:
             self.q.put(("call", lambda e=e: self._mirror_done(c, None, reason, str(e))))
 
     def _mirror_done(self, c, rec, reason, err=""):
+        if rec is not None and c not in self.mirror:  # the account was reset while this copy was on its way
+            self.mirror[c] = rec
+            self.keep_mirror_copies()
+            return
         if rec is None:
             self.mirror.pop(c, None)
             if time.time() - getattr(self, "_mirror_note", 0) > 600:
@@ -4107,13 +4113,14 @@ class App:
             msg += ("\n\nThis only resets what OBF tracks: positions it bought stay in your broker account, "
                     "and you can close them there.")
         if self.mirror:
-            msg += "\n\nCopies on your Alpaca paper account stay open there."
+            msg += ("\n\nCopies on your Alpaca paper account stay open there, and OBF keeps looking after them (see the "
+                    "Alpaca account tab): it sells each one the day before it expires.")
         if not messagebox.askyesno("Reset account", msg):
             return
         self.start_cash = self.cash = cash
         self.pos, self.cost, self.opt = {}, {}, {}
         self.trades, self.curve = [], []
-        self.mirror, self.mirror_trades = {}, []
+        kept = self.keep_mirror_copies()  # (and the history of Alpaca copies is Alpaca's, so it stays in Trades)
         self.bench_units, self.high, self.bought_at, self.bot_alloc = {}, {}, {}, {}
         self.pending_who, self.pending_detail, self.pending_voters = {}, {}, {}
         self.trade_marks, self.curve_n, self.fees_paid = [], 0, 0.0
@@ -4128,6 +4135,9 @@ class App:
             except Exception:
                 E.note_error("reset_account")
         closed = 0 if self.live else self.close_bot_positions()
+        if kept:
+            self.write(f"{kept} cop{'ies' if kept != 1 else 'y'} on your Alpaca paper account stay open; OBF keeps looking after "
+                       "them (Alpaca account tab).")
         self.write(f"Account reset to ${cash:,.2f}. The farm and its learning are kept"
                    + (f"; the bots' {closed} open practice contract{'s' if closed != 1 else ''} were closed." if closed else "."))
 
@@ -4142,6 +4152,8 @@ class App:
             self.running = False
             self.save_farm(force=True)
         self.ui_running(False)
+        keep_trades = list(getattr(self, "mirror_trades", []) or []) if not self.live else []
+        kept = self.keep_mirror_copies() if not self.live else 0
         try:
             os.remove(E.state_path(self.sess_tag()))
         except OSError:
@@ -4152,11 +4164,13 @@ class App:
         except ValueError:
             cash = 1000.0
         self.reset_state(cash)
+        self.mirror_trades = keep_trades
         self.refresh_trades()
         self.update_status()
         self.refresh_view()
         self.refresh_board()
-        self.write("Session reset.")
+        self.write("Session reset." + (f" {kept} cop{'ies' if kept != 1 else 'y'} on your Alpaca paper account stay open; OBF "
+                                       "keeps looking after them (Alpaca account tab)." if kept else ""))
 
     def launch_worker(self):
         """Starts the price-feed thread. Any older feed notices the new number and exits."""
@@ -8460,6 +8474,10 @@ class App:
                 self.guard_other_mode()
             except Exception:
                 E.note_error("expiry_guard")
+            try:
+                self.guard_kept_copies()
+            except Exception:
+                E.note_error("guard_kept_copies")
             held = [(c, self.opt[c]) for c, q in self.pos.items() if q > 0 and self.opt.get(c) and c not in self.pending]
             if held and self.session and not getattr(self, "_guard_busy", False):
                 self._guard_busy = True
@@ -11462,6 +11480,8 @@ class App:
             self.opt_load(quiet=True)
         elif tab == "Bot positions":
             self.refresh_botpos()
+        elif tab == "Alpaca account":
+            self.refresh_alpaca(quiet=True)
         elif "Overview" in tab:
             self.refresh_features()
         elif "Scalp scan" in tab:
@@ -12076,6 +12096,234 @@ class App:
                                  + (f"   |   {unpriced} waiting for a price" if unpriced else ""))
                            if rows else ("No bot holds a contract right now." if farms else "The farms haven't started yet."),
                            fg=(GREEN if pl_all >= 0 else RED) if rows else MUTED)
+
+    # ---------------- Alpaca account: what's really there, straight from Alpaca ----------------
+    @staticmethod
+    def occ_text(sym):
+        """'SPY250321C00500000' -> ('SPY', 'SPY 500C Mar 21 2025', expiry timestamp, 'call', 500.0). Anything else as is."""
+        m = re.match(r"^([A-Z.]+?)(\d{6})([CP])(\d{8})$", str(sym or ""))
+        if not m:
+            return str(sym), str(sym), None, None, None
+        root, ymd, cp, k = m.groups()
+        exp = datetime.strptime(ymd, "%y%m%d").replace(hour=16)
+        K = int(k) / 1000
+        return root, f"{root} {K:g}{cp} {exp:%b %d %Y}", exp.timestamp(), "call" if cp == "C" else "put", K
+
+    def alpaca_owner(self, sym):
+        """Who in OBF looks after this Alpaca position: (text, can it be sold from the Alpaca tab?)."""
+        for c, m in (getattr(self, "mirror", None) or {}).items():
+            if m.get("symbol") == sym:
+                return "Copy of a PRACTICE trade (sold when that trade closes)", False
+        if sym in (self.cfg.get("alpaca_kept") or {}):
+            return "Kept from before a practice reset (OBF sells it the day before it expires)", True
+        cur = self.sess_tag() if self.session else None
+        if cur in ("alpaca", "live") and self.broker() == "alpaca":
+            if any(o.get("symbol") == sym and self.pos.get(c, 0) > 0 for c, o in self.opt.items()):
+                return f"This {self.acct_name()} session (sell it from Portfolio)", False
+        for tag_, nm_ in (("alpaca", "ALPACA PAPER"), ("live", "LIVE")):
+            if tag_ == cur:
+                continue
+            st = E.load_json(E.state_path(tag_), {}) or {}
+            if any(o.get("symbol") == sym and (st.get("pos") or {}).get(c, 0) > 0 for c, o in (st.get("opt") or {}).items()):
+                return f"Your saved {nm_} session (open it to manage it)", False
+        return "Not tracked by OBF", True
+
+    def build_alpaca_tab(self, parent):
+        bar = tk.Frame(parent, bg=CARD)
+        bar.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Button(bar, text="\u27f3 Refresh", command=lambda: self.refresh_alpaca()).pack(side="left")
+        self.al_sell = ttk.Button(bar, text="Sell selected...", style="Plain.TButton", command=self.alpaca_sell_selected)
+        self.al_sell.pack(side="left", padx=6)
+        self.al_sum = tk.Label(bar, text="", bg=CARD, fg=MUTED, anchor="w", font=("", 9, "bold"))
+        self.al_sum.pack(side="left", padx=10)
+        tk.Label(parent, bg=CARD, fg=MUTED, anchor="w", padx=8, font=("", 8), justify="left", wraplength=1100, text=(
+            "What's really in your Alpaca account (the paper or live one your key belongs to), read straight from Alpaca. "
+            "Resetting OBF never closes these. 'Tracked by OBF' says which part of OBF looks after each one.")).pack(fill="x")
+        box = tk.Frame(parent, bg=CARD)
+        box.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        cols = ("contract", "qty", "paid", "worth", "pl", "plpct", "left", "who")
+        heads = ("Contract", "Qty", "Paid", "Worth now", "P/L $", "P/L %", "Expires in", "Tracked by OBF")
+        t = self.al_tree = self.make_tree(box, cols, (200, 50, 90, 90, 90, 70, 90, 420), heads)
+        for c_ in ("contract", "left", "who"):
+            t.column(c_, anchor="w")
+        t.configure(selectmode="extended")
+        t.tag_configure("up", foreground=GREEN)
+        t.tag_configure("down", foreground=RED)
+        self.al_rows = {}
+        self._al_tick()
+
+    def _al_tick(self):
+        """While you're looking at the tab, it refreshes itself every 30 seconds."""
+        try:
+            if self.cur_tab() == "Alpaca account" and not self.in_bg():
+                self.refresh_alpaca(quiet=True)
+        except Exception:
+            E.note_error("_al_tick")
+        self.root.after(30000, self._al_tick)
+
+    def refresh_alpaca(self, quiet=False):
+        if getattr(self, "al_tree", None) is None or getattr(self, "_al_busy", False):
+            return
+        if not E.ALPACA.get("key"):
+            self.al_tree.delete(*self.al_tree.get_children())
+            self.al_rows = {}
+            return self.al_sum.config(text="Log in to Alpaca (Account > Log in) to see your Alpaca positions.", fg=MUTED)
+        self._al_busy = True
+        if not quiet:
+            self.al_sum.config(text="Asking Alpaca...", fg=MUTED)
+
+        def work():
+            try:
+                rows = [p_ for p_ in (E.alp_positions() or []) if float(p_.get("qty") or 0) != 0]
+                self.q.put(("call", lambda: self._alpaca_fill(rows, None)))
+            except Exception as e:
+                self.q.put(("call", lambda e=e: self._alpaca_fill(None, str(e))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _alpaca_fill(self, rows, err):
+        self._al_busy = False
+        if getattr(self, "al_tree", None) is None:
+            return
+        acct = "ALPACA PAPER" if E.ALPACA.get("paper", True) else "ALPACA LIVE (real money)"
+        if rows is None:
+            return self.al_sum.config(text=f"Couldn't read your {acct} account: {err}", fg=RED)
+        t = self.al_tree
+        t.delete(*t.get_children())
+        self.al_rows = {}
+        paid_all = worth_all = 0.0
+        now = time.time()
+        for p_ in sorted(rows, key=lambda r: str(r.get("symbol"))):
+            sym = str(p_.get("symbol"))
+            _, label, exp, _, _ = self.occ_text(sym)
+            qty = float(p_.get("qty") or 0)
+            paid = float(p_.get("cost_basis") or 0)
+            worth = float(p_.get("market_value") or 0)
+            pl = float(p_.get("unrealized_pl") if p_.get("unrealized_pl") not in (None, "") else worth - paid)
+            who, can_sell = self.alpaca_owner(sym)
+            if exp:
+                d = (exp - now) / 86400
+                left = "expired" if d < 0 else f"{d * 24:.0f} h" if d < 1 else f"{d:.1f} days"
+            else:
+                left = "-"
+            iid = t.insert("", "end", values=(label + ("" if p_.get("side", "long") == "long" else "  (short)"), f"{qty:g}",
+                                              f"${paid:,.2f}", f"${worth:,.2f}", f"{pl:+,.2f}",
+                                              f"{(pl / abs(paid) * 100) if paid else 0:+.1f}%", left, who),
+                           tags=("up" if pl >= 0 else "down",))
+            self.al_rows[iid] = dict(symbol=sym, qty=qty, label=label, can_sell=can_sell, side=p_.get("side", "long"))
+            paid_all += paid
+            worth_all += worth
+        pl_all = worth_all - paid_all
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.al_sum.config(text=(f"{acct}: {len(rows)} position{'s' if len(rows) != 1 else ''}   |   paid ${paid_all:,.2f}   |   "
+                                 f"worth ${worth_all:,.2f}   |   P/L {pl_all:+,.2f}   |   as of {stamp}") if rows else
+                           f"{acct}: no open positions (as of {stamp}).", fg=(GREEN if pl_all >= 0 else RED) if rows else MUTED)
+
+    def alpaca_sell_selected(self):
+        sel = [self.al_rows[i] for i in self.al_tree.selection() if i in getattr(self, "al_rows", {})]
+        if not sel:
+            return messagebox.showinfo("Sell", "Pick one or more positions in the list first.")
+        locked = [r for r in sel if not r["can_sell"] or r["side"] != "long" or r["qty"] <= 0]
+        if locked:
+            return messagebox.showinfo("Sell", "These are looked after by an OBF session, so sell them there (that keeps its "
+                                               "records right):\n\n" + "\n".join(r["label"] for r in locked))
+        live = not E.ALPACA.get("paper", True)
+        msg = (("LIVE ACCOUNT, REAL MONEY.\n\n" if live else "") + "Sell these on your "
+               + ("LIVE" if live else "paper") + " Alpaca account now (at the bid, then at market if that doesn't fill)?\n\n"
+               + "\n".join(f"{r['qty']:g} x {r['label']}" for r in sel))
+        if not messagebox.askyesno("Sell on Alpaca", msg, icon="warning" if live else "question"):
+            return
+        self.al_sum.config(text=f"Selling {len(sel)} position{'s' if len(sel) != 1 else ''} on Alpaca...", fg=MUTED)
+        for r in sel:
+            self.executor.submit(self._alpaca_close, r["symbol"], r["qty"], "sold from the Alpaca tab")
+
+    def _alpaca_close(self, sym, qty, reason):
+        """Sells an Alpaca position OBF isn't following (never more than Alpaca says is held). Runs off the UI thread."""
+        try:
+            held = self.broker_held_alpaca(sym)
+            qty = min(int(qty), held)
+            if qty <= 0:
+                return self.q.put(("call", lambda: self._alpaca_closed(sym, 0, 0.0, reason, "Alpaca no longer holds it")))
+            limit = None
+            q = E.option_quotes([sym]).get(sym)
+            if q and q[0] > 0:
+                limit = round(q[0], 2)
+            r = E.alp_order(sym, qty, "sell", limit=limit, held=held)
+            got, avg = self._wait_order(r["id"], max(5, int(self.settings.get("limit_wait", 20))))
+            if got <= 0 and limit:
+                r = E.alp_order(sym, qty, "sell", held=held)
+                got, avg = self._wait_order(r["id"], 30)
+            self.q.put(("call", lambda: self._alpaca_closed(sym, got, avg, reason, "" if got > 0 else "the order didn't fill")))
+        except Exception as e:
+            self.q.put(("call", lambda e=e: self._alpaca_closed(sym, 0, 0.0, reason, str(e))))
+
+    def _alpaca_closed(self, sym, got, avg, reason, err=""):
+        kept = self.cfg.get("alpaca_kept") or {}
+        rec = kept.get(sym)
+        _, label, _, _, _ = self.occ_text(sym)
+        if got > 0:
+            proceeds = got * avg * E.CONTRACT
+            basis = (rec["cost"] * got / rec["qty"]) if rec and rec.get("qty") else None
+            paper = E.ALPACA.get("paper", True)
+            row = dict(time=datetime.now().isoformat(timespec="seconds"), mode="alpaca", acct="ALPACA PAPER" if paper else "LIVE",
+                       side="sell", coin=label, qty=got, price=round(avg, 6), usd=round(proceeds, 2),
+                       pl="" if basis is None else round(proceeds - basis, 2), reason=reason,
+                       who="kept copy of a PRACTICE trade" if rec else "position OBF wasn't following")
+            if paper:
+                self.mirror_trades.append(row)
+                del self.mirror_trades[:-5000]
+                self._trades_dirty = True
+            try:
+                E.append_trade_csv(row)
+            except OSError:
+                pass
+            self.write(f"ALPACA: sold {got:g} x {label} at ${avg:,.2f} ({reason}).", "good")
+            if rec:
+                rec["qty"] -= got
+                rec["cost"] = rec.get("cost", 0) - (basis or 0)
+        elif err == "Alpaca no longer holds it" and rec:
+            rec["qty"] = 0
+        else:
+            self.write(f"ALPACA: couldn't sell {label}: {err}", "warn")
+        if rec is not None and rec.get("qty", 0) <= 0:
+            kept.pop(sym, None)
+        if rec is not None:
+            self.cfg["alpaca_kept"] = kept
+            try:
+                E.save_json(CONFIG_PATH, self.cfg)
+            except OSError:
+                pass
+        self.root.after(1500, lambda: self.refresh_alpaca(quiet=True))
+
+    def keep_mirror_copies(self):
+        """Practice reset: the copies on the Alpaca paper account stay open there, and OBF keeps looking after them
+        (the Alpaca account tab) instead of forgetting them; it sells each one the day before it expires. -> how many."""
+        kept = dict(self.cfg.get("alpaca_kept") or {})
+        n = 0
+        for c, m in (getattr(self, "mirror", None) or {}).items():
+            if m.get("symbol") and not m.get("pending") and m.get("qty", 0) > 0:
+                kept[m["symbol"]] = {k: v for k, v in dict(m, c=c, kept_at=time.time()).items() if k != "closing"}
+                n += 1
+        self.mirror = {}
+        if n:
+            self.cfg["alpaca_kept"] = kept
+            try:
+                E.save_json(CONFIG_PATH, self.cfg)
+            except OSError:
+                pass
+        return n
+
+    def guard_kept_copies(self):
+        """Kept copies (from before a practice reset) are sold the day before they expire, like every other contract
+        OBF looks after, so none turns into shares. Needs the paper login; tries at most every 10 minutes."""
+        kept = self.cfg.get("alpaca_kept") or {}
+        if not kept or not self.is_paper_key() or time.time() - getattr(self, "_kept_try", 0) < 600:
+            return
+        days = max(1, int(self.settings.get("expiry_days", 2) or 2))
+        due = [s_ for s_, r in kept.items() if r.get("exp") and E.sessions_left(r["exp"]) <= days and r.get("qty", 0) > 0]
+        if due:
+            self._kept_try = time.time()
+            for s_ in due:
+                self.executor.submit(self._alpaca_close, s_, kept[s_]["qty"], "expiry (kept copy)")
 
     # ---------------- live scalp lab: a farm of scalpers that learns on its own from live 1-minute prices ----------------
     LAB_CAP = 24          # scalpers in the lab
