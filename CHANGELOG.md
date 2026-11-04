@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.21.1
+- **Orders are never sent twice**: every order now carries its own ID. If the answer from Alpaca gets lost (a timeout
+  or a dropped connection), OBF asks Alpaca whether the order arrived before trying again. Before, a lost answer could
+  place the same order a second time.
+- **Leftover orders are really cancelled**: when a limit order doesn't fill in time, OBF cancels the rest, checks that
+  it's gone, and tries again if not. If it still can't confirm it, it tells you (and the kill switch still cancels it).
+  Before, a failed cancel was silent and the order could fill later without OBF knowing.
+- **Updates come from finished releases only**, checked against a checksum published with each one, and the download
+  must say it's the version you were offered. Before, Update installed whatever was on GitHub at that moment.
+- **Updates install the add-ons a new version needs** (anything new in requirements.txt), and say so if one fails.
+- **Restoring a backup can't be undone by an autosave anymore**: OBF restarts right after writing the restored files
+  instead of saving the old farm and settings over them on the way out.
+- Errors OBF recovers from (a failed save, a dropped connection) are now noted in `errors.log` in the data folder.
+- Tidy-ups: OBF no longer calls itself CBBF in a few places (web requests, sleep blocking, bot files, sounds).
+
 ## 1.21.0
 - **Free roam now studies your farm's own candle size.** It often tested 1-minute bots on 5-minute, hourly or daily
   candles. A bot that decides every 15 candles was being tested as if it decided every 15 days, so the lessons

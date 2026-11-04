@@ -15,13 +15,13 @@ def _stay_open(msg):
             import ctypes
             ctypes.windll.user32.MessageBoxW(None, msg, "OBF could not start", 0x10)
         except Exception:
-            pass
+            E.note_error("_stay_open")
         sys.exit(1)
     print("\n" + "=" * 60 + "\nOBF could not start\n" + "=" * 60 + "\n" + msg + "\n")
     try:
         input("Press Enter to close this window...")
     except Exception:
-        pass
+        E.note_error("_stay_open")
     sys.exit(1)
 
 
@@ -41,7 +41,6 @@ except ImportError as _e:
 
 import bisect
 import csv
-import io
 import json
 import math
 import os
@@ -54,20 +53,17 @@ import random
 import threading
 import time
 import tkinter as tk
-import uuid
 import zipfile
 import collections
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import engine as E
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
 UPDATE_REPO = "kefirman9000/obf"
-UPDATE_BRANCH = "main"
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_SHORT = "OBF"
 CONFIG_PATH = os.path.join(E.HOME_DIR, "config.json")
@@ -1023,14 +1019,14 @@ class App:
         try:
             self.slow_save()
         except Exception:
-            pass
+            E.note_error("on_close")
         self.running = False
         self.awake.off()
         try:
             self.cfg["size"] = f"{self.root.winfo_width()}x{self.root.winfo_height()}"
             E.save_json(CONFIG_PATH, self.cfg)
         except Exception:
-            pass
+            E.note_error("on_close")
         self.save_state()
         if self.tray is not None:
             self.tray.stop()
@@ -1044,13 +1040,13 @@ class App:
             self.save_farm(force=True)
             self.slow_save()
         except Exception:
-            pass
+            E.note_error("on_shutdown")
         try:
             self.cfg["was_running"] = bool(self.running)
             E.save_json(CONFIG_PATH, self.cfg)
             self.save_state()
         except Exception:
-            pass
+            E.note_error("on_shutdown")
 
     def hourly(self):
         """Light housekeeping once an hour: the weekly backup, the daily recap, and (in the background) the update check."""
@@ -1058,12 +1054,12 @@ class App:
             try:
                 fn()
             except Exception:
-                pass
+                E.note_error("hourly")
         if self.tray_hidden():
             try:
                 self.auto_check_update()
             except Exception:
-                pass
+                E.note_error("hourly")
         self.root.after(3600 * 1000, self.hourly)
 
     def recap_base(self):
@@ -3520,7 +3516,7 @@ class App:
                     self.broker_acct = None
                 self.q.put(("call", self.refresh_broker_tile))
             except Exception:
-                pass
+                E.note_error("_broker_loop")
             time.sleep(60)
 
     def refresh_broker_tile(self):
@@ -4098,7 +4094,7 @@ class App:
             try:
                 fn()
             except Exception:
-                pass
+                E.note_error("reset_account")
         self.write(f"Account reset to ${cash:,.2f}. The farm and its learning are kept.")
 
     def reset(self, ask=True):
@@ -4316,7 +4312,7 @@ class App:
                             if v is not None:
                                 vols[c] = v * (bar_min if bar_min < 1 else 1)
                         except Exception:
-                            pass
+                            E.note_error("worker")
                     if vols:
                         self.q.put(("vols", vols))
                 if all(c in prices for c in coins):
@@ -4344,7 +4340,7 @@ class App:
                             self.acct_info = acct
                             self.q.put(("balances", self.read_balances(acct)))
                     except Exception:
-                        pass
+                        E.note_error("worker")
             except Exception:  # never let the feed die
                 self.q.put(("log", (self._record_error("fetching prices"), "bad")))
                 time.sleep(2)
@@ -4547,7 +4543,7 @@ class App:
 
     @staticmethod
     def _report_summary(d):
-        out = [f"--- account ---", json.dumps(d["account"], default=str)]
+        out = ["--- account ---", json.dumps(d["account"], default=str)]
         for name, f in d["farms"].items():
             out += [f"--- {name} ---", f"{f['bots']} bots ({f['tried']} tried), status {f['status']}, exams {f['exams']} "
                                        f"(bar {f['exam_bar']}), conditions now {f['conditions']}", "top bots:"]
@@ -4584,7 +4580,7 @@ class App:
             try:
                 self.write(msg, "bad")
             except Exception:
-                pass
+                E.note_error("on_cb_error")
 
     def drain(self):
         """Handles messages from background threads. One bad message can no longer stop the loop."""
@@ -4791,7 +4787,7 @@ class App:
                                 E.IV_HINT[c] = sum(ivs) / len(ivs)
                         seen[c] = time.time()
                     except Exception:
-                        pass
+                        E.note_error("work")
             finally:
                 self._quotes_busy = False
         threading.Thread(target=work, daemon=True).start()
@@ -4801,7 +4797,7 @@ class App:
         try:
             self.learn_quotes()
         except Exception:
-            pass
+            E.note_error("on_bar")
         keep = min(8000, max(2400, int(1440 / self.session_bar) + 20))
         for c in self.session_coins:
             h = self.hist.setdefault(c, [])
@@ -6354,7 +6350,7 @@ class App:
             # while the market is open, half the roams watch today live and half replay a past day on real prices
             live = bool(self.client) and E.market_clock()["is_open"] and rng.random() < 0.5
         except Exception:
-            pass
+            E.note_error("_roam_scalp")
         uni = self.scan_universe()
         real_ok = bool(self.client)  # Alpaca's real option history (from February 2024) needs the login
         tickers = list(dict.fromkeys(list(self.session_coins) + rng.sample(uni, min(len(uni), 8 if real_ok else 14))))[:10 if real_ok else 16]
@@ -7376,13 +7372,13 @@ class App:
                             qs.update(E.option_quotes(rest))
                         self.q.put(("call", lambda: (self.opt_quotes.update(qs), self.opt_watch_fill())))
                     except Exception:
-                        pass
+                        E.note_error("work")
                 threading.Thread(target=work, daemon=True).start()
             try:
                 if self.cur_tab() == "Options":
                     self.opt_load(quiet=True)
             except Exception:
-                pass
+                E.note_error("opt_tick")
         finally:
             self.root.after(30000, self.opt_tick)
 
@@ -7497,7 +7493,7 @@ class App:
                     try:
                         self.add_ctx(hx, self.SLOW_GRAN, self.SLOW_HISTORY, quote)
                     except Exception:
-                        pass
+                        E.note_error("work")
                 last_ts = min(ts[c][-1] for c in coins) if L else 0
                 t = sl["t"]
                 if t is None and saved.get("farm"):
@@ -7573,7 +7569,7 @@ class App:
                     k = min(len(new[c]) for c in sl["coins"])
                     self.q.put(("call", lambda new=new, k=k: self._slow_step(new, k)))
             except Exception:
-                pass
+                E.note_error("_slow_feed")
 
     def _slow_step(self, new, k):
         sl, t = self.slow, self.slow["t"]
@@ -7725,7 +7721,7 @@ class App:
             if "Slow farm" not in self.cur_tab():
                 return  # redrawn when you open the tab
         except Exception:
-            pass
+            E.note_error("slow_refresh")
         if sl.get("status"):
             txt = sl["status"]
         elif t is None:
@@ -8054,7 +8050,7 @@ class App:
                             z.writestr("config.json", json.dumps(c_))
                             n += 1
                         except Exception:
-                            pass
+                            E.note_error("write_backup")
                         continue
                     if fn.endswith(".lock") or fn.endswith(".flag"):
                         continue
@@ -8086,7 +8082,7 @@ class App:
             self.write(f"The weekly backup couldn't be saved ({e}).", "warn")
 
     def restore_all(self):
-        p = filedialog.askopenfilename(title="Restore a OBF backup", filetypes=[("Zip", "*.zip")])
+        p = filedialog.askopenfilename(title="Restore an OBF backup", filetypes=[("Zip", "*.zip")])
         if not p:
             return
         if self.running:
@@ -8102,6 +8098,8 @@ class App:
                 for fn in files:
                     full = os.path.join(root_, fn)
                     z.write(full, os.path.relpath(full, E.HOME_DIR))
+        # say it now: once the files are written nothing may run (a delayed autosave would undo the restore)
+        messagebox.showinfo("Restore", f"OBF will now restore the backup and restart.\n(Safety copy: {safety})")
         with zipfile.ZipFile(p) as z:
             for m in z.namelist():
                 dest = os.path.normpath(os.path.join(E.HOME_DIR, m))
@@ -8112,8 +8110,7 @@ class App:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with z.open(m) as src, open(dest, "wb") as out:
                     out.write(src.read())
-        messagebox.showinfo("Restore", f"Restored. OBF will now restart to load it.\n(Safety copy: {safety})")
-        self.restart_app()
+        self.restart_app(save=False)
 
     def release_lock(self):
         if self.tray is not None:
@@ -8277,7 +8274,7 @@ class App:
             try:
                 self.guard_other_mode()
             except Exception:
-                pass
+                E.note_error("expiry_guard")
             held = [(c, self.opt[c]) for c, q in self.pos.items() if q > 0 and self.opt.get(c) and c not in self.pending]
             if held and self.session and not getattr(self, "_guard_busy", False):
                 self._guard_busy = True
@@ -8902,7 +8899,7 @@ class App:
             try:
                 old.destroy()
             except Exception:
-                pass
+                E.note_error("_tour_step")
         if i >= len(steps):
             return
         try:
@@ -8963,7 +8960,7 @@ class App:
         if kind == "add":
             lines.append(f"Adding to {c}: the winning bots holding most of the weight are still in it.")
         elif kind == "slow":
-            lines.append(f"Only shaky bots wanted this, so it's a small, slowed-down trade.")
+            lines.append("Only shaky bots wanted this, so it's a small, slowed-down trade.")
         for v in sorted(voters, key=lambda x: -self.tourn.info.get(id(x), {}).get("weight", 0))[:5]:
             st = STATUS_TEXT.get(self.tourn.info.get(id(v), {}).get("status"), "")
             lines.append(f"- {E.bot_nickname(v.key())} ({STRAT_LABELS.get(v.name, v.name)}, {st}): "
@@ -9506,7 +9503,7 @@ class App:
                 self.write("Your saved Alpaca paper session now lives under PRACTICE > 'My Alpaca paper account' "
                            "(it used to sit behind LIVE). LIVE is for real money only.", "good")
         except Exception:
-            pass
+            E.note_error("auto_login")
         if creds and not self.client:
             self.write("Saved Alpaca login found, connecting...")
             self.start_login(*creds, remember=False)
@@ -9678,13 +9675,32 @@ class App:
             if o.get("status") in ("filled", "canceled", "expired", "rejected"):
                 break
             time.sleep(1.0)
-        if o.get("status") not in ("filled", "canceled", "expired", "rejected"):
-            try:
-                E.alp_cancel(oid)
-            except Exception:
-                pass
-            time.sleep(1.0)
-            o = E.alp_get_order(oid)
+        done = ("filled", "canceled", "expired", "rejected")
+        if o.get("status") not in done:
+            # cancel the rest and make sure it's really gone: an order left open could still fill later, unseen
+            for attempt in range(3):
+                try:
+                    E.alp_cancel(oid)
+                except Exception:
+                    E.note_error("cancel order")
+                for _ in range(4):
+                    time.sleep(1.0)
+                    try:
+                        o = E.alp_get_order(oid)
+                    except Exception:
+                        E.note_error("check cancelled order")
+                        continue
+                    if o.get("status") in done:
+                        break
+                if o.get("status") in done:
+                    break
+            if o.get("status") not in done:
+                self.q.put(("log", (f"Couldn't confirm order {oid} was cancelled (Alpaca says {o.get('status') or '?'}). "
+                                    "Please check your Alpaca account: it could still fill.", "warn")))
+                self.q.put(("call", lambda: self.notify("OBF order check", "An order couldn't be confirmed cancelled. "
+                                                                         "Please check your Alpaca account.", sound="problem")))
+                # (it stays in open_oids, so the kill switch still cancels it)
+                return float(o.get("filled_qty") or 0), float(o.get("filled_avg_price") or 0)
         self.open_oids.discard(oid)
         return float(o.get("filled_qty") or 0), float(o.get("filled_avg_price") or 0)
 
@@ -10873,7 +10889,7 @@ class App:
             try:
                 self.root.after_cancel(old)
             except Exception:
-                pass
+                E.note_error("later")
         pend[fn.__name__] = self.root.after(ms, lambda: (pend.pop(fn.__name__, None), fn()))
 
     def soon(self, fn, ms=40):
@@ -11521,7 +11537,7 @@ class App:
             if "Success" in self.cur_tab() and not self.in_bg():
                 self.refresh_success()
         except Exception:
-            pass
+            E.note_error("_succ_tick")
         self.root.after(5000, self._succ_tick)
 
     def refresh_success(self):
@@ -11664,7 +11680,7 @@ class App:
             if "Overview" in self.cur_tab() and not self.in_bg():
                 self.refresh_features()
         except Exception:
-            pass
+            E.note_error("_feat_tick")
         self.root.after(3000, self._feat_tick)
 
     def overview_rows(self):
@@ -11810,7 +11826,7 @@ class App:
             if self.cur_tab() == "Bot positions" and not self.in_bg():
                 self.refresh_botpos()
         except Exception:
-            pass
+            E.note_error("_bp_tick")
         self.root.after(3000, self._bp_tick)
 
     def refresh_botpos(self):
@@ -11966,7 +11982,7 @@ class App:
             if self.cur_tab() == "Scalp lab" and not self.in_bg():
                 self.refresh_lab()
         except Exception:
-            pass
+            E.note_error("_lab_tick")
         self.root.after(2000, self._lab_tick)
 
     def lab_note(self, text):
@@ -12142,7 +12158,7 @@ class App:
             E.save_json(self.lab_path(), dict(best=best, grads=lab["grads"][-200:], sent=sorted(lab["sent"])[-500:],
                                               log=list(self.lab_log)[:300], days=lab["days"]))
         except Exception:
-            pass
+            E.note_error("lab_save")
 
     def lab_graduate(self, v=None, by_hand=False):
         """The lab's best proven scalper joins your farm (main thread)."""
@@ -12386,7 +12402,7 @@ class App:
             try:
                 self.ivx_tick()
             except Exception:
-                pass
+                E.note_error("_scan_loop")
             try:
                 if not self.cfg.get("scalp_scan", True) and not self.scan.get("now"):
                     self.scan["status"] = "Off"
@@ -12424,7 +12440,7 @@ class App:
                 if d.get("c") and len(d["c"]) == len(d.get("t") or ()):
                     ctx[sym] = dict(c=d["c"], t=d["t"])
             except Exception:
-                pass
+                E.note_error("_scan_once")
         bars = {}
         for i, sym in enumerate(uni):
             self.scan["status"] = f"Reading today's prices: {sym} ({i + 1} of {len(uni)})"
@@ -12662,7 +12678,7 @@ class App:
                     if prices or stats:
                         self.q.put(("watch", (prices, stats)))
                 except Exception:
-                    pass
+                    E.note_error("loop")
                 time.sleep(20 if self._iconic else 5)
         self._watch_thread = threading.Thread(target=loop, daemon=True)
         self._watch_thread.start()
@@ -14314,16 +14330,19 @@ class App:
 
         def work():
             try:
-                base = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
-                fresh = f"?t={int(time.time())}"  # GitHub's file cache can serve the old number for minutes after a release
-                remote = E.http_get(f"{base}/VERSION{fresh}", 10, retries=1).decode().strip()
+                rel = E.latest_release(UPDATE_REPO)
+                remote = rel["version"]
+                if not remote:
+                    raise RuntimeError("no release found on GitHub")
                 notes = ""
-                try:
-                    notes = E.changelog_since(E.http_get(f"{base}/CHANGELOG.md{fresh}", 10).decode("utf-8", "replace"), self.version)
+                try:  # the changelog at that release's tag: every version since yours, not just the newest
+                    raw = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{rel['tag']}/CHANGELOG.md"
+                    notes = E.changelog_since(E.http_get(raw, 10).decode("utf-8", "replace"), self.version)
                 except Exception:
-                    pass
+                    E.note_error("work")
+                self.update_rel = rel
                 self.q.put(("update", ("found" if E.version_tuple(remote) > E.version_tuple(self.version) else "none",
-                                       (remote, notes, silent))))
+                                       (remote, notes or rel["notes"], silent))))
             except Exception as e:
                 self.q.put(("update", ("error", (str(e), silent))))
         threading.Thread(target=work, daemon=True).start()
@@ -14364,9 +14383,16 @@ class App:
                 self.show_update()
             return
         if kind == "installed":
-            written, backup = data
+            written, backup, added, problem = data
             self.upd_btn.config(text="\u27f3 Restart to finish updating", bg=ACCENT, fg="white")
             self.write(f"Updated {len(written)} files. The old version is kept in {backup}.", "good")
+            if added and not problem:
+                self.write("Installed what the new version needs: " + ", ".join(added), "good")
+            if problem:
+                self.write(f"The new version needs {', '.join(added)}, which didn't install: {problem}", "warn")
+                messagebox.showwarning("Update", "The update is installed, but an add-on it needs didn't install:\n\n"
+                                                 f"{', '.join(added)}\n\n{problem}\n\nIf the app has trouble after "
+                                                 "restarting, Tools > Undo last update goes back.")
             if messagebox.askyesno("Update installed", "The update is installed. Restart OBF now to use it?\n\n"
                                                        "(Your session is saved first. Tools > Undo last update goes back.)"):
                 self.restart_app()
@@ -14409,10 +14435,19 @@ class App:
 
             def work():
                 try:
-                    data = E.http_get(f"https://github.com/{UPDATE_REPO}/archive/refs/heads/{UPDATE_BRANCH}.zip", 60, retries=1)
-                    self.q.put(("update", ("installed", E.install_update(data, HERE, self.version))))
+                    rel = getattr(self, "update_rel", None) or E.latest_release(UPDATE_REPO)
+                    data = E.download_release(rel)  # the release zip, checked against its published checksum
+                    written, backup = E.install_update(data, HERE, self.version, expect_version=rel["version"])
                 except Exception as e:
-                    self.q.put(("update", ("install_fail", str(e))))
+                    return self.q.put(("update", ("install_fail", str(e))))
+                added, problem = E.new_requirements(backup, HERE), ""
+                if added:  # the new version needs add-ons this computer may not have yet
+                    try:
+                        ok, msg = E.install_packages(added, lambda line: None)
+                        problem = "" if ok else msg
+                    except Exception as e:
+                        problem = str(e)
+                self.q.put(("update", ("installed", (written, backup, added, problem))))
             threading.Thread(target=work, daemon=True).start()
         ttk.Button(b, text="Accept and install", style="Accent.TButton", command=accept).pack(side="right")
         ttk.Button(b, text="Later", command=w.destroy).pack(side="right", padx=6)
@@ -14430,14 +14465,16 @@ class App:
             return messagebox.showerror("Undo update", f"Couldn't restore: {e}")
         self.restart_app()
 
-    def restart_app(self):
+    def restart_app(self, save=True):
+        """save=False after a restore: saving now would write the old in-memory state over the files just restored."""
         self.running = False
         self.awake.off()
-        try:
-            self.save_state()
-            E.save_json(CONFIG_PATH, self.cfg)
-        except Exception:
-            pass
+        if save:
+            try:
+                self.save_state()
+                E.save_json(CONFIG_PATH, self.cfg)
+            except Exception:
+                pass
         try:
             self._gone = True
             self.root.destroy()

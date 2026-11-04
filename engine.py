@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -153,6 +154,32 @@ def clamp_tf(tf):
     return min(TIMEFRAMES, key=lambda t: abs(t - tf))
 
 
+# ---------------- errors the app recovered from ----------------
+_noted = {}
+
+
+def note_error(where):
+    """Records the exception being handled in errors.log, for errors the app carries on after (a failed save, a
+    dropped connection). Each kind is written at most once every 10 minutes and the file stays under ~1 MB, so a
+    repeating problem can't flood it. Never raises."""
+    try:
+        import traceback
+        et, ev, _ = sys.exc_info()
+        key = (where, et.__name__ if et else "")
+        now = time.time()
+        if now - _noted.get(key, 0) < 600:
+            return
+        _noted[key] = now
+        os.makedirs(HOME_DIR, exist_ok=True)
+        path = os.path.join(HOME_DIR, "errors.log")
+        if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+            os.replace(path, path + ".old")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S} {where}\n{traceback.format_exc()}\n")
+    except Exception:
+        pass
+
+
 # ---------------- network helpers ----------------
 def http_get(url, timeout=10, retries=0):
     """GET with a few automatic retries for brief network blips, rate limits (429) and server errors."""
@@ -160,7 +187,7 @@ def http_get(url, timeout=10, retries=0):
     for attempt in range(retries + 1):
         wait = delay
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "cbbf"})
+            req = urllib.request.Request(url, headers={"User-Agent": "obf"})
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.read()
         except urllib.error.HTTPError as ex:
@@ -209,6 +236,14 @@ class NeedLogin(Exception):
     pass
 
 
+class AlpacaError(RuntimeError):
+    """Alpaca answered with an HTTP error. `code` is the status (422 = rejected, 5xx = their side had trouble)."""
+
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+
+
 def alp(method, url, body=None, timeout=12, retries=1, creds=None):
     """One Alpaca API call (JSON in, JSON out)."""
     cr = creds or ALPACA
@@ -235,7 +270,7 @@ def alp(method, url, body=None, timeout=12, retries=1, creds=None):
                 msg = json.loads(ex.read() or b"{}").get("message") or ex.reason
             except Exception:
                 msg = ex.reason
-            raise RuntimeError(f"Alpaca said {ex.code}: {msg}") from None
+            raise AlpacaError(ex.code, f"Alpaca said {ex.code}: {msg}") from None
         except (urllib.error.URLError, OSError):
             if attempt >= retries:
                 raise
@@ -485,7 +520,7 @@ def fetch_range(coin, gran, start, end, quote="USD", note=None):
             k = VOL_RATIO.get(coin) or 1
             rows.update({t: (r[0], r[1], r[2], r[3] * k) for t, r in live.items() if t not in rows})
         except Exception:
-            pass
+            note_error("fetch_range")
     ts = sorted(rows)
     seq = [rows[t] for t in ts]
     return dict(c=[r[0] for r in seq], h=[r[1] for r in seq], l=[r[2] for r in seq], v=[r[3] for r in seq], t=ts)
@@ -713,7 +748,7 @@ def day_option_book(under, day, S, exp_days=8, width=0.06, per=12, note=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         save_json(path, book)
     except Exception:
-        pass
+        note_error("day_option_book")
     return book if book["contracts"] else None
 
 
@@ -951,7 +986,7 @@ class IBBridge:
                     if self.ib is not None and self.ib.isConnected():
                         self.ib.sleep(0.05)  # keep the connection's messages flowing
                 except Exception:
-                    pass
+                    note_error("_run")
                 continue
             try:
                 box.put((True, fn(self.ib)))
@@ -1155,7 +1190,7 @@ class IBBridge:
         try:
             self.call(lambda ib: ib.reqGlobalCancel(), 15)
         except Exception:
-            pass
+            note_error("cancel_all")
 
 
 IB = IBBridge()
@@ -1182,12 +1217,47 @@ def check_order(side, qty, held=None):
                           f"position. OBF only sells contracts it owns.")
 
 
+def alp_order_by_client_id(cid):
+    """The order sent with this client_order_id, or None if Alpaca never got it."""
+    try:
+        return alp("GET", f"{trade_url()}/v2/orders:by_client_order_id?client_order_id={urllib.parse.quote(cid)}")
+    except AlpacaError as ex:
+        if ex.code == 404:
+            return None
+        raise
+
+
 def alp_order(symbol, qty, side, limit=None, tif="day", held=None):
+    """Sends one order. It is never sent twice: every order carries its own client_order_id, and when the answer is
+    lost (timeout, dropped connection, server error) we ask Alpaca whether it arrived before trying again. A second
+    send with the same id is refused by Alpaca, so even a race can't place a duplicate."""
     check_order(side, qty, held)
-    body = dict(symbol=symbol, qty=str(int(qty)), side=side, type="limit" if limit else "market", time_in_force=tif)
+    cid = f"obf-{uuid.uuid4().hex}"
+    body = dict(symbol=symbol, qty=str(int(qty)), side=side, type="limit" if limit else "market", time_in_force=tif,
+                client_order_id=cid)
     if limit:
         body["limit_price"] = f"{limit:.2f}"
-    return alp("POST", f"{trade_url()}/v2/orders", body)
+    url = f"{trade_url()}/v2/orders"
+    try:
+        return alp("POST", url, body, retries=0)
+    except AlpacaError as ex:
+        if ex.code != 429 and ex.code < 500:
+            raise  # Alpaca looked at it and said no: nothing was placed
+        first = ex
+    except (urllib.error.URLError, OSError) as ex:
+        first = ex
+    time.sleep(1.5)
+    found = alp_order_by_client_id(cid)  # did it arrive even though the answer didn't?
+    if found:
+        return found
+    try:
+        return alp("POST", url, body, retries=0)
+    except AlpacaError as ex:
+        if ex.code == 422:  # "client_order_id must be unique": the first send did arrive after all
+            found = alp_order_by_client_id(cid)
+            if found:
+                return found
+        raise ex from first
 
 
 def alp_get_order(oid):
@@ -1869,7 +1939,7 @@ def learn_spreads(c, rows, S=None):
     try:
         save_json(_spreads_path(), SPREAD_FIT)
     except Exception:
-        pass
+        note_error("learn_spreads")
     return SPREAD_FIT[c]
 
 
@@ -1901,10 +1971,10 @@ def minutes_to_close(ts):
 DEFAULT_SETTINGS = {
     "trade_pct": 5.0, "stop_loss": 50.0, "take_profit": 100.0, "daily_loss": 10.0,
     "bar_minutes": 1, "refresh": 2, "fee_pct": 0.1, "evolve_every": 24, "notify": True,
-    "sound": False,              # (old setting, no longer used: CBBF has its own chime now)
-    "chime": True,               # play CBBF's own sounds with notifications (not the Windows system sound)
+    "sound": False,              # (old setting, no longer used: OBF has its own chime now)
+    "chime": True,               # play OBF's own sounds with notifications (not the Windows system sound)
     "chime_volume": 60,          # 0-100
-    "sounds_off": [],            # which of CBBF's sounds are switched off: trade, notify, hof, problem
+    "sounds_off": [],            # which of OBF's sounds are switched off: trade, notify, hof, problem
     "notify_trades": False,      # also notify on every trade (off: only important events)
     "max_coin_pct": 25.0, "style": "Balanced", "keep_awake": True,
     "size_mult": {},  # manual-mode trade size per strategy name (1.0 = normal)
@@ -1953,7 +2023,7 @@ DEFAULT_SETTINGS = {
     "grad_hours": 24.0,          # ...hours it must have spent Winning
     "trade_hours": "",           # account trades only in these hours, like "9-17" or "22-6" (empty = any time; stops always run)
     "weekdays_only": False,      # ...and only Monday to Friday
-    "tg_remote": False,          # control CBBF from Telegram: /status /pause /resume /report /kill
+    "tg_remote": False,          # control OBF from Telegram: /status /pause /resume /report /kill
     "free_roam": False,          # (retired: Free roam only runs while its switch is ON)
     "free_roam_running": False,  # ...also while the bot runs (uses a little more computer power and network)
     "slow_trades_account": False,  # the slow farm (hourly candles) may also trade your account
@@ -3360,7 +3430,7 @@ def market_conds(closes, extra, coins):
         if reg:
             out.append("vol:" + ("calm" if reg == "calm" else "wild" if reg in ("rising", "spiking") else "normal"))
     except Exception:
-        pass
+        note_error("market_conds")
     t = ((extra or {}).get(coins[0]) or {}).get("t")
     if t and len(t) >= 2 and t[-1] - t[-2] < 6 * 3600:
         m = 390 - minutes_to_close(t[-1])  # minutes since the open
@@ -4085,7 +4155,7 @@ class Tournament:
             try:
                 self.kami_learn(v)
             except Exception:
-                pass
+                note_error("_remove")
         if v in self.vars:
             self.vars.remove(v)
             if self.o.get("elders", True) and v.ntrades >= 3 and v.eq:
@@ -4214,7 +4284,7 @@ class Tournament:
                 try:
                     self.on_trade(v, c, t, data_now(x, [c]) if x else None)
                 except Exception:
-                    pass
+                    note_error("_book")
 
     def hold_over(self, k):
         """What just holding the coins (equal weight) returned over the last k decisions, or None."""
@@ -6009,7 +6079,7 @@ def send_alert(settings, text):
         else:
             try:
                 req = urllib.request.Request(hook, data=json.dumps({"content": text[:1900]}).encode(),
-                                             headers={"Content-Type": "application/json", "User-Agent": "cbbf"})
+                                             headers={"Content-Type": "application/json", "User-Agent": "obf"})
                 urllib.request.urlopen(req, timeout=10).read()
             except Exception as ex:
                 problems.append(f"Discord: {ex}")
@@ -6021,7 +6091,7 @@ def send_alert(settings, text):
             try:
                 body = urllib.parse.urlencode({"chat_id": chat, "text": text[:3500]}).encode()
                 req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage", data=body,
-                                             headers={"User-Agent": "cbbf"})
+                                             headers={"User-Agent": "obf"})
                 urllib.request.urlopen(req, timeout=10).read()
             except Exception as ex:
                 problems.append(f"Telegram: {ex}")
@@ -6066,7 +6136,7 @@ class AwakeLock:
             elif sys.platform == "darwin" and shutil.which("caffeinate"):
                 self.proc = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
             elif shutil.which("systemd-inhibit"):
-                self.proc = subprocess.Popen(["systemd-inhibit", "--what=sleep:idle", "--who=CBBF",
+                self.proc = subprocess.Popen(["systemd-inhibit", "--what=sleep:idle", "--who=OBF",
                                               "--why=Trading bot is running", "--mode=block", "sleep", "infinity"])
             else:
                 return
@@ -6245,7 +6315,7 @@ def describe_bot(b, bar_minutes=None):
 
 
 SCHEMA_NOTE = (
-    "CBBF bot file. Each item in `bots` is one trading bot. `name` is the strategy family (see `rules` for what it does), "
+    "OBF bot file. Each item in `bots` is one trading bot. `name` is the strategy family (see `rules` for what it does), "
     "`params` its numbers, `tf` its pace in bars (multiply by `lifetime.bar_minutes` for minutes), `risk.sl` / `risk.tp` "
     "its own stop-loss / take-profit in % (0 = none), `traits` extra habits (trail = trailing stop %, minhold / maxhold = "
     "decisions, cool = decisions to wait after selling, trend = only buy above that many-bar average, minvol = minimum "
@@ -6586,7 +6656,7 @@ def read_bots_file(path):
     elif isinstance(data, list):
         raw = data
     else:
-        return [], ["That does not look like a CBBF bot file."]
+        return [], ["That does not look like an OBF or CBBF bot file."]
     if not isinstance(raw, list):
         return [], ["The bot list in this file is damaged."]
     good = []
@@ -6706,7 +6776,7 @@ def install_packages(specs, log=print):
             if os.path.isdir(u) and u not in sys.path:
                 sys.path.append(u)
         except Exception:
-            pass
+            note_error("install_packages")
         return True, "All set. The add-ons are installed and ready, no restart needed."
     if any(x in low for x in ("getaddrinfo", "connection", "timed out", "could not find a version", "no matching distribution",
                               "name or service not known", "network")):
@@ -6897,12 +6967,62 @@ def changelog_since(text, current):
     return "\n".join(out).strip()
 
 
+def latest_release(repo):
+    """The newest published GitHub release of `repo`: its version, release-zip and checksum links, and notes.
+    Updates come from releases (built and tagged by the Release workflow), never from whatever is on the main branch
+    at that moment, so a half-finished push can't reach anyone."""
+    d = json.loads(http_get(f"https://api.github.com/repos/{repo}/releases/latest", 15, retries=1))
+    tag = str(d.get("tag_name") or "")
+    assets = {a.get("name", ""): a.get("browser_download_url", "") for a in d.get("assets") or []}
+    zip_name = next((n for n in assets if n.endswith(".zip")), "")
+    return dict(version=tag.lstrip("vV"), tag=tag, zip_name=zip_name, zip_url=assets.get(zip_name, ""),
+                sha_url=assets.get(zip_name + ".sha256", ""), notes=str(d.get("body") or ""))
+
+
+def sha256_from_file(text):
+    """The checksum in a `sha256sum`-style line ("<64 hex digits>  name"), or "" if there isn't one."""
+    m = re.match(r"\s*([0-9a-fA-F]{64})\b", text or "")
+    return m.group(1).lower() if m else ""
+
+
+def download_release(rel):
+    """Downloads a release zip and checks it against the checksum published with it. Raises if anything's off,
+    so nothing is installed from a damaged or incomplete download."""
+    import hashlib
+    if not rel.get("zip_url"):
+        raise RuntimeError(f"release {rel.get('tag') or '?'} has no download attached")
+    if not rel.get("sha_url"):
+        raise RuntimeError(f"release {rel.get('tag') or '?'} has no checksum attached, so it wasn't installed")
+    want = sha256_from_file(http_get(rel["sha_url"], 20, retries=2).decode("utf-8", "replace"))
+    if not want:
+        raise RuntimeError("the release's checksum file couldn't be read, so nothing was installed")
+    data = http_get(rel["zip_url"], 120, retries=2)
+    if hashlib.sha256(data).hexdigest() != want:
+        raise RuntimeError("the download doesn't match its checksum (damaged or incomplete), so nothing was installed")
+    return data
+
+
+def _requirement_lines(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [ln.split("#", 1)[0].strip() for ln in f if ln.split("#", 1)[0].strip()]
+    except OSError:
+        return []
+
+
+def new_requirements(backup, here):
+    """Requirement lines the freshly installed version has that the backed-up one didn't (new or changed)."""
+    old = set(_requirement_lines(os.path.join(backup, "requirements.txt")))
+    return [r for r in _requirement_lines(os.path.join(here, "requirements.txt")) if r not in old]
+
+
 UPDATE_FILES = re.compile(r"^(?:[\w.-]+\.pyw?|VERSION|README\.md|CHANGELOG\.md|requirements\.txt|[\w .-]+\.bat)$")
 
 
-def install_update(zip_bytes, here, current_version):
-    """Unpacks a GitHub branch zip over the app folder. The files being replaced are first copied to
-    here/backups/<old version>-<time>/ so the update can be undone. Returns (files written, backup folder)."""
+def install_update(zip_bytes, here, current_version, expect_version=None):
+    """Unpacks a release zip (or a GitHub branch zip) over the app folder. The files being replaced are first copied to
+    here/backups/<old version>-<time>/ so the update can be undone. With expect_version, the zip's VERSION file must
+    say the same. Returns (files written, backup folder)."""
     import io
     import zipfile
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -6913,6 +7033,10 @@ def install_update(zip_bytes, here, current_version):
             picks[rel] = name
     if "main.py" not in picks or "engine.py" not in picks:
         raise RuntimeError("the download doesn't look like this app (main.py / engine.py missing)")
+    if expect_version:
+        got = z.read(picks["VERSION"]).decode("utf-8", "replace").strip() if "VERSION" in picks else ""
+        if got != str(expect_version).strip():
+            raise RuntimeError(f"the download says it is version {got or '?'}, not {expect_version}")
     for rel in ("main.py", "engine.py"):  # never install something that doesn't even compile
         compile(z.read(picks[rel]).decode("utf-8"), rel, "exec")
     backup = os.path.join(here, "backups", f"{current_version}-{datetime.now():%Y%m%d-%H%M%S}")
@@ -6946,7 +7070,7 @@ def restore_backup(here, backup):
             shutil.copy2(os.path.join(backup, rel), os.path.join(here, rel))
 
 
-# ---------------- CBBF's own notification sounds ----------------
+# ---------------- OBF's own notification sounds ----------------
 SOUNDS = {  # (frequency Hz, start s, length s) notes; synthesized, so nothing to download
     "trade": [(988, 0.0, 0.09), (1319, 0.05, 0.12)],
     "notify": [(1319, 0.0, 0.35), (1760, 0.13, 0.5)],
@@ -6991,7 +7115,7 @@ def sound_path(kind, volume=60):
 
 
 def play_sound(kind, volume=60):
-    """Plays one of CBBF's sounds without blocking. Silently does nothing if the computer can't."""
+    """Plays one of OBF's sounds without blocking. Silently does nothing if the computer can't."""
     def run():
         try:
             path = sound_path(kind, volume)
