@@ -2420,14 +2420,44 @@ def pricing_vol(p, times=None):
     """The volatility practice contracts are priced with when the market's own (implied) volatility isn't known: about
     a week of candles (a few months on daily candles), not the last 120. On short candles the last 120 can jump from
     calm to wild in minutes, which repriced cheap contracts hundreds of times over on a move of a few percent: a gain
-    that only existed in the model, which the farm then learned to chase."""
-    step = 60.0
-    if times is not None and len(times) >= 3:
-        diffs = [times[-k] - times[-k - 1] for k in range(1, min(20, len(times) - 1)) if times[-k] > times[-k - 1]]
-        if diffs:
-            step = max(1.0, sorted(diffs)[len(diffs) // 2])
+    that only existed in the model, which the farm then learned to chase. Only moves from one candle to the next count:
+    a jump over a night, a weekend or a halt (earnings, say) isn't a one-minute move, and counting it as one made
+    measured volatility several times too high."""
+    L = len(p)
+    if L < 10:
+        return 0.35
+    if times is None or len(times) != L:
+        step = 60.0
+        if times is not None and len(times) >= 3:
+            diffs = [times[-k] - times[-k - 1] for k in range(1, min(20, len(times) - 1)) if times[-k] > times[-k - 1]]
+            if diffs:
+                step = max(1.0, sorted(diffs)[len(diffs) // 2])
+        n = 120 if step >= 86400 else int(min(2400, max(120, 5 * 6.5 * 3600 / step)))
+        return max(PRICING_VOL_FLOOR, realized_vol(p, times, n))
+    key = ("pv", id(getattr(p, "seq", p)), L // 30)  # (a week-long measure barely moves: worked out every 30 candles)
+    v = _VOL_CACHE.get(key)
+    if v is not None:
+        return v
+    tail = [times[i] for i in range(max(0, L - 21), L)]
+    diffs = sorted(b - a for a, b in zip(tail, tail[1:]) if b > a)
+    step = max(1.0, diffs[len(diffs) // 2]) if diffs else 60.0
     n = 120 if step >= 86400 else int(min(2400, max(120, 5 * 6.5 * 3600 / step)))
-    return max(PRICING_VOL_FLOOR, realized_vol(p, times, n))
+    lo = max(1, L - n)
+    rets = []
+    for i in range(lo, L):
+        a, b, ta, tb = p[i - 1], p[i], times[i - 1], times[i]
+        if a > 0 and b > 0 and 0 < tb - ta <= (step * 1.5 if step < 86400 else step * 4):
+            rets.append(math.log(b / a))
+    if len(rets) < 5:
+        return max(PRICING_VOL_FLOOR, realized_vol(p, times, n))
+    m = sum(rets) / len(rets)
+    sd = (sum((r - m) ** 2 for r in rets) / (len(rets) - 1)) ** 0.5
+    per_year = 252 * 6.5 * 3600 / step if step < 86400 else 252 * 86400 / step
+    v = max(PRICING_VOL_FLOOR, min(3.0, sd * math.sqrt(per_year)))
+    if len(_VOL_CACHE) > 4000:
+        _VOL_CACHE.clear()
+    _VOL_CACHE[key] = v
+    return v
 
 
 PRICING_VOL_FLOOR = 0.12  # (no listed option trades below about this volatility for long)

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.23.5
+- **Fix: restarting OBF made the bots "sell" for big fake profits.** After a restart, the market's own (implied)
+  volatility wasn't known again until the next quote (up to 15 minutes), so contracts were priced with measured
+  volatility instead. One report showed every INTC and AMZN contract repriced at once, and 34 bots "sold" for
+  +122% to +283% in the first minute. Now:
+  - the market's implied volatility is kept through a restart (for up to 20 hours), so nothing jumps;
+  - measured volatility only counts moves from one candle to the next. A jump over a night, a weekend or an earnings
+    gap isn't a one-minute move, and counting it as one read INTC at 226% when the market said 92% (on a test
+    week with a 10% earnings gap: 89% before, 50% now, the true figure).
+- Measured volatility is worked out every 30 candles (it hardly changes faster), so Free roam and the Training camp
+  stay quick.
+
 ## 1.23.4
 - **Contract price sliders**: "Contract price the bots may buy" on the left, under Practice money: a Min and a Max
   slider in dollars per contract. The bots move their strike nearer to or further from the price until a contract

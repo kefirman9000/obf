@@ -762,6 +762,12 @@ class App:
         self.logging_in = False
         self.migrated = E.migrate_home()  # first start after the rename: bring the old data folder across
         self.cfg = E.load_json(CONFIG_PATH, {})
+        for c_, x_ in (self.cfg.get("iv_hint") or {}).items():  # the market's implied volatility, kept through a restart
+            try:
+                if time.time() - float(x_[1]) < 20 * 3600 and float(x_[0]) > 0:
+                    E.IV_HINT[c_] = float(x_[0])
+            except (TypeError, ValueError, IndexError):
+                pass
         apply_theme(root, bool(self.cfg.get("dark", True)))
         self.dark_var = tk.BooleanVar(value=DARK)
         E.private_dir(E.HOME_DIR)
@@ -5154,6 +5160,24 @@ class App:
         self.check_daily()
         self.refresh_view()
 
+    def remember_iv(self, c):
+        """Keeps the market's implied volatility for a ticker in config.json, so after a restart contracts are priced
+        the same way as before (not with measured volatility until the next quote, which made them jump)."""
+        try:
+            iv = float(E.IV_HINT.get(c) or 0)
+        except (TypeError, ValueError):
+            return
+        if iv > 0:
+            book = dict(self.cfg.get("iv_hint") or {})
+            book[c] = [round(iv, 5), time.time()]
+            self.cfg["iv_hint"] = {k: x for k, x in book.items() if time.time() - float(x[1]) < 3 * 86400}
+            if time.time() - getattr(self, "_iv_saved", 0) > 300:
+                self._iv_saved = time.time()
+                try:
+                    E.save_json(CONFIG_PATH, self.cfg)
+                except OSError:
+                    E.note_error("remember_iv")
+
     def learn_quotes(self):
         """While the market is open, every 15 minutes: read each traded ticker's option quotes near the money. Their
         implied volatility (what the market is charging right now, so it rises with the VIX) prices Practice contracts,
@@ -5184,6 +5208,7 @@ class App:
                                 first = min(r["exp"] for r in near)
                                 ivs = [float(r["iv"]) for r in near if r["exp"] == first]
                                 E.IV_HINT[c] = sum(ivs) / len(ivs)
+                                self.remember_iv(c)
                         seen[c] = time.time()
                     except Exception:
                         E.note_error("work")
@@ -7746,6 +7771,7 @@ class App:
                 first = min(r["exp"] for r in cand)
                 ivs = [float(r["iv"]) for r in cand if r["exp"] == first]
                 E.IV_HINT[c] = sum(ivs) / len(ivs)
+                self.remember_iv(c)
         self.opt_fill()
 
     def opt_fill(self):
