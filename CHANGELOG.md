@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.23.4
+- **Contract price sliders**: "Contract price the bots may buy" on the left, under Practice money: a Min and a Max
+  slider in dollars per contract. The bots move their strike nearer to or further from the price until a contract
+  fits the range, and skip the trade if none does (practice, the farms and LIVE alike). Far left on Min means no
+  minimum, far right on Max means no limit. It takes effect from the next trade, and it's the same setting as
+  "Cheapest / Most expensive contract" in Settings, so changing either updates the other.
+
 ## 1.23.3
 - **Bot picks chooses better tickers**: it used to rank tickers almost only by how much they moved today (up to 20
   times the weight of anything else), so index ETFs like SPY and QQQ hardly ever made it in. Now it weighs: trading

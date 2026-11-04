@@ -1449,6 +1449,7 @@ class App:
         Tip(cd, "Tick to make this amount your default practice money: it's filled in here whenever OBF starts, and used "
                 "for new sessions and resets. Untick to go back to $10,000.")
         self.cash_var.trace_add("write", lambda *a: self._sync_default_cash())
+        self.build_prem_sliders(c)
         tk.Label(c, text="Risk style", bg=CARD, fg=MUTED).pack(anchor="w", pady=(8, 0))
         self.style_var = tk.StringVar(value=self.settings.get("style", "Balanced"))
         cb = ttk.Combobox(c, textvariable=self.style_var, values=list(E.STYLES) + ["Custom"], state="readonly")
@@ -4109,6 +4110,81 @@ class App:
         except Exception:
             E.note_error("close_bot_positions")
         return n
+
+    # ---------------- contract price range (left panel) ----------------
+    PREM_SLIDER_MAX = 3000  # $ per contract at the right end of the sliders: there it means "no limit"
+
+    def build_prem_sliders(self, parent):
+        """Two sliders: the cheapest and the dearest contract the bots may buy, in $ per contract. The bots then move
+        their strike until a contract fits (or skip the trade). Same as prem_min / prem_max in Settings."""
+        tk.Label(parent, text="Contract price the bots may buy", bg=CARD, fg=MUTED).pack(anchor="w", pady=(8, 0))
+        self.prem_lbl = tk.Label(parent, text="", bg=CARD, fg=TEXT, font=("", 9, "bold"), anchor="w")
+        self.prem_lbl.pack(fill="x")
+        self.prem_lo = tk.IntVar(value=int(round(float(self.settings.get("prem_min", 0) or 0) * 100)))
+        hi = float(self.settings.get("prem_max", 0) or 0) * 100
+        self.prem_hi = tk.IntVar(value=int(round(hi)) if hi else self.PREM_SLIDER_MAX)
+        self.prem_scales = []
+        for lab, var in (("Min", self.prem_lo), ("Max", self.prem_hi)):
+            row = tk.Frame(parent, bg=CARD)
+            row.pack(fill="x")
+            tk.Label(row, text=lab, bg=CARD, fg=MUTED, width=4, anchor="w", font=("", 8)).pack(side="left")
+            sc = tk.Scale(row, from_=0, to=self.PREM_SLIDER_MAX, resolution=5, orient="horizontal", showvalue=0,
+                          variable=var, bg=CARD, fg=TEXT, troughcolor=LINE, highlightthickness=0, bd=0, sliderlength=14,
+                          command=lambda _v, which=lab: self._prem_moved(which))
+            sc.pack(side="left", fill="x", expand=True)
+            sc.bind("<ButtonRelease-1>", lambda e: self._prem_save())
+            self.prem_scales.append(sc)
+        Tip(self.prem_scales[0], "The cheapest and the most expensive option contract (the whole contract, 100 shares) the bots "
+                                 "may buy. They move their strike nearer to or further from the price until a contract fits, "
+                                 "and skip the trade if none does. Far left on Min = no minimum, far right on Max = no limit. "
+                                 "Same as 'Cheapest / Most expensive contract' in Settings.")
+        self._prem_label()
+
+    def _prem_moved(self, which):
+        lo, hi = self.prem_lo.get(), self.prem_hi.get()
+        if lo > hi:  # the handles can't cross: the one you're dragging pushes the other
+            (self.prem_hi if which == "Min" else self.prem_lo).set(lo if which == "Min" else hi)
+        self._prem_label()
+
+    def _prem_label(self):
+        lo, hi = self.prem_lo.get(), self.prem_hi.get()
+        top = hi >= self.PREM_SLIDER_MAX
+        if not lo and top:
+            t = "Any price (no limit)"
+        elif not lo:
+            t = f"Up to ${hi:,} a contract"
+        elif top:
+            t = f"At least ${lo:,} a contract"
+        else:
+            t = f"${lo:,} to ${hi:,} a contract"
+        self.prem_lbl.config(text=t)
+
+    def _prem_save(self):
+        """Applies the range now (the farm and the account use it from their next trade) and remembers it."""
+        lo, hi = self.prem_lo.get(), self.prem_hi.get()
+        self.settings["prem_min"] = round(lo / 100, 2)
+        self.settings["prem_max"] = 0.0 if hi >= self.PREM_SLIDER_MAX else round(hi / 100, 2)
+        E.set_prem_range(self.settings["prem_min"], self.settings["prem_max"])
+        for t_ in (self.tourn, (getattr(self, "slow", None) or {}).get("t")):
+            if t_ is not None:
+                t_.o["prem"] = list(E.PREM_RANGE)
+        self.cfg["settings"] = self.settings
+        try:
+            E.save_json(CONFIG_PATH, self.cfg)
+        except OSError:
+            E.note_error("_prem_save")
+        txt = E.prem_range_text()
+        self.write("Contract price range: " + (txt + "." if txt else "any price.")
+                   + " The bots move their strike to fit it, or skip the trade.")
+
+    def sync_prem_sliders(self):
+        """After Settings is saved: the sliders show the range that was typed there."""
+        if not hasattr(self, "prem_lo"):
+            return
+        self.prem_lo.set(int(round(float(self.settings.get("prem_min", 0) or 0) * 100)))
+        hi = float(self.settings.get("prem_max", 0) or 0) * 100
+        self.prem_hi.set(min(self.PREM_SLIDER_MAX, int(round(hi))) if hi else self.PREM_SLIDER_MAX)
+        self._prem_label()
 
     # ---------------- default practice money ----------------
     def default_cash_text(self):
@@ -15014,6 +15090,7 @@ class App:
             match = [n for n, p in E.STYLES.items() if all(abs(self.settings[k] - v) < 1e-9 for k, v in p.items())]
             self.settings["style"] = match[0] if match else "Custom"
             self.style_var.set(self.settings["style"])
+            self.sync_prem_sliders()
             if self.tourn:
                 self.tourn.o.update(E.tournament_opts(self.settings))
                 self.tourn.cap = int(self.settings["max_bots"])
