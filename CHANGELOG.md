@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.22.1
+- **Instincts keep a lasting record**: Farm knowledge's "Main instincts" meter used to count only instincts with a bot
+  winning right now, so it bounced around and never built up, however much the farm learned. Each instinct now keeps a
+  record of how its bots do against just holding, review after review (saved with the farm, and passed on by practice
+  farms). An instinct counts as proven when it's winning now or its record beats holding over 10+ reviews, and the
+  farm keeps what it learned about an instinct (and its best bot) even after that family has died out.
+- **Fix: kamikazes were crowding out the farm's eggs**: a kamikaze with a lucky win became a "winner" and laid eggs,
+  which were then culled straight away because the farm already had enough kamikazes. In simulations that wasted 50 to
+  400+ eggs per run, and each one could push out a normal bot to make room. Once the farm has its kamikazes, they no
+  longer lay eggs, and a normal bot never picks up kamikaze genes from its mate. In tests over 21 simulated markets the
+  farm then had more bots it could judge (more with a real track record), though their average results didn't change.
+
 ## 1.22.0
 - **What learning is worth**: Free roam now measures what each learning switch in Settings is worth. About one study
   in seven, the same practice farm lives through the same stretch twice, with one switch on and then off (same bots,
