@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.23.3
+- **Bot picks chooses better tickers**: it used to rank tickers almost only by how much they moved today (up to 20
+  times the weight of anything else), so index ETFs like SPY and QQQ hardly ever made it in. Now it weighs: trading
+  volume; today's move (counted, but only up to 3x); whether a typical contract fits the bots' trade size (otherwise
+  they skip that ticker or only buy the cheapest far-out contracts); and how tight its option prices are. One place
+  is always kept for the best index ETF (SPY, QQQ, IWM or DIA) when it picks 3 or more. The log says why it picked
+  each ticker.
+- Tip: the bots' trade size is your practice money times Trade size %. With $1,000 at 10% they can spend about $100,
+  which rules out most SPY, QQQ or AMZN contracts; $10,000 or more lets them trade those.
+
 ## 1.23.2
 - **Default practice money**: a Default box next to Practice money. Tick it and that amount is filled in whenever OBF
   starts (and on the welcome screen), and used for new sessions and resets. Untick it to go back to $10,000. The box

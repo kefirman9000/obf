@@ -6323,13 +6323,52 @@ def list_products(quote="USD", symbols=None):
 STABLES = {"USDC", "USDT", "DAI", "PYUSD", "EURC", "GUSD", "USDS", "PAX", "TUSD", "FDUSD", "RLUSD"}
 
 
-def scout_coins(products, n, min_volume=5_000_000):
-    """The bot's own coin pick: liquid coins (enough daily volume to trade without big spreads)
-    that are actually moving, skipping stablecoins. Ranked by volume x size of the 24h move."""
+INDEX_ETFS = ("SPY", "QQQ", "IWM", "DIA")
+
+
+def scout_score(d, trade_size=None):
+    """How good a ticker is for this farm today -> (score, plain-English why). Busy (volume), moving (today's move
+    counts, but only up to 3x, so a quiet but busy ETF still competes), affordable (a typical contract, 2% out of
+    the money and two weeks out, should fit the bots' trade size: otherwise they skip it or only buy the cheapest
+    far-out contracts) and cheap to trade (a tight bid/ask gap on its options)."""
+    S, c = float(d.get("price") or 0), d["coin"]
+    if S <= 0:
+        return 0.0, "no price"
+    liq = (d.get("volume_usd") or 0) ** 0.5
+    chg = abs(d.get("change_24h") or 0)
+    move = 1 + min(chg, 8) / 4
+    vol = IV_HINT.get(c) or (0.2 if c in INDEX_ETFS else 0.4)
+    K = round(S * 1.02 / strike_step(S)) * strike_step(S)
+    cost = bs_price(S, K, 14 / 365, vol, "call") * CONTRACT
+    afford = 1.0 if not trade_size or cost <= trade_size else max(0.15, trade_size / cost)
+    hs = half_spread(c, cost / CONTRACT) if cost > 0 else 0.5
+    tight = max(0.3, 1 - 2 * hs)
+    why = (f"moved {chg:.1f}% today, a contract is about ${cost:,.0f}"
+           + ("" if afford >= 1 else f" (more than the ${trade_size:,.0f} trade size)")
+           + (f", bid/ask gap about {2 * hs * 100:.0f}%" if hs > 0.05 else ""))
+    return liq * move * afford * tight, why
+
+
+def scout_coins(products, n, min_volume=5_000_000, trade_size=None, why=None):
+    """The bot's own ticker pick for a new session: the best by scout_score, with one place kept for the best index
+    ETF (SPY, QQQ, IWM, DIA) when picking 3 or more, so the farm always has a steady, liquid market to learn on.
+    why (a dict) gets each pick's reason."""
     pool = [d for d in products if d["coin"] not in STABLES and (d["volume_usd"] or 0) >= min_volume
             and d["change_24h"] is not None]
-    pool.sort(key=lambda d: -((d["volume_usd"] or 0) ** 0.5 * (0.5 + min(abs(d["change_24h"]), 20))))
-    return [d["coin"] for d in pool[:n]]
+    scored = []
+    for d in pool:
+        sc, w = scout_score(d, trade_size)
+        if sc > 0:
+            scored.append((sc, d["coin"], w))
+    scored.sort(reverse=True)
+    picks = [c for _, c, _ in scored[:n]]
+    if n >= 3 and not any(c in INDEX_ETFS for c in picks):
+        etf = next(((sc, c) for sc, c, _ in scored if c in INDEX_ETFS), None)
+        if etf:
+            picks = picks[:n - 1] + [etf[1]]
+    if why is not None:
+        why.update({c: w for _, c, w in scored if c in picks})
+    return picks
 
 
 # ---------------- alerts (Discord / Telegram) ----------------

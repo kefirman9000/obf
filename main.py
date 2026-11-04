@@ -1479,8 +1479,9 @@ class App:
         ab = ttk.Checkbutton(crow, text="Bot picks", variable=self.auto_coin_var, style="Card.TCheckbutton",
                              command=self.toggle_auto_coins)
         ab.pack(side="left", padx=(8, 0))
-        Tip(ab, "Wildcard only: when you press Start, the bot scouts the market and trades the busiest tickers that are "
-                "actually moving. How many: Settings > Wildcard.")
+        Tip(ab, "Wildcard only: when you start a new session, the bot scouts about 40 popular tickers and picks the best "
+                "for its money: busy, moving (up to a point), contracts that fit its trade size and tight option prices. "
+                "One place is kept for the best index ETF (SPY, QQQ, IWM, DIA). How many: Settings > Wildcard.")
 
         # --- market context card: tickers the bots watch but never trade
         f, c = self.card(left, "MARKET CONTEXT (WATCHED)")
@@ -14721,7 +14722,14 @@ class App:
 
         def work():
             try:
-                picks = E.scout_coins(E.list_products(self.cur_quote()), int(self.settings["auto_coins"]))
+                try:
+                    size = float(self.cash_var.get()) * float(self.settings.get("trade_pct", 10)) / 100
+                except (TypeError, ValueError):
+                    size = None
+                why = {}
+                picks = E.scout_coins(E.list_products(self.cur_quote()), int(self.settings["auto_coins"]), trade_size=size,
+                                      why=why)
+                self._scout_why = why
                 self.q.put(("scouted", (picks, None)))
             except Exception as e:
                 self.q.put(("scouted", ([], str(e))))
@@ -14735,7 +14743,8 @@ class App:
             for c, v in self.coin_vars.items():
                 v.set(False)
             self.add_coins(picks)
-            self.write(f"The bot picked {', '.join(picks)}.", "good")
+            why = getattr(self, "_scout_why", {}) or {}
+            self.write(f"The bot picked {', '.join(picks)}." + "".join(f" {c}: {why[c]}." for c in picks if c in why), "good")
         self._scouted = True
         self.toggle()
 
