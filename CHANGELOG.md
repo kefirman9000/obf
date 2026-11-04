@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.22.3
+## 1.22.4
 - **Alpaca account tab**: what's really in your Alpaca account (paper or live, whichever your key belongs to), read
   straight from Alpaca, with a Refresh button (it also refreshes itself every 30 seconds while you look at it). Each
   position says which part of OBF looks after it: a copy of a practice trade, this session, a saved session, a copy kept
