@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.24.0
+- **Only proven bots trade the account now.** Your practice account, Alpaca paper and LIVE only follow bots with a real
+  track record: at least 8 finished trades, at least one full scoring window on the farm, money made over their
+  lifetime and more than just holding, and passed exams on days they never trained on. Shaky and new bots no longer
+  get any say, and kamikazes never do. Among the proven ones, the best lifetime records get the biggest say (up to 3x).
+  Every other bot keeps training on its own pretend money, and a bot whose record slips loses its say again.
+  - Settings > Wildcard: "Only proven bots trade the account" (on), the trades it needs (8), and whether passed
+    exams are required (on). Bots you pick yourself for My team or Hall of Fame only aren't held back.
+  - The log says how many bots are proven and who's leading. Expect the account to trade much less, especially at
+    first: it waits until bots have proven themselves.
+- **A fresh scoreboard, once.** Farms saved before 1.23 carry track records earned on practice prices that were far
+  too generous (single trades of +46,000%), which would have counted as "proven". When such a farm loads, every bot's
+  money, results and exams start again. Genes, rule evidence and everything the farm learned are kept.
+
 ## 1.23.7
 - **OBF can manage Alpaca options no bot traded.** On the Alpaca account tab, pick positions and press "Let OBF
   manage selected": OBF then looks after them with your account's rules from Settings (safety stop, lock-in profit,

@@ -154,6 +154,10 @@ SETTING_GROUPS = [
                           "at once. Stops one bad dragon draining the account. Example: 25 with $1,000 = $250 per bot (0 = no limit)", float),
     ]),
     ("Wildcard", "How the bot treats strategies that are winning, shaky or failing.", [
+        ("proven_only", "Only proven bots trade the account (practice, Alpaca paper and LIVE): a bot needs a real track "
+                        "record first. Every other bot keeps training on its own pretend money", bool),
+        ("proven_trades", "...finished trades a bot needs before it may trade the account", int),
+        ("proven_exam", "...and it must have passed its exams (Free roam tests it on days it never trained on)", bool),
         ("winner_boost", "Biggest trade size a top winner can earn (1 = normal, 2.5 = 2.5 times)", float),
         ("slow_every", "Shaky strategies may only trade every N decisions", int),
         ("fail_drop", "Stop a strategy at once if it falls this % from its peak (0 = off)", float),
@@ -925,6 +929,11 @@ class App:
         try:
             if not t.restore(d.get("farm")):
                 return None
+            if getattr(t, "scoreboard_reset", False):
+                self.q.put(("log", ("This farm's track records were earned on practice prices that were far too generous "
+                                    "(fixed in 1.23), so every bot starts a fresh scoreboard: money, results and exams "
+                                    "start again, genes and what they learned are kept. Bots have to prove themselves "
+                                    "again before they trade the account.", "warn")))
             gone = t.trim_to_cap()  # Free roam could push a farm past its size before 1.21
             if gone:
                 self.q.put(("log", (f"Your farm had grown past its size of {t.cap}; {gone} bots that couldn't be judged or "
@@ -9698,6 +9707,28 @@ class App:
 
     def update_wild_msg(self):
         n, top, scored = self.tourn.summary()
+        if self.settings.get("proven_only", True):
+            t = self.tourn
+            proven = t.proven_bots()
+            leading = [v for v in t.active if v in proven]
+            need = f"{int(self.settings.get('proven_trades', 8) or 0)}+ finished trades, made money over its lifetime, " \
+                   f"beat just holding" + (", passed its exams" if self.settings.get("proven_exam", True) else "")
+            if leading:
+                best = max(leading, key=lambda v: t.life(v)["ret"])
+                msg = (f"The account follows {len(leading)} proven winner{'s' if len(leading) != 1 else ''} "
+                       f"({len(proven)} proven in all). Best lifetime record: {E.bot_nickname(best.key())} "
+                       f"({t.life(best)['ret'] * 100:+.1f}% since it hatched).")
+            elif proven:
+                msg = (f"{len(proven)} bot{'s are' if len(proven) != 1 else ' is'} proven, but none is winning right now, "
+                       "so the account waits.")
+            else:
+                msg = (f"No bot is proven yet ({need}), so the account doesn't trade. The farm keeps training on its own "
+                       "pretend money.")
+            self.wild_msg = msg
+            if msg != self.last_wild_msg:
+                self.write(msg)
+                self.last_wild_msg = msg
+            return
         if n:
             info = self.tourn.info[id(top)]
             slow = len(self.tourn.slowed)

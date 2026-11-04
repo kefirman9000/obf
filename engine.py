@@ -2166,6 +2166,9 @@ DEFAULT_SETTINGS = {
     "roam_reuse": 3,             # Free roam studies each downloaded stretch this many times before fetching a new one
     "feature_tests": True,       # Free roam tests what each learning switch is worth (reported, never changed for you)
     "report_detail": False,      # Export a report also adds the detailed part (bot trades, price feed, checks)
+    "proven_only": True,         # only bots with a real track record decide the account's trades
+    "proven_trades": 8,          # ...finished trades a bot needs first
+    "proven_exam": True,         # ...and passed exams on prices it never trained on
     "alpaca_adopt_all": False,   # OBF manages every Alpaca option position nothing in OBF follows
     "slow_trades_account": False,  # the slow farm (hourly candles) may also trade your account
     "slow_size": 30,             # bots on the slow farm
@@ -2817,6 +2820,8 @@ def tournament_opts(settings):
                 post_review=bool(settings.get("post_review", True)), learn_losses=bool(settings.get("learn_losses", True)),
                 time_habits=bool(settings.get("time_habits", True)), agree_sizing=bool(settings.get("agree_sizing", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
+                proven_only=bool(settings.get("proven_only", True)), proven_exam=bool(settings.get("proven_exam", True)),
+                proven_trades=int(settings.get("proven_trades", 8) or 0),
                 prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0], sspread=_set_scalp_spread(settings))
 
 
@@ -4766,6 +4771,31 @@ class Tournament:
     def _holding(v, c):
         return v.sim.pos.get(c, 0) > 0
 
+    def proven(self, v):
+        """May this bot help decide the account's trades? Only when it has a real track record: enough finished
+        trades, enough time on the farm, money made over its lifetime and more than just holding, and (by default)
+        passed exams on prices it never trained on. Kamikazes never decide; everything else keeps training on its own
+        pretend money until it gets there. With the gate off (Settings), every winning bot may."""
+        if not self.o.get("proven_only", True):
+            return True
+        if is_kami(v):
+            return False
+        if v.origin == "team":  # bots you picked yourself to trade with (My team / Hall of Fame only)
+            return True
+        if v.wins + v.losses < int(self.o.get("proven_trades", 8) or 0):
+            return False
+        if v.age < self.window_for(v.tf):  # it has lived through at least one full scoring window of its own
+            return False
+        lf = self.life(v)
+        if lf["ret"] <= 0 or (lf["edge"] is not None and lf["edge"] <= 0):
+            return False
+        if self.o.get("proven_exam", True) and exam_verdict(v, self.serial)[0] != "passed":
+            return False
+        return True
+
+    def proven_bots(self):
+        return [v for v in self.vars if self.proven(v)]
+
     def vote(self, c, breed=None, key=None):
         """-> (signal, size multiplier). Winners vote at full weight, shaky strategies at a
         small weight. A vote that only shaky strategies want must wait out a cooldown, so they
@@ -4775,20 +4805,27 @@ class Tournament:
         cooldowns and notes are kept (the account's book for this ticker; defaults to the ticker)."""
         key = key or c
         keep = (lambda v: True) if breed is None else (lambda v: is_scalp(v.name) == (breed == "scalp"))
-        active, slowed = [v for v in self.active if keep(v)], [v for v in self.slowed if keep(v)]
+        gate = bool(self.o.get("proven_only", True))
+        # proven only: just the winning bots with a real track record decide (shaky ones never do)
+        active = [v for v in self.active if keep(v) and self.proven(v)]
+        slowed = [] if gate else [v for v in self.slowed if keep(v)]
         self.kind[key] = None
         bw = sw = bs = ss = 0.0
         act_buy = act_sell = False
         for v in active + slowed:
             d, s = self.info[id(v)], v.sig.get(c)
             is_act = d["status"] == "active"
+            w = d["weight"]
+            if gate:  # the best lifetime records lead the way: up to 3x the say for a bot far ahead of holding
+                lf = self.life(v)
+                w *= 1 + min(2.0, max(0.0, lf["edge"] if lf["edge"] is not None else lf["ret"]))
             if s == "buy":
-                bw += d["weight"]
-                bs += d["weight"] * d["stake"]
+                bw += w
+                bs += w * d["stake"]
                 act_buy = act_buy or is_act
             elif s == "sell":
-                sw += d["weight"]
-                ss += d["weight"] * d["stake"]
+                sw += w
+                ss += w * d["stake"]
                 act_sell = act_sell or is_act
         sig, mult, from_winner = None, 1.0, False
         if bw > sw:
@@ -5312,7 +5349,8 @@ class Tournament:
                               opt=getattr(v.sim, "opt", {}), vols=dict(getattr(v.sim, "vol_src", {}) or {})))
             bots.append(d)
         lineage = dict(list(self.lineage.items())[-600:])
-        return dict(version=1, n=self.n, serial=self.serial, cap=self.cap, coins=self.coins, start_cash=self.start_cash,
+        return dict(version=1, scoreboard=SCOREBOARD, n=self.n, serial=self.serial, cap=self.cap, coins=self.coins,
+                    start_cash=self.start_cash,
                     last_px={c: float(x) for c, x in (self.last_px or {}).items() if x},
                     elders=self.elders[-40:], champions=self.champions, season=self.season,
                     review=self.review, mut_stats=self.mut_stats, evolves=self.evolves,
@@ -5432,6 +5470,10 @@ class Tournament:
         self.trial_book = {k: list(x) for k, x in (st.get("trial_book") or {}).items()}
         hc = st.get("hold_curve") or [1.0]
         self.hold_curve = deque(hc, maxlen=self.W * 10 + 2)
+        self.scoreboard_reset = False
+        if int(st.get("scoreboard", 1) or 1) < SCOREBOARD:
+            fresh_scoreboard(self)
+            self.scoreboard_reset = True
         self._rate()
         return True
 
@@ -5688,6 +5730,23 @@ def _fresh_money(t):
         v.inducted = False
     t.hold_curve = deque([1.0], maxlen=t.W * 10 + 2)
     t.info, t.active, t.slowed = {}, [], []
+
+
+SCOREBOARD = 2  # bumped when old track records can't be trusted any more (2 = practice options were mispriced before 1.23)
+
+
+def fresh_scoreboard(t):
+    """Once, for a farm saved before practice options were priced properly (1.23): every bot's money, track record,
+    exams and test results start again, because they were earned on prices that were wildly too generous. Genes, rule
+    evidence and everything the farm learned stay. Bots then have to prove themselves again before they may trade."""
+    _fresh_money(t)
+    for v in t.vars:
+        v.exams, v.backtests, v.roam_scan = [], [], None
+        v.best_tr = v.worst_tr = None
+        v.coin_pl, v.mood_gain, v.mood_n, v.cond_gain, v.cond_n = {}, {}, {}, {}, {}
+        v.live_high = None
+        v.twin = None
+        v._key = None
 
 
 def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes=None, start_cash=1000.0, fee=0.006,
