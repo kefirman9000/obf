@@ -213,6 +213,9 @@ SETTING_GROUPS = [
         ("learn_losses", "Learn from its own losses: a bot takes on a never-rule that would have stopped several of its "
                          "losing trades (and few winners)", bool),
         ("multicore", "Learn on several processor cores at once at the start (faster warm-up)", bool),
+        ("roam_reuse", "Free roam studies each stretch of history it downloads this many times before downloading a "
+                       "new one (1 = always new). Only the first visit can promote bots (exams, graduates); repeat "
+                       "visits only teach", int),
     ]),
     ("Library & Hall of Fame", "The Bot Library keeps every bot you save, plus long-term winners the farm saves for you. "
                                "The Hall of Fame holds only the bots you promote yourself (right-click a bot).", [
@@ -6128,7 +6131,24 @@ class App:
         if self.roam_watching():
             time.sleep(0.03 if kind == "test" else 0.004)  # someone's watching: let the trades scroll by
 
-    def _roam_pick(self, rng, min_bars=400, prefer=None):
+    def _roam_pick(self, rng, min_bars=400, **kw):
+        """Where the next Free roam study looks. Each stretch it downloads is studied `roam_reuse` times (Settings >
+        Learning, default 3) before a new one is fetched. Repeat visits come back with info["revisit"] True: they teach,
+        but never promote anyone (see E.StretchPool)."""
+        try:
+            reuse = max(1, min(10, int(self.settings.get("roam_reuse", 3) or 1)))
+        except (TypeError, ValueError):
+            reuse = 3
+        pool = self.__dict__.setdefault("_roam_pool", E.StretchPool())
+        key = tuple(self.session_coins)
+        again = pool.take(key, reuse, min_bars // 2, kw.get("prefer"))
+        if again:
+            self.roam_check_on()
+            return again
+        closes, extra, info = self._roam_fetch(rng, min_bars, **kw)
+        return closes, extra, pool.add(key, reuse, closes, extra, info)
+
+    def _roam_fetch(self, rng, min_bars=400, prefer=None):
         """The farm chooses where to learn: a candle size, then a stretch of history it has studied least, but only
         stretches where every ticker really traded (checked against each ticker's daily history first)."""
         coins = list(self.session_coins)
@@ -6277,13 +6297,14 @@ class App:
                 if v in t.vars:
                     E.remember_backtest(v, r, t)
                     taught["bots"] += 1
-                    if not E.is_kami(v) and info["gran"] == self.farm_gran():  # unseen prices, its own candles: an exam
+                    if not E.is_kami(v) and info["gran"] == self.farm_gran() and not info.get("revisit"):
+                        # unseen prices (a first visit), its own candles: an exam
                         E.add_exam(v, "self-test", r["edge"] * 100, r.get("closed", r["trades"]), info["start"], info["gran"])
                         taught["exams"] += 1
                 res.append((E.bot_nickname(v.key()), round(r["ret"] * 100, 2), r["trades"], round(r["ret"] * 100, 2),
                             r.get("closed", 0), r.get("wins", 0), r.get("best_trade"), r.get("worst_trade")))
             good = sum(1 for x in res if x[1] > 0)
-            rec = dict(time=time.time(), kind="Self-test", start=info["start"], end=info["end"], gran=info["gran"],
+            rec = dict(time=time.time(), kind="Self-test", revisit=bool(info.get("revisit")), start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=res,
                        summary=f"{good} of {len(res)} made money; taught: {taught['bots']} bots' rule evidence and memory"
                                + (f", {taught['exams']} exams" if taught["exams"] else "")
@@ -6320,7 +6341,7 @@ class App:
             t.learn_hindsight(res)
             ok = [r for r in res["results"] if r["ok"]]
             grad = ""
-            if ok and self.seeded and not t.nursery_full():  # (when the farm is full of young eggs the lesson waits in the book)
+            if ok and self.seeded and not t.nursery_full() and not info.get("revisit"):  # (when the farm is full of young eggs the lesson waits in the book)
                 g = ok[0]["genes"]
                 v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
                                   note="Hindsight egg:", tf=g["tf"], origin="hindsight", risk=g["risk"], traits=g["traits"],
@@ -6332,7 +6353,7 @@ class App:
             rows = [(STRAT_LABELS.get(r["genes"]["name"], r["genes"]["name"]) + " (" + ", ".join(f"{k}={x}" for k, x in r["genes"]["params"].items()) + ")",
                      round(r["check_ret"] * 100, 2), r["closed"], round(r["check_ret"] * 100, 2), r["closed"], r["wins"],
                      r["best"], r["worst"]) for r in res["results"][:6]]
-            rec = dict(time=time.time(), kind="Hindsight", start=info["start"], end=info["end"], gran=info["gran"], bars=info["bars"],
+            rec = dict(time=time.time(), kind="Hindsight", revisit=bool(info.get("revisit")), start=info["start"], end=info["end"], gran=info["gran"], bars=info["bars"],
                        hold=round(info["hold"] * 100, 2), mood=info["mood"], results=rows, passed=len(ok), graduate=grad,
                        summary=f"tried {res['tried']} instincts and settings; {len(ok)} would have worked (on prices they "
                                f"hadn't seen too)" + (f"; {grad} hatched from the best" if grad else ""))
@@ -6570,7 +6591,7 @@ class App:
             E.teach_from(t, res["tourn"])
             passed = [r for r in res["results"] if r["passed"]]
             grad = ""
-            if passed and self.seeded and len(t.vars) < t.cap + 2:
+            if passed and self.seeded and len(t.vars) < t.cap + 2 and not info.get("revisit"):  # (a revisit only teaches)
                 g = passed[0]["genes"]
                 v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
                                   note="Free roam graduate:", tf=g["tf"], origin="free roam", risk=g["risk"],
@@ -6587,7 +6608,7 @@ class App:
                     return E.rel_edge(r["exam_ret"], res["exam_hold"]), r["exam_ret"]
                 hold_ = r["train_ret"] - r["train_edge"] if r["train_edge"] is not None else None
                 return E.rel_edge(r["train_ret"], hold_), r["train_ret"]
-            rec = dict(time=time.time(), kind="Practice farm", start=info["start"], end=info["end"], gran=info["gran"],
+            rec = dict(time=time.time(), kind="Practice farm", revisit=bool(info.get("revisit")), start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"],
                        results=[(E.bot_nickname(r["v"].key()), round(vs_hold(r)[1] * 100, 2), r["trades"],
                                  round(vs_hold(r)[1] * 100, 2), r.get("closed", 0), r.get("wins", 0), r.get("best_trade"),
@@ -6915,7 +6936,7 @@ class App:
                 ex = r["summary"] + (":  " + ",  ".join(f"{x['name']} {x['ret']:+.1f}%" for x in (self.roam_result(r, x) for x in r.get("results", [])[:4]))
                                      if r.get("results") else "")
                 log.insert("", "end", tags=(v_,), values=(
-                    datetime.fromtimestamp(r["time"]).strftime("%b %d %H:%M"), r["kind"],
+                    datetime.fromtimestamp(r["time"]).strftime("%b %d %H:%M"), r["kind"] + (" (again)" if r.get("revisit") else ""),
                     f"{self._when(r['start'], True)} to {self._when(r['end'], True)}", E.fmt_bar(r["gran"] / 60),
                     f"{MOOD_TEXT.get(r['mood'], r['mood'])} ({r['hold']:+.1f}%)", ex))
 

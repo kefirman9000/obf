@@ -1,6 +1,10 @@
 # Changelog
 
 ## 1.21.1
+- **Free roam downloads much less**: each stretch of history it downloads is now studied 3 times before it
+  fetches a new one (Settings > Learning, "Free roam studies each stretch..."; 1 = always new). Only the first
+  visit is on prices the farm hasn't seen, so only it can promote bots (exams, graduates or hatched eggs); repeat visits still teach
+  and show as "(again)" in the study log.
 - **Orders are never sent twice**: every order now carries its own ID. If the answer from Alpaca gets lost (a timeout
   or a dropped connection), OBF asks Alpaca whether the order arrived before trying again. Before, a lost answer could
   place the same order a second time.
