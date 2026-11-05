@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.24.2
+- **Donate button**: a pink **Donate** button in the top right (and Tools > Donate) opens OBF's GitHub Sponsors page.
+  OBF stays free; donations pay for new breeds, new tricks and more time to build them.
+- **Fix: Free roam no longer logs errors when you aren't logged in.** It needs Alpaca's history, so it now waits
+  quietly, says once in the log that it's waiting for a login, and starts studying as soon as you log in.
+- **Start asks you to log in when you haven't**: Practice uses pretend money but real prices, and those come from
+  Alpaca, so without a login the bots just waited. Start now offers to open the login (or start anyway).
+- **Fix: "no history" isn't a crash any more.** When Free roam finds nothing to study (a holiday, a gap in the
+  data) it notes it and moves on, instead of adding an entry to crash.log and the error counter.
+- **New README and screenshots**: the page now explains how the farm trains, breeds and tests its dragons, with
+  fresh dark-mode screenshots of the farm, the BEASTS den, Overview, a dragon's card, Free roam, Farm knowledge, the Library,
+  Portfolio, Bot positions and Success.
+
 ## 1.24.1
 - **An alert when no bot may trade.** While the bot runs and no bot is proven yet, an amber bar under the top line
   says so: the account won't trade, how many bots are training, and what the closest ones still need ("4 more
