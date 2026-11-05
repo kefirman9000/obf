@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.25.0
+- **Proven bots are reachable now.** Almost no bot ever earned a vote, so the account never traded. Two reasons:
+  bots were replaced faster than they could finish a record (about half the farm in two hours), and trades from Free
+  roam's exams didn't count. Now:
+  - Trades a bot makes in its exams (days it never trained on) count toward the finished trades it needs.
+  - Bots on course to earn a vote (passed exams, or exams so far positive and not behind holding) aren't retired or
+    dropped to make room, up to a third of the farm, so they live long enough to finish their record.
+  - The rules themselves are unchanged: exams, lifetime profit and beating just holding are still required.
+- **A rejected saved key no longer costs you the session.** When Alpaca rejects the key saved on this computer, OBF
+  forgets it and opens the login (tick Remember with your current key). Loading history now waits for a login that's
+  still connecting, and logging in after a start without history reloads it for the same farm.
+
 ## 1.24.2
 - **Donate button**: a pink **Donate** button in the top right (and Tools > Donate) opens OBF's GitHub Sponsors page.
   OBF stays free; donations pay for new breeds, new tricks and more time to build them.

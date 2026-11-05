@@ -4464,6 +4464,10 @@ class App:
 
     def _seed(self, coins, bar_min, wild, fee, pct, evolve):
         gran = E.candle_gran(bar_min)
+        for _ in range(40):  # a saved login still connecting: wait for it (history comes from Alpaca) up to 20 s
+            if E.ALPACA.get("key") or not self.logging_in:
+                break
+            time.sleep(0.5)
         if bar_min < 1:
             self.q.put(("log", (f"Loading history. Nothing shorter than 1-minute bars is offered, so the bots warm up "
                                 f"on those and switch to real {E.fmt_bar(bar_min)} bars as live prices arrive.", "info")))
@@ -5235,12 +5239,28 @@ class App:
             self.usd_avail = self.avail()
             self.logging_in = False
             self.update_status()
+            short = min((len(self.hist.get(c) or []) for c in self.session_coins), default=0) if self.session_coins else 0
+            if self.running and self.seeded and self.session_coins and short < 120:
+                # started without history (no login yet): load it now, for the same farm, so the bots see a full chart
+                self._restored_farm, self.seeded = self.tourn, False
+                self.write("Logged in: loading the price history the bots missed (your farm carries on as it was).")
+                self.launch_worker()
             self.write(f"Logged in to Alpaca ({'PAPER' if E.ALPACA.get('paper', True) else 'LIVE'}). Buying power: ${self.usd_avail:,.2f} "
                        f"")
         elif kind == "balances":
             self.balances = data
             self.usd_avail = self.avail()
             self.update_status()
+        elif kind == "saved_login_rejected":
+            self.logging_in = False
+            self.update_status()
+            self.write("Your saved Alpaca key was rejected (it may have been regenerated or revoked), so it was forgotten. "
+                       "Log in again with your current key and tick Remember: until then there are no prices.", "bad")
+            if not self.tray_mode:
+                messagebox.showwarning("Saved key rejected", "Alpaca didn't accept the key saved on this computer (it may "
+                                       "have been regenerated or revoked), so it was forgotten.\n\nPlease log in with "
+                                       "your current key and tick 'Remember'. Until then the bots have no prices.")
+                self.open_login()
         elif kind == "login_failed":
             self.logging_in = False
             self.update_status()
@@ -10272,7 +10292,7 @@ class App:
             E.note_error("auto_login")
         if creds and not self.client:
             self.write("Saved Alpaca login found, connecting...")
-            self.start_login(*creds, remember=False)
+            self.start_login(*creds, remember=False, saved=True)
 
     def open_login(self):
         if self.client:
@@ -10321,16 +10341,20 @@ class App:
         ttk.Button(row, text="Cancel", command=w.destroy).pack(side="left", padx=4)
         ttk.Button(row, text="Log in", style="Accent.TButton", command=go).pack(side="left")
 
-    def start_login(self, key, secret, paper=True, remember=False):
+    def start_login(self, key, secret, paper=True, remember=False, saved=False):
         self.logging_in = True
         self.update_status()
-        threading.Thread(target=self._connect, args=(key, secret, paper, remember), daemon=True).start()
+        threading.Thread(target=self._connect, args=(key, secret, paper, remember, saved), daemon=True).start()
 
-    def _connect(self, key, secret, paper, remember):
+    def _connect(self, key, secret, paper, remember, saved=False):
         creds = dict(key=key, secret=secret, paper=bool(paper))
         try:
             acct = E.alp_account(creds)
         except Exception as e:
+            low = str(e).lower()
+            if saved and ("401" in low or "403" in low or "unauthorized" in low or "forbidden" in low):
+                E.clear_login()  # a dead key: forget it, so the next start doesn't fail the same way
+                return self.q.put(("saved_login_rejected", E.explain_login_error(e, secret)))
             return self.q.put(("login_failed", E.explain_login_error(e, secret)))
         E.ALPACA.update(creds)
         if remember and not E.save_login(key, secret, paper):
