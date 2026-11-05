@@ -89,3 +89,18 @@ def test_overnight_gaps_do_not_inflate_pricing_volatility():
             t.append(t0 + day * 86400 + m * 60)
     assert E.realized_vol(p, t, 1950) > 0.75  # the old way
     assert 0.42 < E.pricing_vol(p, t) < 0.58  # close to the true 50%
+
+
+def test_a_contract_keeps_its_own_volatility_when_the_markets_is_lost():
+    """After a restart the market's implied volatility isn't known for a while, and a few candles can measure a wild
+    one: a held contract must keep the volatility it was bought with, not jump to a fake gain or loss."""
+    E.IV_HINT.clear()
+    E.IV_HINT["X"] = 0.30
+    s = E.OptionSim(1000.0, 0.0, 0.1, genes=dict(omode=1, odte=14, otm=2))
+    s.now = 1.77e9
+    s.vol_src["X"] = 0.30
+    assert s.buy("X", 100.0)
+    before = s.mark_one("X", 100.0)
+    E.IV_HINT.clear()
+    s.vol_src["X"] = 2.26
+    assert abs(s.mark_one("X", 100.0) - before) < 1e-6

@@ -2640,6 +2640,7 @@ class OptionSim(Sim):
         if real:  # a past day with real option history: trade the listed contract at what it really traded at
             self.opt[c].update(K=real["K"], exp=real["exp"], symbol=real["symbol"])
             K, step = real["K"], strike_step(S)
+        self.opt[c]["vol"] = round(self._vol(c), 4)  # priced with this: kept for when the market's own vol isn't known
         prem = self.mark_one(c, S)
         if (PREM_RANGE[0] or PREM_RANGE[1]) and not prem_ok(prem / CONTRACT):
             # outside the price range: walk the strike (further out of the money = cheaper, closer in = dearer)
@@ -2701,7 +2702,10 @@ class OptionSim(Sim):
         if real:
             return real
         T = max(0.0, o["exp"] - self.now) / YEAR
-        return bs_price(S, o["K"], T, self._vol(c), o["type"]) * CONTRACT
+        # the market's own (implied) volatility when it's known; otherwise the one the contract was bought with. Measured
+        # volatility from a few candles (right after a restart, say) could reprice it to a fake gain or loss in a minute.
+        vol = IV_HINT.get(c) or o.get("vol") or self._vol(c)
+        return bs_price(S, o["K"], T, vol, o["type"]) * CONTRACT
 
     def _count_fill(self, o):
         if self.book is not None:

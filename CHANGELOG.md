@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.25.1
+- **Fix: practice option trades no longer lose (or win) money that was never there.**
+  - While you're logged in, practice now buys real listed contracts at their real ask, from the option quotes OBF reads
+    every 15 minutes. Before, it bought at a model price and then valued the contract at its real quote, which for
+    far-out contracts was a small fraction of the model's: a "loss" of 80-90% within a minute that tripped the safety
+    stop. If no listed contract fits (your contract price range, a tight enough bid/ask gap), the trade is skipped and
+    the log says why. Not logged in, the model still prices them.
+  - The model never walks a strike more than 25% away from the stock to fit your contract price range (a $0.60 limit
+    used to reach strikes like AMD 760C).
+- **Fix: contracts no longer jump in value after a restart.** Each contract remembers the volatility it was priced
+  with and uses it until the market's own (implied) volatility is known again. Before, a few candles of measured
+  volatility (226% for INTC once) could hand bots fake gains of hundreds of percent at a restart.
+
 ## 1.25.0
 - **Proven bots are reachable now.** Almost no bot ever earned a vote, so the account never traded. Two reasons:
   bots were replaced faster than they could finish a record (about half the farm in two hours), and trades from Free

@@ -878,6 +878,7 @@ class App:
         self.cur_vol = {}         # ticker -> latest volume per bar
         self.opt = {}             # ticker -> the option contract the account holds: {type, K, exp, symbol}
         self.opt_quotes = {}      # option symbol -> (bid, ask, time) from Alpaca
+        self.chain_cache = {}     # ticker -> (time, option chain rows): what practice buys from while you're logged in
         self.market = None        # Alpaca market clock (is_open, next_open, next_close)
         self.ctx_hist = {}        # context ticker -> prices lined up with the session's bars (watched, never traded)
         self.tick_px = {}         # coin -> deque of (time, price) for the tick chart
@@ -3521,7 +3522,7 @@ class App:
             qty = self.pos.get(coin, 0)
             return self.cost.get(coin, 0) / qty if qty else 0.0
         T = max(0.0, o["exp"] - time.time()) / E.YEAR
-        vol = E.IV_HINT.get(t) or E.pricing_vol(self.hist.get(t) or [S], (self.hx.get(t) or {}).get("t"))
+        vol = E.IV_HINT.get(t) or o.get("vol") or E.pricing_vol(self.hist.get(t) or [S], (self.hx.get(t) or {}).get("t"))
         return E.bs_price(S, o["K"], T, vol, o["type"]) * E.CONTRACT
 
     def ctx_list(self, coins=None):
@@ -5365,9 +5366,10 @@ class App:
                 for c in due:
                     try:
                         S = self.last.get(c)
-                        rows = E.option_chain(c, today.strftime("%Y-%m-%d"), (today + timedelta(days=12)).strftime("%Y-%m-%d"),
-                                              None, S * 0.9 if S else None, S * 1.1 if S else None)
+                        rows = E.option_chain(c, today.strftime("%Y-%m-%d"), (today + timedelta(days=30)).strftime("%Y-%m-%d"),
+                                              None, S * 0.8 if S else None, S * 1.2 if S else None)
                         E.learn_spreads(c, rows, S)
+                        self.chain_cache[c] = (time.time(), rows)  # practice buys these real contracts at their real ask
                         if S:
                             near = [r for r in rows if r.get("iv") and abs(r["K"] / S - 1) < 0.03 and r["exp"] - time.time() > 2 * 86400]
                             if near:
@@ -10109,28 +10111,60 @@ class App:
             self.executor.submit(self.live_open, c, typ, S, spend, dte, otm, reason)
             return
         step = E.strike_step(S)
-        K = round((S * (1 + otm / 100) if typ == "call" else S * (1 - otm / 100)) / step) * step
-        exp = E.next_expiry(time.time(), dte)
-        o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(t_, exp, typ, K))
-        T = max(0.0, exp - time.time()) / E.YEAR
-        vol = E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
-        prem = E.bs_price(S, K, T, vol, typ) * E.CONTRACT
-        if (E.PREM_RANGE[0] or E.PREM_RANGE[1]) and not E.prem_ok(prem / E.CONTRACT):
-            cheaper = 1 if typ == "call" else -1  # walk the strike into the price range
-            way = cheaper if (E.PREM_RANGE[1] and prem / E.CONTRACT > E.PREM_RANGE[1]) else -cheaper
-            for _ in range(60):
-                K += way * step
-                if K <= 0:
-                    break
-                prem = E.bs_price(S, K, T, vol, typ) * E.CONTRACT
-                if E.prem_ok(prem / E.CONTRACT):
-                    break
-            if K <= 0 or not E.prem_ok(prem / E.CONTRACT):
+        now = time.time()
+        real = None
+        if self.client:
+            # Logged in, OBF reads the real quote of whatever the account holds, so a contract bought at a model price
+            # would be marked at its real price a minute later (far-out ones at a small fraction: a fake loss that
+            # trips the safety stop). So practice buys a real listed contract at its real ask, or nothing.
+            cache = self.chain_cache.get(t_)
+            if not cache or now - cache[0] > 1800:
+                self._quotes_at = {k: x for k, x in (getattr(self, "_quotes_at", {}) or {}).items() if k != t_}
+                if now - getattr(self, "_chain_note", 0) > 900:
+                    self._chain_note = now
+                    self.write(f"Skipped a {typ} on {t_}: waiting for its real option quotes (they load within a minute "
+                               f"while the market is open).", "info")
                 return
+            rules = self.pick_rules()
+            if scalp:
+                rules["max_spread_pct"] = min(rules["max_spread_pct"] or E.SCALP_SPREAD[0], E.SCALP_SPREAD[0])
+            real = E.pick_contract(cache[1], S, typ, dte, otm, now, **rules)
+            if not real:
+                if now - getattr(self, "_pick_note", 0) > 900:
+                    self._pick_note = now
+                    rng = E.prem_range_text()
+                    self.write(f"Skipped a {typ} on {t_}: no listed contract near what the bots want"
+                               + (f" inside your contract price range ({rng})" if rng else "") + " with a tight enough "
+                               "bid/ask gap.", "warn")
+                return
+            K, exp = real["K"], real["exp"]
+            o = dict(type=typ, K=K, exp=exp, symbol=real["symbol"])
+            prem = real["ask"] * E.CONTRACT
+            vol = float(real.get("iv") or 0) or E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
+            self.opt_quotes[real["symbol"]] = (real["bid"], real["ask"], cache[0])
+        else:
+            K = round((S * (1 + otm / 100) if typ == "call" else S * (1 - otm / 100)) / step) * step
+            exp = E.next_expiry(now, dte)
+            T = max(0.0, exp - now) / E.YEAR
+            vol = E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
+            prem = E.bs_price(S, K, T, vol, typ) * E.CONTRACT
+            if (E.PREM_RANGE[0] or E.PREM_RANGE[1]) and not E.prem_ok(prem / E.CONTRACT):
+                cheaper = 1 if typ == "call" else -1  # walk the strike into the price range, never past 25% from the stock
+                way = cheaper if (E.PREM_RANGE[1] and prem / E.CONTRACT > E.PREM_RANGE[1]) else -cheaper
+                for _ in range(60):
+                    K += way * step
+                    if K <= 0 or abs(K / S - 1) > 0.25:
+                        break
+                    prem = E.bs_price(S, K, T, vol, typ) * E.CONTRACT
+                    if E.prem_ok(prem / E.CONTRACT):
+                        break
+                if K <= 0 or abs(K / S - 1) > 0.25 or not E.prem_ok(prem / E.CONTRACT):
+                    return
             o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(t_, exp, typ, K))
+        o["vol"] = round(float(vol), 4)  # what it was priced with: used again when the market's own volatility isn't known
         fee, slip = E.cost_model(self.settings)
-        half = max(slip, 0.02)
-        if scalp:  # a scalp pays this ticker's real bid/ask gap, and only takes tight ones
+        half = 0.0 if real else max(slip, 0.02)  # a real fill already paid the ask
+        if scalp and not real:  # a scalp pays this ticker's real bid/ask gap, and only takes tight ones
             half = E.half_spread(t_, prem / E.CONTRACT)
             if 2 * half * 100 > E.SCALP_SPREAD[0]:
                 if time.time() - getattr(self, "_spread_note", 0) > 900:
