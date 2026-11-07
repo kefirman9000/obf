@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.26.1
+- **Essentials only button** (top bar, next to Check for updates): one click switches off everything that downloads
+  extra history or works the disk in the background: Free roam, the Slow farm, the Scalp lab, background exams, the automatic
+  economic calendar refresh and weekly backups. Normal trading and its prices keep running. While it's on, those modes
+  can't start by themselves; starting one by hand asks whether to switch Essentials only off. Click again to allow them.
+
 ## 1.26.0
 - **Minimum days to expiry** (default 7): bots that hold overnight no longer buy contracts a day or two from expiry,
   which can lose most of their value overnight. Several top bots were buying 2-day contracts. Scalpers (flat by the
