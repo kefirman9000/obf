@@ -1,6 +1,22 @@
 # Changelog
 
 
+
+## 1.30.0
+- **Practice learns what real fills cost.** With 'Both' on, every practice trade is also placed on Alpaca paper. OBF now
+  compares the two prices and, after 10 priced copies, practice charges the difference on buys and sells, so practice
+  results stop being rosier (or harsher) than real ones. The Alpaca account tab shows the comparison, and the farm
+  doctor warns when many paper copies don't fill at all. Settings > Learn from paper fills (on).
+- **Earnings awareness.** OBF keeps the US earnings calendar for the next six weeks (from Nasdaq, refreshed every 6
+  hours; off with Essentials only):
+  - **Earnings guard** (Settings, default 1): the account opens nothing in a stock the day before or the day it
+    reports.
+  - A new never-rule bots can learn, **Stays away from earnings**, graded like the others.
+  - The farm doctor warns when you're holding something into an earnings report.
+- **Two new option exits bots can learn:** **Decay exit** (sell once time decay eats X% of the contract a day, so a
+  contract isn't held while it melts near expiry) and **Volatility-collapse exit** (sell once the contract's
+  volatility has fallen X% since it was bought, as after an earnings report or a calm-down).
+
 ## 1.29.0
 - **Farm doctor** (top bar, next to Essentials only): checks the farm and the app every minute and offers a fix
   where there is one: a farm far past its size (one click trims it), most bots unjudged, no bot proven for hours,

@@ -61,7 +61,7 @@ from datetime import date, datetime, timedelta, timezone
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import engine as E
-from farmcore import FarmAppMixin, LIMIT_SETTINGS  # safety limits and the farm doctor, shared by the apps
+from farmcore import FarmAppMixin, FillCheckMixin, LIMIT_SETTINGS, FILL_SETTINGS, EARN_SETTINGS, earnings_loop  # safety limits and the farm doctor, shared by the apps
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
 UPDATE_REPO = "kefirman9000/obf"
@@ -138,6 +138,8 @@ SETTING_GROUPS = [
         ("daily_loss", "Daily loss limit: stop trading for the rest of the day if the account falls this % since "
                        "midnight. Open contracts are kept, not sold (0 = off). The TODAY tile shows how close you are", float),
         *LIMIT_SETTINGS,
+        *FILL_SETTINGS,
+        *EARN_SETTINGS,
         ("expiry_days", "Expiry guard: sell every contract this many trading days before it expires, so nothing is "
                         "ever exercised into shares. 2 = sell on Wednesday for a Friday expiry (at least 1). Runs whenever "
                         "OBF is open, even with the bot stopped", int),
@@ -754,7 +756,8 @@ def read_version():
         return "0.0.0"
 
 
-class App(FarmAppMixin):
+class App(FarmAppMixin, FillCheckMixin):
+    HAS_EARNINGS = True  # stocks report earnings (the earnings guard, rule and calendar)
     def __init__(self, root, tray=False):
         self.tray_mode, self.tray = bool(tray), None  # tray: started in the background (icon by the clock)
         # Background learning (Free roam, Slow farm, Training camp) shares Python with the window. Handing control
@@ -1926,6 +1929,7 @@ class App(FarmAppMixin):
         self.tile_frames["broker"].grid_remove()  # shown once there's an Alpaca account to read
         tiles.columnconfigure(5, weight=0)
         threading.Thread(target=self._broker_loop, daemon=True).start()
+        threading.Thread(target=earnings_loop, args=(self,), daemon=True).start()  # earnings calendar (farmcore)
         self.root.after(50, self.apply_compact)
         self.verdict_lbl = tk.Label(right, text="", bg=BG, fg=MUTED, anchor="w", font=("", 10, "bold"))
         self.verdict_lbl.pack(fill="x", pady=(6, 0))
@@ -2892,12 +2896,15 @@ class App(FarmAppMixin):
             return
         if rec is None:
             self.mirror.pop(c, None)
+            if "fill" in err:
+                self.fill_note_paper(c, "buy", None)
             if time.time() - getattr(self, "_mirror_note", 0) > 600:
                 self._mirror_note = time.time()
                 self.write(f"ALPACA PAPER: the copy of {self.contract_label(c)} wasn't placed ({err}). The PRACTICE trade "
                            "itself is unaffected.", "warn")
             return
         self.mirror[c] = rec
+        self.fill_note_paper(c, "buy", rec["avg"])
         self._mirror_row("buy", c, rec["qty"], rec["avg"], rec["cost"], None, reason, rec)
         if self.pos.get(c, 0) <= 0:  # the practice trade closed while the copy was on its way
             self.mirror_close(c, "sync")
@@ -2942,11 +2949,14 @@ class App(FarmAppMixin):
             return
         if fill is None:
             rec.pop("closing", None)
+            if "fill" in err:
+                self.fill_note_paper(c, "sell", None)
             if time.time() - getattr(self, "_mirror_note", 0) > 600:
                 self._mirror_note = time.time()
                 self.write(f"ALPACA PAPER: couldn't sell the copy of {self.contract_label(c)} yet ({err}); trying again.", "warn")
             return
         got, avg = fill
+        self.fill_note_paper(c, "sell", avg)
         proceeds = got * avg * E.CONTRACT
         basis = rec["cost"] * (got / rec["qty"]) if rec["qty"] else rec["cost"]
         self._mirror_row("sell", c, got, avg, proceeds, proceeds - basis, reason, rec)
@@ -10616,7 +10626,7 @@ class App(FarmAppMixin):
             o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(t_, exp, typ, K))
         o["vol"] = round(float(vol), 4)  # what it was priced with: used again when the market's own volatility isn't known
         fee, slip = E.cost_model(self.settings)
-        half = 0.0 if real else max(slip, 0.02)  # a real fill already paid the ask
+        half = self.fill_adjust("buy") if real else max(slip, 0.02)  # a real fill already paid the ask (plus what paper fills taught)
         if scalp and not real:  # a scalp pays this ticker's real bid/ask gap, and only takes tight ones
             half = E.half_spread(t_, prem / E.CONTRACT)
             if 2 * half * 100 > E.SCALP_SPREAD[0]:
@@ -10669,6 +10679,7 @@ class App(FarmAppMixin):
         expired = o and time.time() >= o.get("exp", 0)
         fee, slip = E.cost_model(self.settings)
         half = E.half_spread(tick_of(c), value / E.CONTRACT) if o.get("scalp") else max(slip, 0.02)
+        half += self.fill_adjust("sell")  # what Alpaca paper fills showed real sells cost (0 until it knows)
         fill = value if expired else value * (1 - half)
         proceeds = qty * fill * (1 - (0 if expired else fee)) - (0 if expired else qty * E.CONTRACT_FEE[0])
         self.fees_paid += 0 if expired else qty * value * half + qty * fill * fee + qty * E.CONTRACT_FEE[0]
@@ -10684,6 +10695,7 @@ class App(FarmAppMixin):
     def log_trade(self, side, c, qty, px, usd, pl, reason):
         if side == "sell" and pl is not None:
             self.limit_note_close(pl)
+        self.fill_note_practice(c, side, px)
         acct_ = self.acct_name()
         row = dict(time=datetime.now().isoformat(timespec="seconds"), mode={"PRACTICE": "paper", "ALPACA PAPER": "alpaca"}.get(acct_, "live"),
                    acct=acct_,
@@ -13257,6 +13269,9 @@ class App(FarmAppMixin):
         tk.Label(parent, bg=CARD, fg=MUTED, anchor="w", padx=8, font=("", 8), justify="left", wraplength=1100, text=(
             "What's really in your Alpaca account (the paper or live one your key belongs to), read straight from Alpaca. "
             "Resetting OBF never closes these. 'Tracked by OBF' says which part of OBF looks after each one.")).pack(fill="x")
+        self.al_fills = tk.Label(parent, bg=CARD, fg=TEXT, anchor="w", padx=8, font=("", 8, "bold"), justify="left",
+                                 wraplength=1100, text="")
+        self.al_fills.pack(fill="x")
         box = tk.Frame(parent, bg=CARD)
         box.pack(fill="both", expand=True, padx=6, pady=(2, 6))
         cols = ("contract", "qty", "paid", "worth", "pl", "plpct", "left", "who")
@@ -13280,6 +13295,8 @@ class App(FarmAppMixin):
         self.root.after(30000, self._al_tick)
 
     def refresh_alpaca(self, quiet=False):
+        if hasattr(self, "al_fills"):
+            self.al_fills.config(text="Practice vs real fills: " + self.fill_text())
         if getattr(self, "al_tree", None) is None or getattr(self, "_al_busy", False):
             return
         if not E.ALPACA.get("key"):
