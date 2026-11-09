@@ -22,6 +22,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from farmcore import (  # noqa: F401  shared with the other bot farm apps (see farmcore.py)
+    earn_days_ahead,
     loosen_silent,
     LIMIT_DEFAULTS,
     BAR_CHOICES, BIG_EVENTS, BOT_FORMAT_VERSION, CANDLE_GRANS, CLASSICS, COLLECT_FIELDS, CTX_KEY, DISK_T0,
@@ -2051,7 +2052,7 @@ class OptionSim(Sim):
         step = strike_step(S)
         K = round((S * (1 + otm) if typ == "call" else S * (1 - otm)) / step) * step
         exp = next_expiry(self.now, dte_for(g))
-        self.opt[c] = dict(type=typ, K=K, exp=exp, under=c)
+        self.opt[c] = dict(type=typ, K=K, exp=exp, under=c, vol=round(float(self._vol(c) or 0), 4))  # (for 'ivdrop')
         real = self._pick_listed(c, typ, K, exp, S) if self.book else None
         if real:  # a past day with real option history: trade the listed contract at what it really traded at
             self.opt[c].update(K=real["K"], exp=real["exp"], symbol=real["symbol"])
@@ -2306,12 +2307,16 @@ TRAITS = {
     "vixwide": dict(lo=1.2, hi=3.0, kind=float, text=lambda v: f"widens its stop and target up to {v:g}x when volatility jumps"),
     "moods":   dict(lo=1, hi=14, kind=int, text=lambda v: "trades only when " + " / ".join(
         m for i, m in enumerate(MOODS) if v & (1 << i))),
+    "decay":   dict(lo=1.0, hi=15.0, kind=float, text=lambda v: f"sells once time decay eats {v:g}%+ of its contract a day"),
+    "ivdrop":  dict(lo=10.0, hi=60.0, kind=float,
+                    text=lambda v: f"sells once its contract's volatility has dropped {v:g}% since it bought (a collapse)"),
 }
 TRAIT_NAMES = {"trail": "Trailing stop", "maxhold": "Max hold", "minhold": "Min hold", "cool": "Cooldown", "trend": "Trend filter",
                "minvol": "Min volatility", "rsicap": "Overbought guard", "confirm": "Confirmation",
                "entries": "Max entries", "exit": "Stops-only exit", "moods": "Mood gate", "adapt": "Adaptive stops",
                "omode": "Calls / puts (1 calls, 2 puts, 3 both)", "odte": "Days to expiry", "otm": "% out of the money",
                "oexit": "Exit days before expiry", "flatby": "Flat before the close (minutes, scalpers)",
+               "decay": "Decay exit (% a day)", "ivdrop": "Volatility-collapse exit (% drop)",
                "vixmode": "Volatility gate (1 calm, 2 rising, 3 spikes, 4 not spikes, 5 any)",
                "vixwide": "Wider exits when volatility jumps (x)", "kami": "Kamikaze (1 = yes)"}
 
@@ -2360,6 +2365,8 @@ VETOES = {
                     text=lambda x: f"never opens a contract in the last {int(x)} minutes before the 4 pm close (New York)"),
     "panic":   dict(lo=0.5, hi=5.0, side="sell", name="No panic selling",
                     text=lambda x: f"never sells on its strategy right after a {x:g}%+ one-bar drop (stops still work)"),
+    "earnings": dict(lo=1, hi=5, side="open", name="Stays away from earnings",
+                     text=lambda x: f"never opens a contract {int(x)} trading day{'s' if int(x) > 1 else ''} or less before an earnings report"),
     "gap":     dict(lo=0.3, hi=4.0, side="open", name="No gap days",
                     text=lambda x: f"never opens a contract on a day that opened {x:g}%+ away from the day before's close"),
     "weekday": dict(lo=1, hi=5, side="open", name="Skips one weekday",
@@ -2384,7 +2391,7 @@ def clean_vetoes(d):
             x = 0
         if x > 0 and len(out) < MAX_VETOES:
             x = min(max(x, spec["lo"]), spec["hi"])
-            out[k] = int(round(x)) if k in ("revenge", "opening", "closing", "weekday", "newsday") else round(x, 2)
+            out[k] = int(round(x)) if k in ("revenge", "opening", "closing", "weekday", "newsday", "earnings") else round(x, 2)
     return out
 
 
@@ -2444,6 +2451,9 @@ def _veto(v, k, x, c, closes, n, extra, coins):
         return bool(moves) and sum(moves) / len(moves) * 100 <= -x
     if k == "panic":
         return (p[-1] / p[-2] - 1) * 100 <= -x
+    if k == "earnings":  # (from the earnings calendar; with none downloaded it never blocks)
+        dd = earn_days_ahead(c, _bar_time(extra, c, v.sim))
+        return dd is not None and dd <= int(x)
     if k == "gap":
         g = day_gap(c, p, ((extra or {}).get(c) or {}).get("t"))
         return g is not None and abs(g) >= x
@@ -2703,6 +2713,27 @@ def _study_states(v, L, key, closes, c, n, xc):
     return out
 
 
+def option_exit(sim, c, S, tr):
+    """'decay' or 'ivdrop' when one of a bot's option exits says sell now, else None.
+    decay: what one more day costs the contract (Black-Scholes, at today's volatility), as % of its value.
+    ivdrop: how far the contract's volatility has fallen since it was bought (after an earnings report, a calm-down)."""
+    o = sim.opt.get(c) or {}
+    if not o or not S:
+        return None
+    vol = sim._vol(c)
+    if tr.get("decay"):
+        T = max(0.0, o["exp"] - sim.now) / YEAR
+        if T > 0:
+            p0 = bs_price(S, o["K"], T, vol, o["type"])
+            p1 = bs_price(S, o["K"], max(0.0, T - 1 / 365), vol, o["type"])
+            if p0 > 0.005 and (p0 - p1) / p0 * 100 >= tr["decay"]:
+                return "decay"
+    v0 = float(o.get("vol") or 0)
+    if tr.get("ivdrop") and v0 > 0 and vol > 0 and (1 - vol / v0) * 100 >= tr["ivdrop"]:
+        return "ivdrop"
+    return None
+
+
 def bot_step(v, closes, n, coins, extra=None):
     """One decision of one bot on every coin: its own exits first (stop-loss, take-profit, trailing stop,
     max hold), then its strategy signal filtered by its traits. Returns the trades made [(coin, trade)]."""
@@ -2754,12 +2785,16 @@ def bot_step(v, closes, n, coins, extra=None):
                 why = "trail"
             elif tr.get("maxhold") and n - v.since.get(c, n) >= tr["maxhold"] * v.tf:
                 why = "time"
+            elif opt and (tr.get("decay") or tr.get("ivdrop")):
+                why = option_exit(sim, c, last[c], tr)
             if why:
                 sim.sell(c, last[c], n)
                 v.sig[c] = "sell"
                 v.why[c] = {"expiry": "its contract was close to expiry",
                             "stop": f"its own safety stop ({v.risk['sl']:g}%)", "target": f"its own profit target ({v.risk['tp']:g}%)",
                             "trail": f"its trailing stop ({tr.get('trail', 0):g}%)", "time": "it held as long as it allows",
+                            "decay": f"time decay was eating {tr.get('decay', 0):g}%+ of the contract a day",
+                            "ivdrop": f"its volatility collapsed ({tr.get('ivdrop', 0):g}%+ since it bought)",
                             "flat": f"scalpers are flat {tr.get('flatby', 0)} min before the close"}[why]
         if sim.last is None:
             if n % v.tf:  # between this bot's own decisions: no signal, no trade
