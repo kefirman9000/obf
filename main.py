@@ -61,6 +61,7 @@ from datetime import date, datetime, timedelta, timezone
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import engine as E
+from farmcore import FarmAppMixin, LIMIT_SETTINGS  # safety limits and the farm doctor, shared by the apps
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
 UPDATE_REPO = "kefirman9000/obf"
@@ -136,6 +137,7 @@ SETTING_GROUPS = [
                          "Safety stops still sell at any time (0 = off)", float),
         ("daily_loss", "Daily loss limit: stop trading for the rest of the day if the account falls this % since "
                        "midnight. Open contracts are kept, not sold (0 = off). The TODAY tile shows how close you are", float),
+        *LIMIT_SETTINGS,
         ("expiry_days", "Expiry guard: sell every contract this many trading days before it expires, so nothing is "
                         "ever exercised into shares. 2 = sell on Wednesday for a Friday expiry (at least 1). Runs whenever "
                         "OBF is open, even with the bot stopped", int),
@@ -752,7 +754,7 @@ def read_version():
         return "0.0.0"
 
 
-class App:
+class App(FarmAppMixin):
     def __init__(self, root, tray=False):
         self.tray_mode, self.tray = bool(tray), None  # tray: started in the background (icon by the clock)
         # Background learning (Free roam, Slow farm, Training camp) shares Python with the window. Handing control
@@ -948,6 +950,7 @@ class App:
                                     "(fixed in 1.23), so every bot starts a fresh scoreboard: money, results and exams "
                                     "start again, genes and what they learned are kept. Bots have to prove themselves "
                                     "again before they trade the account.", "warn")))
+            t.cap = int(self.settings["max_bots"])  # loading stretches the size to fit everyone: back to your setting
             gone = t.trim_to_cap()  # Free roam could push a farm past its size before 1.21
             if gone:
                 self.q.put(("log", (f"Your farm had grown past its size of {t.cap}; {gone} bots that couldn't be judged or "
@@ -1674,6 +1677,7 @@ class App:
         self.ess_btn = tk.Button(header, command=self.toggle_essentials, relief="flat", bd=0, padx=10, pady=3,
                                  cursor="hand2", font=("", 9, "bold"))
         self.ess_btn.pack(side="right", padx=(0, 8))
+        self.build_doctor_button(header)
         Tip(self.ess_btn, "Essentials only: switches off everything that downloads extra history or works the disk in "
                           "the background (Free roam, Auto camp, the Slow farm, the Scalp lab, background exams, the economic "
                           "calendar refresh, weekly backups). Normal trading and its prices keep running.")
@@ -10532,6 +10536,8 @@ class App:
         spend = self.group_room(c, typ, self.trade_size(c, mult))
         if spend <= 0:
             return
+        if self.limit_blocked(c, spend):
+            return
         dte, otm = E.dte_for(g), float(g.get("otm", 1.0) or 1.0)
         scalp = g.get("_scalp")
         if scalp and not (scalp["flatby"] < E.minutes_to_close(time.time()) <= 390):
@@ -10676,6 +10682,8 @@ class App:
         self.mirror_close(c, reason)
 
     def log_trade(self, side, c, qty, px, usd, pl, reason):
+        if side == "sell" and pl is not None:
+            self.limit_note_close(pl)
         acct_ = self.acct_name()
         row = dict(time=datetime.now().isoformat(timespec="seconds"), mode={"PRACTICE": "paper", "ALPACA PAPER": "alpaca"}.get(acct_, "live"),
                    acct=acct_,
