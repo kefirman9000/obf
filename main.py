@@ -61,7 +61,7 @@ from datetime import date, datetime, timedelta, timezone
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import engine as E
-from farmcore import CoreRunner, FarmAppMixin, FillCheckMixin, LIMIT_SETTINGS, FILL_SETTINGS, EARN_SETTINGS, earnings_loop  # safety limits and the farm doctor, shared by the apps
+from farmcore import NAV_SETTINGS, CoreRunner, FarmAppMixin, NavMixin, FillCheckMixin, LIMIT_SETTINGS, FILL_SETTINGS, EARN_SETTINGS, earnings_loop  # safety limits and the farm doctor, shared by the apps
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
 UPDATE_REPO = "kefirman9000/obf"
@@ -138,6 +138,7 @@ SETTING_GROUPS = [
         ("daily_loss", "Daily loss limit: stop trading for the rest of the day if the account falls this % since "
                        "midnight. Open contracts are kept, not sold (0 = off). The TODAY tile shows how close you are", float),
         *LIMIT_SETTINGS,
+        *NAV_SETTINGS,
         *FILL_SETTINGS,
         *EARN_SETTINGS,
         ("expiry_days", "Expiry guard: sell every contract this many trading days before it expires, so nothing is "
@@ -758,7 +759,7 @@ def read_version():
         return "0.0.0"
 
 
-class App(FarmAppMixin, FillCheckMixin):
+class App(FarmAppMixin, FillCheckMixin, NavMixin):
     HAS_EARNINGS = True  # stocks report earnings (the earnings guard, rule and calendar)
     def __init__(self, root, tray=False):
         self.cores = CoreRunner(enabled=lambda: bool(self.settings.get("study_cores", True)))  # studies on other cores
@@ -1972,6 +1973,7 @@ class App(FarmAppMixin, FillCheckMixin):
         nb.add(ts, text="  \u26a1 Scalpers  ")
         nb.add(tm, text="  Markets  ")
         nb.add(tt, text="  Trades  ")
+        self.root.after(0, self.build_nav)  # Home and the section rail (farmcore), once the window is built
         # Markets = watchlist + live prices; Trades = trades + what the bot did + the strategy scoreboard
         self.subnb = {}
         for outer, names in ((tm, ("Watchlist", "Live prices")), (tt, ("Trades", "What the bot did", "Strategy scoreboard"))):
