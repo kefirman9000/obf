@@ -10411,8 +10411,12 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                        "pretend money.")
             self.wild_msg = msg
             if msg != self.last_wild_msg:
-                self.write(msg)
                 self.last_wild_msg = msg
+                gist = msg.split(":")[0]
+                seen = self.__dict__.setdefault("_wild_said", {})
+                if time.time() - seen.get(gist, 0) > 600:
+                    seen[gist] = time.time()
+                    self.write(msg)
             return
         if n:
             info = self.tourn.info[id(top)]
@@ -10429,8 +10433,14 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             msg = "Wildcard is still learning from recent prices."
         self.wild_msg = msg
         if msg != self.last_wild_msg:
-            self.write(msg)
             self.last_wild_msg = msg
+            # the line under the top keeps up live; the log hears about the same kind of news once every 10 minutes
+            # (the stand-ins change places minute to minute, which filled the log with the same sentence)
+            gist = msg.split(":")[0]
+            seen = self.__dict__.setdefault("_wild_said", {})
+            if time.time() - seen.get(gist, 0) > 600:
+                seen[gist] = time.time()
+                self.write(msg)
 
     def account_stops(self):
         """(stop, take, who decided) as fractions. With 'bot_stops' on in Wildcard, the account uses the
@@ -10653,6 +10663,20 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                                + (f" inside your contract price range ({rng})" if rng else "") + " with a tight enough "
                                "bid/ask gap.", "warn")
                 return
+            if now - cache[0] > 90:  # the chain is minutes old: check this contract's price now, or skip it
+                try:
+                    fq = E.option_quotes([real["symbol"]]).get(real["symbol"])
+                except Exception:
+                    fq = None
+                if fq and fq[1] > 0:
+                    real = dict(real, bid=fq[0], ask=fq[1])
+                ms = float(rules.get("max_spread_pct") or 0)
+                if not fq or (ms and not E.liquid(real, ms, 0)):
+                    if now - getattr(self, "_stale_note", 0) > 900:
+                        self._stale_note = now
+                        self.write(f"Skipped a {typ} on {t_}: its bid/ask gap right now is too wide (a far-out contract "
+                                   "loses most of its price the moment it's bought).", "warn")
+                    return
             K, exp = real["K"], real["exp"]
             o = dict(type=typ, K=K, exp=exp, symbol=real["symbol"])
             prem = real["ask"] * E.CONTRACT
