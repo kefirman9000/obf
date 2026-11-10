@@ -8,6 +8,17 @@
 
 
 
+
+## 1.34.1
+- **Fix: practice could buy a far-out contract at a stale price and lose most of it a minute later.** The contract
+  list practice picks from can be up to 30 minutes old; one AMD put was bought at that old $1.15 ask and the real
+  price a minute later was $0.33, so the safety stop sold it at -$82. Practice now checks the contract's price right
+  before buying when the list is over 90 seconds old, and skips it if the bid/ask gap is too wide.
+- **The stand-ins message no longer fills the log.** The stand-ins swap places minute to minute; the line under the
+  top still updates live, but the log says it once every 10 minutes.
+- **Farm doctor: Essentials only.** While it's on, Free roam and the other trainers are paused, so no bot can pass
+  exams and become proven; the doctor now says so, with a button to turn it off.
+
 ## 1.34.0
 - **Flexible prices for option buys on Alpaca** (the bots' own trades in ALPACA PAPER and LIVE, and the paper copies
   made with 'Both'). Instead of one limit order at the ask that expires if the price moves:
