@@ -6,6 +6,14 @@
 
 
 
+
+## 1.33.1
+- **More practice trades reach your Alpaca paper account.** With 'Both' on, a copy was placed as a limit order at the
+  ask OBF had just seen; when the price moved on during the wait, it never filled and the copy was skipped (about a
+  third of copies on one farm). A copy that doesn't fill now tries once more at the current ask plus 5%, so it fills
+  unless the market really ran away. (Paper sells already fell back to a market order.)
+- The report for Claude now says whether 'Both' is on and how many copies were placed and filled.
+
 ## 1.33.0
 - **Stand-ins while no bot is proven.** Until a proven bot is winning, the account no longer just waits: the 3 best
   winners trade it at half the normal size. Each must be winning right now, have 3+ finished trades, be ahead over
