@@ -3454,6 +3454,14 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             vb.pack(side="left")
             tb = ttk.Combobox(head, textvariable=kind, values=self.CHART_TYPES, width=7, state="readonly")
             tb.pack(side="left", padx=(4, 0))
+            typed = tk.StringVar()  # any ticker, not just the ones in the list: Enter shows it on this chart
+            te = tk.Entry(head, textvariable=typed, width=7, bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat",
+                          highlightthickness=1, highlightbackground=LINE)
+            te.pack(side="left", padx=(6, 0), ipady=2)
+            te.bind("<Return>", lambda e, vw=view, tv=typed: self.chart_typed(vw, tv))
+            tk.Button(head, text="Show", bg=CARD, fg=MUTED, relief="flat", bd=0, padx=4, cursor="hand2",
+                      command=lambda vw=view, tv=typed: self.chart_typed(vw, tv)).pack(side="left", padx=(2, 0))
+            Tip(te, "Type any ticker (like F or PFE) and press Enter to chart it here.")
             cv = tk.Canvas(pf, height=120, bg=CARD, highlightthickness=0)
             cv.pack(fill="both", expand=True)
             cv.bind("<Configure>", lambda e: self.later(self.draw_chart, 180))
@@ -3472,6 +3480,54 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 pass
         self.update_view_choices()
         self.draw_chart()
+
+    def chart_typed(self, view, typed):
+        """A ticker typed next to a chart: show it there. Tickers outside the session are downloaded (and kept fresh
+        while a chart shows them); the last few typed stay in the charts' lists."""
+        sym = typed.get().strip().upper().lstrip("$")
+        typed.set("")
+        if not sym:
+            return
+        if not E.valid_coin(sym):
+            return self.write(f"'{sym}' isn't a ticker the charts can show.", "bad")
+        mine = [x for x in (self.cfg.get("chart_tickers") or []) if x != sym]
+        if sym not in (self.session_coins or []):
+            self.cfg["chart_tickers"] = ([sym] + mine)[:8]
+        view.set(sym)
+        self.panels_changed()
+        if sym not in (self.session_coins or []):
+            self.fetch_chart_ticker(sym)
+
+    def fetch_chart_ticker(self, sym):
+        """Downloads a typed ticker's prices for the charts (in the background), at the session's candle size."""
+        ext = self.__dict__.setdefault("ext_px", {})
+        busy = self.__dict__.setdefault("_ext_busy", set())
+        if sym in busy or time.time() - (ext.get(sym) or {}).get("at", 0) < 55:
+            return
+        busy.add(sym)
+        gran = int(max(1, float(getattr(self, "session_bar", 0) or self.settings.get("bar_minutes", 1))) * 60)
+
+        def work():
+            try:
+                d = E.fetch_ohlcv(sym, gran, 2000, self.quote)
+                pts = list(zip(d.get("t") or [], d.get("c") or []))
+            except Exception:
+                pts = None
+
+            def done():
+                busy.discard(sym)
+                if pts:
+                    ext[sym] = dict(pts=pts, at=time.time())
+                    self.draw_chart()
+                elif sym not in ext:
+                    self.write(f"Couldn't load prices for {sym} (is it a real ticker?).", "bad")
+                    self.cfg["chart_tickers"] = [x for x in (self.cfg.get("chart_tickers") or []) if x != sym]
+                    for p in self.panels:
+                        if p["view"].get() == sym:
+                            p["view"].set("Account value")
+                    self.panels_changed()
+            self.q.put(("call", done))
+        threading.Thread(target=work, daemon=True).start()
 
     def panels_changed(self):
         specs = [dict(view=p["view"].get(), type=p["type"].get()) for p in self.panels]
@@ -3510,7 +3566,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
     def update_view_choices(self):
         coins = list(self.session_coins or [c for c, v in self.coin_vars.items() if v.get()])
-        vals = list(self.PANEL_VIEWS) + coins
+        vals = list(self.PANEL_VIEWS) + coins + [x for x in (self.cfg.get("chart_tickers") or []) if x not in coins]
         for p in self.panels:
             if list(p["box"].cget("values")) != vals:
                 p["box"].config(values=vals)
@@ -3582,6 +3638,12 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             series.append(("account", [(p[2], p[0]) for p in pts] if pts and len(pts[0]) >= 3 else [], ACCENT, 1))
             series.append(("Hall of Fame shadow", list(self.shadow_curve), "#f59e0b", 2))
             return series, marks, "$", None
+        if view not in (self.session_coins or []) and view in (self.cfg.get("chart_tickers") or []):
+            # a ticker typed next to the chart: its own prices, downloaded (refreshed about once a minute)
+            self.fetch_chart_ticker(view)
+            pts_ = (getattr(self, "ext_px", {}).get(view) or {}).get("pts") or []
+            series.append((view, list(pts_), coin_color(view) if self.cfg.get("chart_coin_colors", True) else ACCENT, 2))
+            return series, marks, "px", view
         if view == "Account value" or view not in (self.session_coins or []):
             if pts and len(pts[0]) < 3:  # older saved sessions have no times: space them by the refresh rate
                 step, now = max(1, int(self.settings["refresh"])), time.time()
