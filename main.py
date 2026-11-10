@@ -2888,6 +2888,12 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             pick = min(cands, key=lambda r: abs(r["exp"] - o["exp"]) / 86400 + abs(r["K"] - o["K"]) / max(o["K"], 1) * 100)
             r = E.alp_order(pick["symbol"], qty, "buy", limit=round(pick["ask"], 2))
             got, avg = self._wait_order(r["id"], max(5, int(self.settings.get("limit_wait", 20))))
+            if got <= 0:  # the ask moved on (a third of copies missed this way): once more at today's ask, a little above
+                q = E.option_quotes([pick["symbol"]]).get(pick["symbol"])
+                ask = q[1] if q and len(q) > 1 and q[1] > 0 else pick["ask"]
+                limit = round(max(ask, pick["ask"]) * 1.05 + 0.01, 2)
+                r = E.alp_order(pick["symbol"], qty, "buy", limit=limit)
+                got, avg = self._wait_order(r["id"], max(10, int(self.settings.get("limit_wait", 20))))
             if got <= 0:
                 return self.q.put(("call", lambda: self._mirror_done(c, None, reason, "the order didn't fill in time")))
             rec = dict(symbol=pick["symbol"], qty=int(got), avg=avg, cost=got * avg * E.CONTRACT, K=pick["K"], exp=pick["exp"],
@@ -5192,7 +5198,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                                                 start_cash=self.start_cash, cash=round(self.cash, 2), positions=dict(self.pos),
                                                 options=self.opt, trades=len(self.trades), coins=self.session_coins,
                                                 bar_minutes=self.session_bar, logged_in=bool(self.client)),
-            settings=self._scrub(dict(self.settings)), switches=self._scrub({k: self.cfg.get(k) for k in self.cfg if k.endswith("_on")}),
+            settings=self._scrub(dict(self.settings)), switches=self._scrub({k: self.cfg.get(k) for k in self.cfg if k.endswith("_on") or k in ("mirror_paper", "auto_camp", "essentials")}),
+            paper_copies=dict(on=self.mirror_on(), placed=len(getattr(self, "mirror_trades", []) or []), fills=self.fill_stats()),
             farms=farms, free_roam=dict(on=bool(self.cfg.get("roam_on")), studies=getattr(self, "roam_n", 0),
                                         days_trained=sorted(getattr(self, "roam_days", set()) or []),
                                         holidays=sorted(getattr(self, "roam_dead", set()) or []),
