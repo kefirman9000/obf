@@ -10,6 +10,18 @@
 
 
 
+## 1.36.0
+Changes from what Free roam found (your settings move once to the new values; change them back in Settings if you like):
+- **Scalpers.** They kept losing about 8% on premium, mostly to the bid/ask gap. Now: 10% of the farm (was 25%),
+  they skip contracts whose gap is wider than 3% (was 8%), and a scalper may trade your account (or stand in) only
+  after **2 winning exam days at real option prices** (Settings > Scalp breed; 0 = no extra test). They keep
+  learning on the farm meanwhile.
+- **Adaptive stops off by default.** Its tests leaned against it (-13% with it vs -5% without). Bots carrying it drop
+  it. Free roam keeps testing it on vs off, so 'What learning is worth' will show if it earns its place back.
+- **Hindsight eggs.** At most 20% of new eggs (was up to 60%), down to 5% while few hold up. Instincts whose eggs did
+  well afterwards (Bollinger bands, SMA crossover) now hatch most of them. A hindsight egg that loses its first exam
+  is retired instead of sitting in Rising.
+
 ## 1.35.0
 - **Ticker rotation.** The bots no longer stay on the same tickers forever. Once a day, about 15 minutes after the
   open, the bot looks over about 70 busy tickers, now including cheap ones whose options a small account can really

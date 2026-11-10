@@ -84,10 +84,13 @@ def strat_signal(name, p, n, params, tf=1, x=None):
 def feature_candidates(settings, keys):
     """The learning switches (from `keys`) that are on and actually change how a practice farm learns."""
     base = tournament_opts(settings)
-    out = [k for k in keys if k not in FEATURE_SKIP and settings.get(k) is True
-           and tournament_opts(dict(settings, **{k: False})) != base]
+    out = [k for k in keys if k not in FEATURE_SKIP and (settings.get(k) is True or (k in FEATURE_RETEST and settings.get(k) is False))
+           and tournament_opts(dict(settings, **{k: not settings.get(k)})) != base]
     tournament_opts(settings)  # (it also sets a few shared values: put them back)
     return out
+
+
+FEATURE_RETEST = ("adapt_exits",)  # switched off by default, but Free roam keeps testing them (on vs off) in case they earn it back
 
 
 def feature_test(closes, extra, settings, key, make_opts, seed=None, progress=None, **train_kw):
@@ -95,7 +98,7 @@ def feature_test(closes, extra, settings, key, make_opts, seed=None, progress=No
     settings are, once with `key` switched off. -> dict(key, on, off) (exam scores, see farm_pick_score), with
     on/off None when that run's picks didn't trade enough to judge."""
     out = dict(key=key)
-    for i, (arm, s) in enumerate((("on", settings), ("off", dict(settings, **{key: False})))):
+    for i, (arm, s) in enumerate((("on", dict(settings, **{key: True})), ("off", dict(settings, **{key: False})))):
         def prog(done, total, text, i=i):
             if progress:
                 progress(i * total + done, 2 * total, f"run {i + 1} of 2 ({'with' if i == 0 else 'without'} it): {text}")
@@ -1581,7 +1584,7 @@ DEFAULT_SETTINGS = {
     "learn_losses": True,        # a bot takes on a never-rule itself when that rule would have stopped several of its losses
     "post_review": True,         # after losing trades the farm notes which never-rule would have helped, and tries those more
     "islands": 3,                # separate sub-farms that only swap a champion now and then (1 = one big farm)
-    "adapt_exits": True,         # bots can evolve stops and targets that widen in wild markets and tighten in calm ones
+    "adapt_exits": False,        # (off by default since 1.36: Free roam's tests leaned against it; still tested) bots can evolve stops and targets that widen in wild markets and tighten in calm ones
     "mut_memory": True,          # the farm remembers which kinds of change make winners and does more of those
     "multicore": True,           # warm up the islands on several processor cores at once
     "shadow_live": True,         # follow your Hall of Fame bots with pretend money in real time (Shadow Live)
@@ -1632,8 +1635,8 @@ DEFAULT_SETTINGS = {
     "kamikazes": True,           # the kamikaze breed: all-or-nothing bets on cheap contracts, and the farm's rule testers
     "kami_share": 10,            # % of the farm kept for kamikazes (they have only a small say in your account)
     "scalpers": True,            # the scalp breed: fast in-and-out bots (tight stop + target, time limit, flat by the close)
-    "scalp_share": 25,
-    "scalp_spread": 8.0,         # scalpers skip contracts whose bid/ask gap is wider than this % of the price           # % of the fast farm kept for scalpers (they can win up to twice that; needs 5-min bars or faster)
+    "scalp_share": 10,
+    "scalp_spread": 3.0,         # scalpers skip contracts whose bid/ask gap is wider than this % of the price           # % of the fast farm kept for scalpers (they can win up to twice that; needs 5-min bars or faster)
     "min_hold_min": 0.0,         # account: minutes to hold before a strategy signal may sell (stops still sell)
     "fee_aware": True,           # don't sell for a profit smaller than the round-trip fees (losses and stops still sell)
     "max_trades_hour": 30,       # brake: most signal trades the account may make in an hour (0 = no limit)
@@ -1671,6 +1674,8 @@ STYLES = {  # risk presets: trade size, stop / target on the premium, daily limi
 }
 
 
+DEFAULT_SETTINGS["defaults_rev"] = 2  # bumped when a default changes on purpose for everyone (see merge_settings)
+DEFAULT_SETTINGS["scalp_real_exams"] = 2  # scalpers trade the account only after this many winning exam days at real option prices
 DEFAULT_SETTINGS.update(LIMIT_DEFAULTS)  # account-wide safety limits (farmcore)
 
 
@@ -1684,6 +1689,12 @@ def merge_settings(saved):
                     s["params"][n].update({pk: pv for pk, pv in pp.items() if pk in s["params"][n]})
         elif k in s:
             s[k] = v
+    if saved and int(saved.get("defaults_rev", 1) or 1) < 2:
+        # 1.36: Free roam showed scalpers losing to the bid/ask spread and Adaptive stops leaning harmful
+        s["adapt_exits"] = False
+        s["scalp_share"] = min(_numor(s.get("scalp_share"), 10), 10)
+        s["scalp_spread"] = min(_numor(s.get("scalp_spread"), 3.0), 3.0)
+    s["defaults_rev"] = DEFAULT_SETTINGS["defaults_rev"]
     s["size_mult"] = dict(s.get("size_mult") or {})
     s["extra_coins"] = [c for c in (s.get("extra_coins") or []) if isinstance(c, str) and valid_coin(c)]
     if s["order_type"] not in ("market", "limit"):
@@ -1693,6 +1704,13 @@ def merge_settings(saved):
     except (TypeError, ValueError):
         s["bar_minutes"] = 1
     return s
+
+
+def _numor(x, default):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
 
 
 def valid_coin(c):
@@ -2244,12 +2262,17 @@ def tournament_opts(settings):
                 ctx=[c for c in (settings.get("ctx_tickers") or []) if valid_coin(c)] if settings.get("ctx_studies", True) else [],
                 post_review=bool(settings.get("post_review", True)), learn_losses=bool(settings.get("learn_losses", True)),
                 time_habits=bool(settings.get("time_habits", True)), agree_sizing=bool(settings.get("agree_sizing", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
-                adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
+                adapt_exits=bool(settings.get("adapt_exits", True)), scalp_real_exams=int(_numor(settings.get("scalp_real_exams", 2), 2)), mut_memory=bool(settings.get("mut_memory", True)),
                 proven_only=bool(settings.get("proven_only", True)), keep_veterans=bool(settings.get("keep_veterans", True)), keep_variety=bool(settings.get("keep_variety", True)), proven_exam=bool(settings.get("proven_exam", True)),
                 proven_trades=int(settings.get("proven_trades", 8) or 0),
                 standin_n=int(settings.get("standin_n", 3) or 0), standin_size=float(settings.get("standin_size", 0.5) or 0.5),
                 proven_kamikazes=bool(settings.get("proven_kamikazes", False)),
                 prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0], sspread=_set_scalp_spread(settings))
+
+
+def real_exam_wins(v):
+    """Exam days this bot made money on, priced from real option history (not estimated)."""
+    return sum(1 for x in (getattr(v, "exams", None) or []) if x.get("real") and x.get("n", 0) > 0 and x.get("edge", 0) > 0)
 
 
 def scalp_share(settings):
@@ -3364,7 +3387,8 @@ class Tournament(FarmMixin):
                  and not ((e.get("fwd") or [0, 0])[0] >= 12 and (e.get("fwd") or [0, 0])[1] == 0)]
         if not cands or not self.o.get("hindsight", True):
             return None
-        n, e = self.rng.choices(cands, weights=[(x["wins"] + 1) / (x["tries"] + 2) * self.hindsight_fwd(x) * 2
+        # how its eggs did afterwards counts most (squared): instincts whose eggs hold up hatch most of them
+        n, e = self.rng.choices(cands, weights=[(x["wins"] + 1) / (x["tries"] + 2) * (self.hindsight_fwd(x) * 2) ** 2
                                                  for _, x in cands])[0]
         g = json.loads(json.dumps(self.rng.choice(e["best"][:3])["genes"]))
         g["params"] = self.mutate(n, g["params"], 0.15)
@@ -3392,14 +3416,27 @@ class Tournament(FarmMixin):
         if not ok and e.get("best") and f[0] >= 3 and f[1] * 3 < f[0]:
             e["best"] = e["best"][1:]  # its lessons keep failing later on: drop the top one, try the next
 
+    def hindsight_exam(self, v):
+        """Just after an exam: a hindsight egg (not proven, not trading) that failed its first exam with trades is
+        retired, so it doesn't sit in Rising for days. -> True if it was retired."""
+        if v not in self.vars or getattr(v, "origin", None) != "hindsight" or self.proven(v):
+            return False
+        ex = [x for x in (getattr(v, "exams", None) or []) if x.get("n", 0) > 0]
+        if len(ex) != 1 or ex[0]["edge"] > 0:
+            return False
+        self.grade_hindsight(v, False)
+        self._remove(v, "retired: a hindsight egg that lost on its first exam")
+        return True
+
     def hindsight_share(self):
-        """Share of new eggs hatched from the hindsight book: 60% while its eggs hold up, down to 20% if they don't."""
+        """Share of new eggs hatched from the hindsight book: 20% while its eggs hold up (1 in 4 doing well later),
+        down to 5% if they don't."""
         book = getattr(self, "hindsight", {}) or {}
         n = sum((e.get("fwd") or [0, 0])[0] for e in book.values())
         w = sum((e.get("fwd") or [0, 0])[1] for e in book.values())
         if n < 5:
-            return 0.6
-        return min(0.6, max(0.2, 0.6 * (w / n) / 0.5))
+            return 0.2
+        return min(0.2, max(0.05, 0.2 * (w / n) / 0.25))
 
     # ---- the scalp breed ----
     def scalp_target(self):
@@ -3846,6 +3883,11 @@ class Tournament(FarmMixin):
         extra (optional): coin -> {'h': highs, 'l': lows, 'v': volumes}, lined up with the closes."""
         self.n += 1
         self.xfull = extra
+        if not self.o.get("adapt_exits", True):  # switched off: bots already carrying the trait drop it too
+            for v in self.vars:
+                if v.traits.get("adapt"):
+                    v.traits.pop("adapt", None)
+                    v.adapt_k.clear()
         self._market(closes)
         for k in set(self.coins) | set(self.cool) | set(self.add_cool):
             self.cool[k] = max(0, self.cool.get(k, 0) - 1)
@@ -4072,6 +4114,12 @@ class Tournament(FarmMixin):
             gaps.append(f"a lifetime profit (now {lf['ret'] * 100:+.1f}%)")
         elif lf["edge"] is not None and lf["edge"] <= 0:
             gaps.append(f"to beat just holding (now {lf['edge'] * 100:+.1f}% vs holding)")
+        need_r = int(self.o.get("scalp_real_exams", 2) or 0)
+        if is_scalp(v.name) and need_r > 0:
+            got = real_exam_wins(v)
+            if got < need_r:
+                gaps.append(f"{need_r - got} more winning exam day{'s' if need_r - got != 1 else ''} at real option prices"
+                            " (scalpers)")
         if self.o.get("proven_exam", True) and not kami:  # (kamikazes aren't examined: their record is their proof)
             verdict, d = exam_verdict(v, self.serial)
             if verdict == "failed":
@@ -4096,7 +4144,8 @@ class Tournament(FarmMixin):
         standin = False
         if gate and not active:
             # nobody is proven yet: the best few winners stand in, at a smaller size, until one is
-            active = self.standins(keep)
+            need_r = int(self.o.get("scalp_real_exams", 2) or 0)  # scalpers stand in only once they've shown it at real prices
+            active = self.standins(lambda v: keep(v) and (not is_scalp(v.name) or real_exam_wins(v) >= need_r))
             standin = bool(active)
         self.standin_on = standin
         slowed = [] if gate else [v for v in self.slowed if keep(v)]

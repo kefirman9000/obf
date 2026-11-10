@@ -210,6 +210,8 @@ SETTING_GROUPS = [
         ("scalp_share", "...% of the farm kept for scalpers (they can win up to twice that, never over 60%)", int),
         ("scalp_spread", "...scalpers skip contracts whose bid/ask gap is wider than this % of the price (Practice uses "
                          "the real gaps it reads from each ticker's live option quotes)", float),
+        ("scalp_real_exams", "...winning exam days at REAL option prices a scalper needs before it may trade your "
+                             "account (0 = no extra test)", int),
         (None, "Rules a bot can grow", "head"),
         ("layers", "Studies: several reasons to buy, several reasons not to, exit studies and sizing", bool),
         ("htf_studies", "Bigger-trend study: a slower timeframe must agree before buying", bool),
@@ -217,7 +219,8 @@ SETTING_GROUPS = [
         ("ctx_tickers", "Tickers the bots WATCH but never trade, separated by commas (VIXY stands in for the VIX index, "
                         "which isn't in the free data feed)", "tickers"),
         ("vetoes", "Never-rules: things a bot refuses to do, each graded in hindsight", bool),
-        ("adapt_exits", "Adaptive stops: wider in wild markets, tighter in calm ones", bool),
+        ("adapt_exits", "Adaptive stops: wider in wild markets, tighter in calm ones (off by default: Free roam's "
+                        "tests leaned against it; it keeps testing it)", bool),
         ("luck_check", "Luck check: a bot's great score counts for less while it rests on only a few trades", bool),
         ("exam_gate", "Exams: bots are tested on days they never trained on; failing keeps them out of BEASTS", bool),
         ("cond_aware", "Right bot for the moment: each bot's say follows its record in today's conditions", bool),
@@ -1331,6 +1334,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                         if v in t.vars:
                             E.add_exam(v, "self-test", r["edge"] * 100, r.get("closed", r["trades"]), info["start"], info["gran"])
                             done.append(f"{nm} {r['edge'] * 100:+.1f}% vs holding")
+                            if t.hindsight_exam(v):
+                                done[-1] += " (a hindsight egg: retired)"
                     if done:
                         t._rate()
                         self.write("Exams on prices they never saw (" + self._when(info["start"], True) + "): "
@@ -7542,6 +7547,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                         # unseen prices (a first visit), its own candles: an exam
                         E.add_exam(v, "self-test", r["edge"] * 100, r.get("closed", r["trades"]), info["start"], info["gran"])
                         taught["exams"] += 1
+                        if t.hindsight_exam(v):
+                            self.write(f"Retired {E.bot_nickname(v.key())}: a hindsight egg that lost on its first exam.")
                 res.append((E.bot_nickname(v.key()), round(r["ret"] * 100, 2), r["trades"], round(r["ret"] * 100, 2),
                             r.get("closed", 0), r.get("wins", 0), r.get("best_trade"), r.get("worst_trade")))
             good = sum(1 for x in res if x[1] > 0)
@@ -7745,6 +7752,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 self.scan_done(res)  # today's live results also fill the Scalp scan tab
             by_uid = {v.uid: v for v in t.vars}
             rows = []
+            rf0 = sum(x.get("real", 0) for x in res["tickers"].values())
+            ef0 = sum(x.get("est", 0) for x in res["tickers"].values())
+            real_day = bool(books) and rf0 + ef0 > 0 and rf0 / (rf0 + ef0) >= 0.5  # mostly real option prices
             for g in allg:
                 b = res["bots"].get(g["uid"]) or [0, 0, 0.0, 0.0]
                 pct = b[2] / b[3] * 100 if b[3] else 0.0
@@ -7756,6 +7766,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                     if exam and not E.is_kami(v):  # a held-back day: an exam, and nothing is learned from it
                         if b[0]:
                             E.add_exam(v, "day", pct, b[0], day.isoformat(), 60)
+                            if real_day:
+                                v.exams[-1]["real"] = True  # counts toward a scalper's real-price exams
                         continue
                     if b[0] >= 8 and b[2] > 0:  # a scalper that paid on a day it never saw: an elder for future eggs
                         t.elders.append(dict(name=v.name, params=dict(v.params), tf=v.tf, edge=b[2] / b[3]))
