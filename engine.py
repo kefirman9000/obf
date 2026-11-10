@@ -1651,6 +1651,8 @@ DEFAULT_SETTINGS = {
     "order_type": "market",      # (options always use limit orders at the bid / ask; kept for old settings files)
     "maker_fee_pct": 0.4,        # fee for limit orders that rest on the book (Practice)
     "limit_wait": 20,            # seconds a limit order may wait for a fill
+    "rotate_tickers": True,      # once a day the bot may swap a ticker whose options don't fit for one that does
+    "rotate_max": 2,             # ...at most this many swaps a day
     "market_liquid": True,       # Alpaca paper: busy contracts with a tight bid/ask are bought with a market order
     "liquid_volume": 500,        # ...contracts traded today for a contract to count as busy
     "chase_pct": 3.0,            # limit buys start at the middle of bid/ask and may step up to this % over the ask
@@ -3357,7 +3359,9 @@ class Tournament(FarmMixin):
     def hindsight_genes(self):
         """Genes for a new egg from the hindsight book (weighted by how often each instinct would have worked), or None."""
         book = getattr(self, "hindsight", {}) or {}
-        cands = [(n, e) for n, e in book.items() if e["best"] and n in STRATS and n in WILDCARD_STRATS]
+        cands = [(n, e) for n, e in book.items() if e["best"] and n in STRATS and n in WILDCARD_STRATS
+                 # an instinct whose hindsight eggs never once held up afterwards (12+ tries) hatches no more of them
+                 and not ((e.get("fwd") or [0, 0])[0] >= 12 and (e.get("fwd") or [0, 0])[1] == 0)]
         if not cands or not self.o.get("hindsight", True):
             return None
         n, e = self.rng.choices(cands, weights=[(x["wins"] + 1) / (x["tries"] + 2) * self.hindsight_fwd(x) * 2
@@ -5486,11 +5490,16 @@ def scan_scalps(job):
 POPULAR = ["SPY", "QQQ", "IWM", "DIA", "AAPL", "NVDA", "TSLA", "AMD", "MSFT", "AMZN", "META", "GOOGL", "NFLX", "PLTR",
            "COIN", "MSTR", "SMCI", "AVGO", "BA", "JPM", "BAC", "XOM", "INTC", "UBER", "SOFI", "RIVN", "GME", "SNOW",
            "SHOP", "DIS", "NIO", "F", "GLD", "SLV", "TLT", "XLF", "XLE", "ARKK", "SOXL", "TQQQ"]
+# busy stocks whose options are cheap enough for a small account (a contract near the price costs tens of dollars,
+# not thousands): what the bots can really buy with a $100 trade
+AFFORDABLE = ["F", "PFE", "T", "VZ", "BAC", "WFC", "C", "KO", "CSCO", "GM", "AAL", "CCL", "SNAP", "HOOD", "LCID", "WBD",
+              "KMI", "MARA", "RIOT", "PINS", "PYPL", "DKNG", "NU", "CLF", "KVUE", "GRAB", "SIRI", "PCG", "JBLU", "CHWY"]
+UNIVERSE = list(dict.fromkeys(POPULAR + AFFORDABLE))
 
 
 def list_products(quote="USD", symbols=None):
     """[{coin, price, change_24h, volume_usd}] for popular optionable tickers (or the ones given), busiest first."""
-    syms = list(symbols or POPULAR)
+    syms = list(symbols or UNIVERSE)
     out = []
     for k in range(0, len(syms), 100):
         q = urllib.parse.quote(",".join(syms[k:k + 100]))
