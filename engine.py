@@ -566,7 +566,8 @@ def option_chain(under, exp_from=None, exp_to=None, typ=None, strike_lo=None, st
             lq, lt, g = sn.get("latestQuote") or {}, sn.get("latestTrade") or {}, sn.get("greeks") or {}
             out.append(dict(symbol=sym, under=p_[0], exp=p_[1], type=p_[2], K=p_[3], bid=float(lq.get("bp") or 0),
                             ask=float(lq.get("ap") or 0), last=float(lt.get("p") or 0), iv=sn.get("impliedVolatility"),
-                            delta=g.get("delta"), gamma=g.get("gamma"), theta=g.get("theta"), vega=g.get("vega")))
+                            delta=g.get("delta"), gamma=g.get("gamma"), theta=g.get("theta"), vega=g.get("vega"),
+                            vol=int((sn.get("dailyBar") or {}).get("v") or 0)))
         token = d.get("next_page_token")
         pages += 1
         if not token:
@@ -1650,6 +1651,9 @@ DEFAULT_SETTINGS = {
     "order_type": "market",      # (options always use limit orders at the bid / ask; kept for old settings files)
     "maker_fee_pct": 0.4,        # fee for limit orders that rest on the book (Practice)
     "limit_wait": 20,            # seconds a limit order may wait for a fill
+    "market_liquid": True,       # Alpaca paper: busy contracts with a tight bid/ask are bought with a market order
+    "liquid_volume": 500,        # ...contracts traded today for a contract to count as busy
+    "chase_pct": 3.0,            # limit buys start at the middle of bid/ask and may step up to this % over the ask
     "limit_fallback": True,      # if a limit order does not fill in time, use a market order instead
     # Alerts
     "alert_discord": "", "alert_tg_token": "", "alert_tg_chat": "",

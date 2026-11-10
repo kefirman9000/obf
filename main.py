@@ -261,6 +261,11 @@ SETTING_GROUPS = [
     ]),
     ("Orders", "How orders are placed, and the extra costs Practice mode pretends to pay.", [
         ("limit_wait", "Limit orders: seconds to wait for a fill", int),
+        ("chase_pct", "Flexible prices: an option buy starts at the middle of the bid and ask, then steps up to the ask "
+                      "and at most this % above it before giving up (0 = only ever the ask)", float),
+        ("market_liquid", "Market orders on Alpaca paper when a contract is busy (tight bid/ask and plenty traded today): "
+                          "they fill at once. Real money always uses limit orders", bool),
+        ("liquid_volume", "...contracts traded today for a contract to count as busy", int),
         ("max_trades_hour", "Brake: at most this many strategy trades per hour (0 = no limit). Safety stops always run", int),
         ("trade_hours", "Trading hours: the account only makes strategy trades in these hours, like 9-17 or 22-6 "
                         "(empty = any time). The bots keep learning and safety stops always run", str),
@@ -2873,6 +2878,34 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         self.mirror[c] = dict(pending=True)
         self.executor.submit(self._mirror_open, c, dict(o), int(qty), reason)
 
+    def smart_buy(self, row, qty, paper):
+        """Buys `qty` of an option row on Alpaca with flexible pricing. A busy contract (tight bid/ask, plenty traded
+        today) on a PAPER account gets a market order. Otherwise the limit starts at the middle of the bid and ask,
+        steps up to the ask, then to a fresh ask plus up to chase_pct %, each step waiting its share of limit_wait.
+        Real money never uses a market order. -> (contracts bought, average price a share)"""
+        sym, bid, ask = row["symbol"], float(row.get("bid") or 0), float(row["ask"])
+        wait = max(6, int(self.settings.get("limit_wait", 20)))
+        mid = (bid + ask) / 2 if bid > 0 else ask
+        gap = (ask - bid) / mid * 100 if bid > 0 and mid > 0 else 999
+        busy = (gap <= 5 or ask - bid <= 0.05) and int(row.get("vol") or 0) >= int(self.settings.get("liquid_volume", 500) or 0)
+        if paper and busy and self.settings.get("market_liquid", True):
+            r = E.alp_order(sym, qty, "buy")
+            got, avg = self._wait_order(r["id"], 30)
+            if got > 0:
+                return got, avg
+        chase = max(0.0, float(self.settings.get("chase_pct", 3.0) or 0)) / 100
+        steps = [(math.ceil(mid * 100) / 100, 0.3), (round(ask, 2), 0.4)] if bid > 0 and mid < ask - 0.005 else [(round(ask, 2), 0.6)]
+        for i, (px, share) in enumerate(steps + ([(None, 0.4)] if chase > 0 else [])):
+            if px is None:  # the last step: today's ask, a little above it
+                q = E.option_quotes([sym]).get(sym)
+                fresh = q[1] if q and len(q) > 1 and q[1] > 0 else ask
+                px = round(max(fresh, ask) * (1 + chase) + 0.01, 2)
+            r = E.alp_order(sym, qty, "buy", limit=px)
+            got, avg = self._wait_order(r["id"], max(4, int(wait * share)))
+            if got > 0:
+                return got, avg
+        return 0, 0.0
+
     def _mirror_open(self, c, o, qty, reason):
         """Buys the listed contract closest to the practice one (same type, nearest expiry and strike), same size."""
         try:
@@ -2886,14 +2919,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             if not cands:
                 raise RuntimeError("no listed contract near the practice one")
             pick = min(cands, key=lambda r: abs(r["exp"] - o["exp"]) / 86400 + abs(r["K"] - o["K"]) / max(o["K"], 1) * 100)
-            r = E.alp_order(pick["symbol"], qty, "buy", limit=round(pick["ask"], 2))
-            got, avg = self._wait_order(r["id"], max(5, int(self.settings.get("limit_wait", 20))))
-            if got <= 0:  # the ask moved on (a third of copies missed this way): once more at today's ask, a little above
-                q = E.option_quotes([pick["symbol"]]).get(pick["symbol"])
-                ask = q[1] if q and len(q) > 1 and q[1] > 0 else pick["ask"]
-                limit = round(max(ask, pick["ask"]) * 1.05 + 0.01, 2)
-                r = E.alp_order(pick["symbol"], qty, "buy", limit=limit)
-                got, avg = self._wait_order(r["id"], max(10, int(self.settings.get("limit_wait", 20))))
+            got, avg = self.smart_buy(pick, qty, paper=True)  # (a copy only ever goes to the paper account)
             if got <= 0:
                 return self.q.put(("call", lambda: self._mirror_done(c, None, reason, "the order didn't fill in time")))
             rec = dict(symbol=pick["symbol"], qty=int(got), avg=avg, cost=got * avg * E.CONTRACT, K=pick["K"], exp=pick["exp"],
@@ -11057,8 +11083,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 qty = 1
             if qty < 1:
                 raise RuntimeError(f"one contract costs ${ask * E.CONTRACT:,.0f}, more than this trade's size")
-            r = E.alp_order(pick["symbol"], qty, "buy", limit=round(ask, 2))
-            got, avg = self._wait_order(r["id"], max(5, int(self.settings.get("limit_wait", 20))))
+            got, avg = self.smart_buy(pick, qty, paper=bool(E.ALPACA.get("paper", True)))
             if got <= 0:
                 return self.q.put(("unfilled", ("buy", c, spend)))
             o = dict(type=typ, K=pick["K"], exp=pick["exp"], symbol=pick["symbol"], broker="alpaca")

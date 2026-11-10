@@ -7,6 +7,18 @@
 
 
 
+
+## 1.34.0
+- **Flexible prices for option buys on Alpaca** (the bots' own trades in ALPACA PAPER and LIVE, and the paper copies
+  made with 'Both'). Instead of one limit order at the ask that expires if the price moves:
+  - a **busy contract** (bid/ask gap within 5% or 5 cents, and at least 500 traded today) on your **paper**
+    account is bought with a **market order**, so it fills at once;
+  - otherwise the limit **starts at the middle of the bid and ask**, steps up to the ask, then to today's ask plus
+    up to 3%, each step taking its share of the limit wait.
+  - **Real money never uses a market order**; it gets the stepping limit only.
+  Settings > Flexible prices (how far above the ask, 0 = only ever the ask), Market orders on Alpaca paper when a
+  contract is busy (on), and how many contracts traded today count as busy (500).
+
 ## 1.33.1
 - **More practice trades reach your Alpaca paper account.** With 'Both' on, a copy was placed as a limit order at the
   ask OBF had just seen; when the price moved on during the wait, it never filled and the copy was skipped (about a
