@@ -9,6 +9,19 @@
 
 
 
+
+## 1.35.0
+- **Ticker rotation.** The bots no longer stay on the same tickers forever. Once a day, about 15 minutes after the
+  open, the bot looks over about 70 busy tickers, now including cheap ones whose options a small account can really
+  buy (F, PFE, T, VZ, BAC, KO, CSCO, GM, SNAP, HOOD and more), and swaps up to 2 of yours whose options don't fit its
+  trade size or barely move for ones that clearly fit better (at least 1.5x the score). It never drops a ticker the
+  account holds, and keeps one index ETF. The bots carry everything they've learned over; their open pretend
+  positions in a dropped ticker are closed, and 'the market' carries on from today's value over the new tickers.
+  A **Re-pick now** button next to Bot picks does it on demand. Settings > Ticker rotation (on), at most N a day (2).
+- **Bot picks** (choosing tickers for a new session) also looks at the cheaper tickers now.
+- **Hindsight eggs**: an instinct whose hindsight eggs never once held up afterwards (12+ tries, like Supertrend's
+  0 of 25 on one farm) hatches no more of them.
+
 ## 1.34.1
 - **Fix: practice could buy a far-out contract at a stale price and lose most of it a minute later.** The contract
   list practice picks from can be up to 30 minutes old; one AMD put was bought at that old $1.15 ask and the real

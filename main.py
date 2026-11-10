@@ -261,6 +261,11 @@ SETTING_GROUPS = [
     ]),
     ("Orders", "How orders are placed, and the extra costs Practice mode pretends to pay.", [
         ("limit_wait", "Limit orders: seconds to wait for a fill", int),
+        ("rotate_tickers", "Ticker rotation: once a day, about 15 minutes after the open, the bot looks over about 70 busy "
+                           "tickers (cheap ones like F, PFE, T, BAC too) and swaps one whose options don't fit its trade "
+                           "size or barely move for one that clearly fits better. It never drops a ticker the account "
+                           "holds", bool),
+        ("rotate_max", "...at most this many swaps a day", int),
         ("chase_pct", "Flexible prices: an option buy starts at the middle of the bid and ask, then steps up to the ask "
                       "and at most this % above it before giving up (0 = only ever the ask)", float),
         ("market_liquid", "Market orders on Alpaca paper when a contract is busy (tight bid/ask and plenty traded today): "
@@ -1692,6 +1697,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                                  cursor="hand2", font=("", 9, "bold"))
         self.ess_btn.pack(side="right", padx=(0, 8))
         self.build_doctor_button(header)
+        self.root.after(60000, self.rotate_tick)  # ticker rotation, once a day while the farm runs
         Tip(self.ess_btn, "Essentials only: switches off everything that downloads extra history or works the disk in "
                           "the background (Free roam, Auto camp, the Slow farm, the Scalp lab, background exams, the economic "
                           "calendar refresh, weekly backups). Normal trading and its prices keep running.")
@@ -1794,6 +1800,10 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         ab = ttk.Checkbutton(crow, text="Bot picks", variable=self.auto_coin_var, style="Card.TCheckbutton",
                              command=self.toggle_auto_coins)
         ab.pack(side="left", padx=(8, 0))
+        rp = ttk.Button(crow, text="Re-pick now", style="Plain.TButton", command=lambda: self.rotate_tickers(by_hand=True))
+        rp.pack(side="left", padx=(8, 0))
+        Tip(rp, "Swap the tickers whose options don't fit the bots for better ones right now (Wildcard, while running). "
+                "It also happens by itself once a day (Settings > Ticker rotation).")
         Tip(ab, "Wildcard only: when you start a new session, the bot scouts about 40 popular tickers and picks the best "
                 "for its money: busy, moving (up to a point), contracts that fit its trade size and tight option prices. "
                 "One place is kept for the best index ETF (SPY, QQQ, IWM, DIA). How many: Settings > Wildcard.")
@@ -15845,6 +15855,123 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         status = ttk.Label(b, foreground=MUTED)
         status.pack(side="right", padx=10)
         fill()
+
+    # ---------------- ticker rotation ----------------
+    def rotate_tick(self):
+        """Every 5 minutes: once a day, ~15 minutes after the open, re-scout the tickers (Settings > Ticker rotation)."""
+        try:
+            mkt = self.market if isinstance(self.market, dict) else {}
+            today = datetime.now().strftime("%Y-%m-%d")
+            if (self.settings.get("rotate_tickers", True) and self.running and self.wild and self.tourn is not None
+                    and self.seeded and mkt.get("is_open") and self.cfg.get("rotated_day") != today
+                    and not getattr(self, "_rotating", False) and not self.cfg.get("essentials")
+                    and E.minutes_to_close(time.time()) <= 375):
+                self.rotate_tickers()
+        except Exception:
+            self._record_error("ticker rotation")
+        if not self.closing():
+            self.root.after(300000, self.rotate_tick)
+
+    def rotate_tickers(self, by_hand=False):
+        """Scouts the busy tickers and swaps the session's worst-fitting ones (up to rotate_max) for clearly better
+        ones: options the bots can afford at their trade size, moving, busy, with a tight bid/ask."""
+        if not (self.session and self.wild and self.tourn is not None and self.seeded):
+            if by_hand:
+                messagebox.showinfo("Re-pick tickers", "Start a Wildcard session first: the bots pick tickers for a running farm.")
+            return
+        self._rotating = True
+        size = self.equity() * float(self.settings.get("trade_pct", 10)) / 100
+        cur = list(self.session_coins)
+        held = {tick_of(k) for k, q in self.pos.items() if q > 0} | {tick_of(k) for k in self.pending}
+
+        def work():
+            try:
+                prods = E.list_products(self.cur_quote(), symbols=list(dict.fromkeys(cur + list(E.UNIVERSE) + list(self.watchlist()))))
+                sc = {}
+                for d in prods:
+                    s_, w = E.scout_score(d, size)
+                    if (d.get("volume_usd") or 0) >= 5_000_000 or d["coin"] in cur:
+                        sc[d["coin"]] = (s_, w)
+                mine = sorted(((sc.get(c, (0.0, "no data"))[0], c) for c in cur if c not in held), key=lambda x: x[0])
+                etfs = [c for c in cur if c in E.INDEX_ETFS]
+                outs = [(s_, c) for s_, c in mine if not (c in E.INDEX_ETFS and len(etfs) <= 1)]
+                cands = sorted(((v[0], c) for c, v in sc.items() if c not in cur), reverse=True)
+                swaps = []
+                for s_old, old in outs[:max(0, int(self.settings.get("rotate_max", 2) or 0))]:
+                    if not cands:
+                        break
+                    s_new, new = cands[0]
+                    if s_new < 1.5 * max(s_old, 1e-9):
+                        break
+                    cands.pop(0)
+                    d = E.fetch_ohlcv(new, E.candle_gran(self.session_bar), 2000, self.quote)
+                    swaps.append((old, new, d, sc.get(old, (0, ""))[1], sc[new][1]))
+                self.q.put(("call", lambda: self._apply_rotation(swaps, by_hand)))
+            except Exception as e:
+                self.q.put(("call", lambda e=e: self._apply_rotation([], by_hand, str(e))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_rotation(self, swaps, by_hand, err=""):
+        self._rotating = False
+        self.cfg["rotated_day"] = datetime.now().strftime("%Y-%m-%d")
+        E.save_json(CONFIG_PATH, self.cfg)
+        if err:
+            return self.write(f"Ticker rotation couldn't scout today ({err}).", "warn")
+        if not swaps:
+            return self.write("Ticker rotation: your tickers still fit the bots best; nothing swapped." if by_hand else
+                              "Ticker rotation: the tickers still fit best today.", "info")
+        t, done = self.tourn, []
+        ref = self.session_coins[0]
+        times = list((self.hx.get(ref) or {}).get("t") or [])
+        for old, new, d, why_old, why_new in swaps:
+            if old not in self.session_coins or new in self.session_coins:
+                continue
+            if any(tick_of(k) == old and q > 0 for k, q in self.pos.items()) or any(tick_of(k) == old for k in self.pending):
+                continue  # the account bought it meanwhile: keep it
+            # line the new ticker's bars up with the session's (same minutes; a missing minute repeats the one before)
+            by_t = {tt: i for i, tt in enumerate(d.get("t") or [])}
+            cl, hh, ll, vv, last_i = [], [], [], [], None
+            for tt in times:
+                i = by_t.get(tt, last_i)
+                if i is None:
+                    i = 0
+                last_i = i
+                cl.append(d["c"][i]); hh.append(d["h"][i]); ll.append(d["l"][i]); vv.append(d["v"][i] if by_t.get(tt) is not None else 0.0)
+            if not times or len(cl) != len(self.hist.get(ref) or []):
+                continue
+            self.hist[new], self.hx[new] = cl, dict(h=hh, l=ll, v=vv, t=list(times))
+            self.session_coins = [new if c == old else c for c in self.session_coins]
+            self.hist.pop(old, None)
+            self.hx.pop(old, None)
+            self.last.setdefault(new, cl[-1])
+            done.append((old, new, why_old, why_new))
+        if not done:
+            return
+        t.align_coins(list(self.session_coins), dict(self.last))
+        # 'the market' carries on from today's value, split equally over the new tickers
+        if self.bench_units:
+            val = self.bench_equity()
+            share = val / len(self.session_coins)
+            self.bench_units = {c: share / (self.last.get(c) or self.hist[c][-1]) for c in self.session_coins}
+        try:
+            self.add_coins([n for _, n, _, _ in done])
+            for o_, n_, _, _ in done:
+                if o_ in self.coin_vars:
+                    self.coin_vars[o_].set(False)
+                if n_ in self.coin_vars:
+                    self.coin_vars[n_].set(True)
+            self.save_ticked()
+        except Exception:
+            pass
+        if self.worker_args:
+            self.worker_args = (list(self.session_coins),) + tuple(self.worker_args[1:])
+            self.launch_worker()
+        self.save_state(force=True)
+        self.save_farm()
+        for o_, n_, wo, wn in done:
+            self.write(f"\u21c4 Ticker rotation: swapped {o_} ({wo}) for {n_} ({wn}). The bots carry everything they've "
+                       "learned over; their open pretend positions in the old ticker were closed.", "good")
+        self.refresh_board()
 
     def scout_then_start(self):
         self.write(f"Scouting for {self.settings['auto_coins']} busy tickers that are moving...")
