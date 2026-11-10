@@ -10,6 +10,11 @@
 
 
 
+## 1.37.0
+- **Chart any ticker.** Each chart now has a small box next to its dropdowns: type a ticker (F, PFE, anything) and
+  press Enter or Show to chart it there. Tickers outside your session are downloaded and kept fresh about once a
+  minute while shown, and the last 8 you typed stay in the charts' dropdowns.
+
 ## 1.36.0
 Changes from what Free roam found (your settings move once to the new values; change them back in Settings if you like):
 - **Scalpers.** They kept losing about 8% on premium, mostly to the bid/ask gap. Now: 10% of the farm (was 25%),
