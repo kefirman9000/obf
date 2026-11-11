@@ -13053,7 +13053,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             if not lv:
                 return f"Learning from {n:,.0f} finished trades; no clear lesson yet (needs {E.LESSON_MIN}+ on each side)."
             short = {"side": lambda c: f"prefer {c}s", "maxotm": lambda c: f"stay within {c}% out",
-                     "exit": lambda c: "let stops/targets sell", "minhold": lambda c: f"hold {c}+ decisions"}
+                     "exit": lambda c: "let stops/targets sell", "minhold": lambda c: f"hold {c}+ decisions",
+                     "night": lambda c: "hold overnight" if c == 1 else "go flat before the close",
+                     "dte": lambda c: f"buy {c}+ days from expiry", "late": lambda c: f"don't open in the last {c} min"}
             return f"From {n:,.0f} trades: " + "; ".join(short[k](x[0]) for k, x in lv.items()) + "."
 
         def legend_status():
@@ -13098,8 +13100,10 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                                         "its finds; finds whose eggs don't hold up are dropped.",
              mine_status, s_("strategy_miner"), self.open_roam),
             ("\U0001f4d3", "Trade lessons", "The farm learns from its own finished trades: calls vs puts, how far out of "
-                                          "the money, selling on signals vs stops and targets, and how long it held. About "
-                                          "half the new eggs lean toward what worked; the rest keep testing the other way.",
+                                          "the money, selling on signals vs stops and targets, how long it held, holding "
+                                          "overnight or not, days to expiry, the hour it bought, and which instincts trade "
+                                          "best (they hatch more often). About half the new eggs lean toward what worked; "
+                                          "the rest keep testing the other way.",
              lesson_status, s_("trade_lessons"), lambda: self.open_knowledge()),
             ("\u265b", "Legends", "Bots that proved themselves are kept here for good when they leave the farm. Some new "
                                   "eggs hatch from them, elders' nudges include them, and the Strategy miner re-tests "

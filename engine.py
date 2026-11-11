@@ -1533,6 +1533,12 @@ def half_spread(c, prem_share):
     return min(0.5, (a + b * prem_share) / 2 / prem_share)
 
 
+def ny_hour(ts):
+    """The hour of the day in New York (0-23) at ts."""
+    d = datetime.fromtimestamp(ts, timezone.utc)
+    return (d - timedelta(hours=_ny_offset(d))).hour
+
+
 def minutes_to_close(ts):
     """Minutes from ts until 4 pm New York on that day (negative after the close, over 390 before the 9:30 open)."""
     d = datetime.fromtimestamp(ts, timezone.utc)
@@ -2153,6 +2159,8 @@ class OptionSim(Sim):
             self.too_far = getattr(self, "too_far", 0) + 1
             return False
         self.opt[c]["otm0"] = round(dist, 2)  # how far out it was when bought (for the farm's trade lessons)
+        self.opt[c]["t0"] = self.now  # when it was bought, and how many days it had left (for the lessons too)
+        self.opt[c]["dte0"] = round((self.opt[c]["exp"] - self.now) / 86400, 1)
         slip = self.slip
         rs = self._real_slip(c, self.opt[c], prem)
         if rs is not None:  # a real contract on a past day: buys pay the ask (its real bid/ask gap), for every bot
@@ -2227,7 +2235,8 @@ class OptionSim(Sim):
         proceeds = q * fill * (1 - (0 if expired else self.fee)) - (0 if expired else q * CONTRACT_FEE[0])
         self.fees += 0 if expired else q * prem * slip + q * fill * self.fee + q * CONTRACT_FEE[0]
         self.cash += proceeds
-        self.last = dict(side="sell", coin=c, qty=q, price=fill, usd=proceeds, pl=proceeds - self.cost.get(c, 0), contract=o)
+        self.last = dict(side="sell", coin=c, qty=q, price=fill, usd=proceeds, pl=proceeds - self.cost.get(c, 0), contract=o,
+                         at=self.now)
         self.pos[c], self.cost[c] = 0, 0
         self.opt.pop(c, None)
         self.tbars.append(n)
@@ -2383,6 +2392,9 @@ TRAITS = {
     "omode":   dict(lo=1, hi=3, kind=int, text=lambda v: {1: "calls only", 2: "puts only", 3: "calls and puts"}.get(int(v), "calls and puts")),
     "odte":    dict(lo=1, hi=60, kind=int, text=lambda v: f"buys contracts about {v} days from expiry"),
     "otm":     dict(lo=0.25, hi=12.0, kind=float, text=lambda v: f"strikes {v:g}% out of the money"),
+    "night":   dict(lo=1, hi=2, kind=int, text=lambda v: "holds overnight (no selling on its signals in the last 30 minutes; "
+                                                         "its stops still work)" if int(v) == 1 else
+                    "goes flat before the close (sells in the last 15 minutes)"),
     "maxotm":  dict(lo=2.0, hi=40.0, kind=float,
                     text=lambda v: f"never buys a contract over {v:g}% out of the money (skips the trade instead)"),
     "oexit":   dict(lo=1, hi=10, kind=int, text=lambda v: f"gets out {v} day{'s' if v != 1 else ''} before expiry"),
@@ -2401,6 +2413,7 @@ TRAIT_NAMES = {"trail": "Trailing stop", "maxhold": "Max hold", "minhold": "Min 
                "entries": "Max entries", "exit": "Stops-only exit", "moods": "Mood gate", "adapt": "Adaptive stops",
                "omode": "Calls / puts (1 calls, 2 puts, 3 both)", "odte": "Days to expiry", "otm": "% out of the money",
                "maxotm": "Farthest out it will buy (%)",
+               "night": "Overnight (1 holds overnight, 2 flat before the close)",
                "oexit": "Exit days before expiry", "flatby": "Flat before the close (minutes, scalpers)",
                "decay": "Decay exit (% a day)", "ivdrop": "Volatility-collapse exit (% drop)",
                "vixmode": "Volatility gate (1 calm, 2 rising, 3 spikes, 4 not spikes, 5 any)",
@@ -2848,6 +2861,8 @@ def bot_step(v, closes, n, coins, extra=None):
                     why = "expiry"
                 elif tr.get("flatby") and minutes_to_close(sim.now) <= tr["flatby"]:
                     why = "flat"  # scalpers never hold into the close
+                elif tr.get("night") == 2 and not tr.get("flatby") and minutes_to_close(sim.now) <= 15:
+                    why = "eod"  # this bot doesn't hold overnight
             k_ = 1.0
             if tr.get("adapt") and n % v.tf == 0:  # adaptive stops: scaled by today's swing vs this bot's usual swing
                 ser = tail_series(closes[c], v.tf, 21)
@@ -2881,7 +2896,8 @@ def bot_step(v, closes, n, coins, extra=None):
                             "trail": f"its trailing stop ({tr.get('trail', 0):g}%)", "time": "it held as long as it allows",
                             "decay": f"time decay was eating {tr.get('decay', 0):g}%+ of the contract a day",
                             "ivdrop": f"its volatility collapsed ({tr.get('ivdrop', 0):g}%+ since it bought)",
-                            "flat": f"scalpers are flat {tr.get('flatby', 0)} min before the close"}[why]
+                            "flat": f"scalpers are flat {tr.get('flatby', 0)} min before the close",
+                            "eod": "it goes flat before the close"}[why]
         if sim.last is None:
             if n % v.tf:  # between this bot's own decisions: no signal, no trade
                 v.sig[c] = None
@@ -2971,6 +2987,14 @@ def bot_step(v, closes, n, coins, extra=None):
                         s = None
             elif s == "sell" and tr.get("exit") and (v.risk["sl"] or v.risk["tp"] or tr.get("trail") or tr.get("maxhold")):
                 s = None  # this bot only leaves through its own exits
+            if s and tr.get("night") == 1 and sim.pos.get(c, 0) > 0 and getattr(sim, "now", None) \
+                    and minutes_to_close(sim.now) <= 30:
+                typ_ = ((sim.opt.get(c) or {}).get("type") if opt else "call")
+                if (s == "sell" and typ_ == "call") or (s == "buy" and typ_ == "put"):
+                    s = None  # holds overnight: its signals don't sell it this close to the close (stops still do)
+            if s and tr.get("night") == 2 and sim.pos.get(c, 0) <= 0 and getattr(sim, "now", None) \
+                    and minutes_to_close(sim.now) <= 20:
+                s = None  # flat before the close: nothing new this late (it would have to be sold right away)
             elif s == "sell" and tr.get("minhold") and n - v.since.get(c, n) < tr["minhold"] * v.tf:
                 s = None  # this bot holds for a while before its strategy may sell (its stops still work)
             elif s == "sell" and v.fee_guard and sim.pos.get(c, 0) > 0 and not opt:
@@ -3603,6 +3627,16 @@ class Tournament(FarmMixin):
         if d is not None:
             keys.append("dist:" + ("0-5" if d < 5 else "5-15" if d < 15 else "15-30" if d < 30 else "30+"))
         keys.append("exit:" + exit_kind(t.get("why")))
+        t0, t1 = ct.get("t0"), t.get("at")
+        if t0 and t1 and t1 >= t0:
+            keys.append("night:" + ("over" if ny_date(t0) != ny_date(t1) else "same"))
+            h0 = ny_hour(t0)
+            keys.append("open:" + ("9" if h0 <= 9 else "10-11" if h0 <= 11 else "12-13" if h0 <= 13 else "14-15"))
+        d0 = ct.get("dte0")
+        if d0 is not None:
+            keys.append("dte:" + ("0-3" if d0 <= 3 else "4-10" if d0 <= 10 else "11+"))
+        if t.get("strat"):
+            keys.append("strat:" + t["strat"])
         h = t.get("held")
         if h is not None:
             keys.append("hold:" + ("0-15" if h < 15 else "15-60" if h < 60 else "60-240" if h < 240 else "240+"))
@@ -3652,6 +3686,17 @@ class Tournament(FarmMixin):
         if q[0] >= N and rest[0] >= N and rest[1] - q[1] >= GAP:
             out["minhold"] = (15, f"trades held under 15 decisions averaged {q[1]:+.1f}% ({q[2] * 100:.0f}% won); "
                                   f"held 15-240, {rest[1]:+.1f}%")
+        ov, sd = self._lesson("night:over"), self._lesson("night:same")
+        if ov[0] >= N and sd[0] >= N and abs(ov[1] - sd[1]) >= GAP:
+            hold = ov[1] > sd[1]
+            out["night"] = (1 if hold else 2, f"held overnight: {ov[1]:+.1f}% a trade ({ov[2] * 100:.0f}% won, {ov[0]:.0f} trades); "
+                                              f"sold the same day: {sd[1]:+.1f}% ({sd[2] * 100:.0f}% won, {sd[0]:.0f})")
+        sh, lg = self._lesson("dte:0-3"), self._lesson("dte:4-10", "dte:11+")
+        if sh[0] >= N and lg[0] >= N and lg[1] - sh[1] >= GAP:
+            out["dte"] = (7, f"contracts bought 3 days or less from expiry averaged {sh[1]:+.1f}%; with more time, {lg[1]:+.1f}%")
+        late, early = self._lesson("open:14-15"), self._lesson("open:9", "open:10-11", "open:12-13")
+        if late[0] >= N and early[0] >= N and early[1] - late[1] >= GAP:
+            out["late"] = (60, f"trades opened after 2 pm averaged {late[1]:+.1f}%; opened earlier, {early[1]:+.1f}%")
         return out
 
     def lesson_traits(self, t):
@@ -3669,7 +3714,34 @@ class Tournament(FarmMixin):
             t["exit"] = 1
         if "minhold" in lv and "minhold" not in t and self.rng.random() < 0.5:
             t["minhold"] = self.rng.randint(12, 30)
+        if "night" in lv and "night" not in t and self.rng.random() < 0.5:
+            t["night"] = lv["night"][0]
+        if "dte" in lv and float(t.get("odte", 99) or 99) < 7 and self.rng.random() < 0.5:
+            t["odte"] = self.rng.randint(7, 21)
         return clean_traits(t)
+
+    def lesson_vetoes(self, vt):
+        """A new egg's never-rules lean toward what the trades say too: trades opened late in the day did worse ->
+        about half the eggs skip opening in the last hour or so."""
+        if not self.o.get("lessons", True) or not self.o.get("vetoes", True):
+            return vt
+        lv = self.lesson_view()
+        vt = dict(vt or {})
+        if "late" in lv and "closing" not in vt and self.rng.random() < 0.5 and len(vt) < MAX_VETOES:
+            vt["closing"] = self.rng.randint(45, 90)
+        return vt
+
+    def strat_weights(self, names):
+        """How often each instinct hatches as a random egg: by how its trades have gone on this farm (40+ trades:
+        better average, more eggs; never below a third of an even share, never over 2.5x), so what works gets tried
+        more while everything keeps a chance to come back."""
+        if not self.o.get("lessons", True):
+            return [1.0] * len(names)
+        out = []
+        for nm in names:
+            n_, avg, _ = self._lesson("strat:" + nm)
+            out.append(1.0 if n_ < LESSON_MIN else min(2.5, max(0.33, 1 + avg / 10)))
+        return out
 
     # ---- Legends: bots with a proven record, kept for good (they don't vanish when they leave the farm) ----
     def legend_case(self, v):
@@ -4279,7 +4351,7 @@ class Tournament(FarmMixin):
                     v.trade_pcts = (list(getattr(v, "trade_pcts", None) or []) + [round(pc_, 2)])[-40:]
                     v.best_pl = max(float(getattr(v, "best_pl", 0) or 0), float(t["pl"]))
                     if not self.replaying and self.o.get("lessons", True):
-                        self.learn_lesson(t, pc_)
+                        self.learn_lesson(dict(t, strat=v.name), pc_)
                 if t.get("flags") and not self.replaying:
                     for k in t["flags"]:
                         self.review.setdefault(k, [0, 0])[0 if t["pl"] <= 0 else 1] += 1
@@ -4981,7 +5053,8 @@ class Tournament(FarmMixin):
             elif v:
                 v.hs_src = hg["name"]
             return v
-        name = self.rng.choice([n for n in WILDCARD_STRATS if n != avoid] or list(WILDCARD_STRATS))
+        pool = [n for n in WILDCARD_STRATS if n != avoid] or list(WILDCARD_STRATS)
+        name = self.rng.choices(pool, weights=self.strat_weights(pool))[0]
         p = self._rand_params(name)
         if len(self.vars) >= self.cap:
             cands = [v for v, _ in self.weakest() if v not in self.active
@@ -4997,7 +5070,7 @@ class Tournament(FarmMixin):
                 return v
         return self.add_variant(name, p, closes, note="Random new strategy:", tf=self.rng.choice(TIMEFRAMES),
                                 origin="random", risk=self.rand_risk(), traits=self.rand_traits(0.35),
-                                vetoes=self.rand_vetoes(), layers=self.rand_layers())
+                                vetoes=self.lesson_vetoes(self.rand_vetoes()), layers=self.rand_layers())
 
 
 
@@ -5940,9 +6013,10 @@ def farm_knowledge(t):
                           data=dict(mode=g, genes=_genes(v) if v else None)))
     # trade lessons: what the farm's own finished trades say
     titles = {"side": "Prefer {}s", "maxotm": "Stay within {}% out of the money", "exit": "Let stops and targets sell",
-              "minhold": "Hold at least {} decisions"}
+              "minhold": "Hold at least {} decisions",
+              "night": "{}", "dte": "Buy at least {} days from expiry", "late": "Don't open in the last {} minutes"}
     for k, (choice, ev) in (t.lesson_view() if hasattr(t, "lesson_view") else {}).items():
-        items.append(dict(id=f"lesson:{k}", kind="Trade lesson", title=titles[k].format(choice), detail="about half the new "
+        items.append(dict(id=f"lesson:{k}", kind="Trade lesson", title=titles[k].format({1: "Hold overnight", 2: "Go flat before the close"}.get(choice, choice) if k == "night" else choice), detail="about half the new "
                           "eggs lean this way; the rest keep testing the other way", evidence=ev, score=5.0, strong=True,
                           data=dict(lessons={x: list(s) for x, s in (t.lessons or {}).items()})))
     # season champions, elders, mutation memory

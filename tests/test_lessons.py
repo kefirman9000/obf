@@ -124,3 +124,60 @@ def test_rotation_scores_a_ticker_on_its_real_swing():
     guess, _ = E.scout_score(d, 100.0)
     real, why = E.scout_score(d, 100.0, vol=1.85)  # a 3x ETF: its contracts cost several times the guess
     assert real < guess * 0.5 and "more than the $100 trade size" in why
+
+
+def _run(genes, seed=102, n=2400):
+    from test_feature_tests import market
+    closes, extra = market(seed, n)
+    coins = list(closes)
+    b = E._bt_bot(genes, coins, 10000.0, 0.0, 0.2, 0.0)
+    out = []
+    for i in range(E.WARM, n):
+        for c, t in E.bot_step(b, {x: E.View(closes[x], i + 1) for x in coins}, i, coins, E.slice_extra(extra, i + 1)):
+            if t["side"] == "sell":
+                out.append(t)
+    return out
+
+
+def test_flat_before_the_close_never_holds_overnight():
+    g = dict(name="RSI", params=dict(E.STRATS["RSI"]["params"]), tf=1, risk={}, traits={"night": 2}, vetoes={}, layers={})
+    sells = _run(g)
+    assert sells
+    for t in sells:
+        t0 = (t.get("contract") or {}).get("t0")
+        assert t0 and E.ny_date(t0) == E.ny_date(t["at"]), t.get("why")
+
+
+def test_holding_overnight_carries_positions_into_the_next_day():
+    base = dict(name="RSI", params=dict(E.STRATS["RSI"]["params"]), tf=1, risk={}, vetoes={}, layers={})
+    over = lambda ts: sum(1 for t in ts if E.ny_date(t["contract"]["t0"]) != E.ny_date(t["at"]))
+    assert over(_run(dict(base, traits={"night": 1}))) >= over(_run(dict(base, traits={})))
+
+
+def test_time_expiry_and_instinct_lessons():
+    t, _ = farm()
+    t.lessons = {}
+    day = E.ny_time("2026-11-09", 9, 30)  # a Monday's open, New York
+    rng = random.Random(5)
+    for i in range(300):
+        night = rng.random() < 0.3
+        short = rng.random() < 0.3
+        late = rng.random() < 0.3
+        good = rng.random() < 0.5
+        t0 = day + (5.0 if late else 1.0) * 3600  # 2:30 pm or 10:30 am
+        t1 = t0 + (86400 if night else 1800)
+        pc = (8 if night else -6) - (6 if short else 0) - (5 if late else 0) + (6 if good else -6) + rng.gauss(0, 3)
+        tr = dict(contract=dict(type="call", otm0=2, t0=t0, dte0=2 if short else 14), at=t1, why="RSI said sell", held=40,
+                  strat="RSI" if good else "Momentum")
+        t.learn_lesson(tr, pc)
+    lv = t.lesson_view()
+    assert lv["night"][0] == 1 and lv["dte"][0] == 7 and "late" in lv
+    eggs = [t.rand_traits(0.0) for _ in range(200)]
+    assert 0.3 < sum(1 for x in eggs if x.get("night") == 1) / 200 < 0.7
+    vt = [t.lesson_vetoes({}) for _ in range(200)]
+    assert 0.3 < sum(1 for x in vt if "closing" in x) / 200 < 0.7
+    w = dict(zip(["RSI", "Momentum", "MACD"], t.strat_weights(["RSI", "Momentum", "MACD"])))
+    assert w["RSI"] > w["MACD"] == 1.0 > w["Momentum"] >= 0.33
+    assert E.ny_hour(day + 3600) == 10
+    titles = [i["title"] for i in E.farm_knowledge(t) if i["kind"] == "Trade lesson"]
+    assert "Hold overnight" in titles
