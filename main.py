@@ -1559,10 +1559,17 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         self.write("Running in the background (icon by the clock).")
 
     def show_window(self):
+        """Brings the window up in front (from the icon by the clock, minimized, or behind other windows). Windows
+        won't let a background app take the front on its own, so it's put on top for a moment."""
         self._in_tray = False
+        self.tray_mode = False  # opened by you: from now on it's a normal window (restarts open the window too)
         self.root.deiconify()
+        if self.root.state() == "iconic":
+            self.root.state("normal")
         self.root.lift()
         try:
+            self.root.attributes("-topmost", True)
+            self.root.after(400, lambda: self.root.attributes("-topmost", False))
             self.root.focus_force()
         except Exception:
             pass
@@ -16873,7 +16880,13 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         self.restart_app()
 
     def restart_app(self, save=True):
-        """save=False after a restore: saving now would write the old in-memory state over the files just restored."""
+        """save=False after a restore: saving now would write the old in-memory state over the files just restored.
+        The new copy opens the way this one is now: as the icon by the clock only if it's hidden there right now (not
+        just because Windows started it that way at login), otherwise in its window."""
+        try:
+            hidden = bool(self.tray_hidden())
+        except Exception:
+            hidden = False
         self.running = False
         self.awake.off()
         if save:
@@ -16890,7 +16903,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             pass
         self.release_lock()
         # a fresh process (not os.execv: on Windows that doesn't quote paths, so a space in a folder name broke restarts)
-        args = [sys.executable, os.path.join(HERE, "main.py")] + [a for a in sys.argv[1:] if a == "--tray"]
+        args = [sys.executable, os.path.join(HERE, "main.py")] + (["--tray"] if hidden else [])
         try:
             subprocess.Popen(args, cwd=HERE, close_fds=True)
         except Exception:
