@@ -117,3 +117,10 @@ def test_exit_kinds():
     assert E.exit_kind("its trailing stop (5%)") == "trail"
     assert E.exit_kind("it held as long as it allows") == "time"
     assert E.exit_kind("1 of its 3 buy studies agreed (needs 1)") == "signal"
+
+
+def test_rotation_scores_a_ticker_on_its_real_swing():
+    d = dict(coin="ZZZX", price=61.78, change_24h=3.0, volume_usd=5e9)
+    guess, _ = E.scout_score(d, 100.0)
+    real, why = E.scout_score(d, 100.0, vol=1.85)  # a 3x ETF: its contracts cost several times the guess
+    assert real < guess * 0.5 and "more than the $100 trade size" in why

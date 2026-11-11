@@ -6261,7 +6261,7 @@ def list_products(quote="USD", symbols=None):
 INDEX_ETFS = ("SPY", "QQQ", "IWM", "DIA")
 
 
-def scout_score(d, trade_size=None):
+def scout_score(d, trade_size=None, vol=None):
     """How good a ticker is for this farm today -> (score, plain-English why). Busy (volume), moving (today's move
     counts, but only up to 3x, so a quiet but busy ETF still competes), affordable (a typical contract, 2% out of
     the money and two weeks out, should fit the bots' trade size: otherwise they skip it or only buy the cheapest
@@ -6272,7 +6272,7 @@ def scout_score(d, trade_size=None):
     liq = (d.get("volume_usd") or 0) ** 0.5
     chg = abs(d.get("change_24h") or 0)
     move = 1 + min(chg, 8) / 4
-    vol = IV_HINT.get(c) or (0.2 if c in INDEX_ETFS else 0.4)
+    vol = vol or IV_HINT.get(c) or (0.2 if c in INDEX_ETFS else 0.4)  # (a guess until its own prices are measured)
     K = round(S * 1.02 / strike_step(S)) * strike_step(S)
     cost = bs_price(S, K, 14 / 365, vol, "call") * CONTRACT
     afford = 1.0 if not trade_size or cost <= trade_size else max(0.15, trade_size / cost)

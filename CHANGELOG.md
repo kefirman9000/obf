@@ -10,6 +10,19 @@
 
 
 
+## 1.40.2
+- **Fix: a ticker swap that stopped halfway froze the bots.** On 11/11 the rotation swapped AMZN for SOXL, then
+  crashed on the next swap (a download whose price lists weren't all the same length). The session switched to
+  SOXL, but the farm and the price feed didn't, so no new candle came for every ticker. Now each swap is checked on
+  its own (a bad download keeps the old ticker), and every 5 minutes the app makes sure the price feed follows the
+  session's tickers.
+- **A farm saved during such a swap carries on** with today's tickers on restart, instead of a new farm starting
+  (it compares the tickers the bots were really saved on, and keeps every bot and what it learned).
+- **Ticker rotation judges a ticker's options by its real swing.** It guessed an unknown ticker's volatility
+  (40%), so SOXL looked like a $160 contract when it's about $900. Now a candidate's own prices are measured
+  before the swap, and it's skipped if its real contracts don't fit the trade size better.
+- (1.40.1) OBF opens in its window: only a start with Windows opens as the icon by the clock.
+
 ## 1.40.1
 - **OBF opens in its window again.** If Windows started OBF at login (as the icon by the clock), every restart after
   an update came back as the icon too, even when you had the window open. A restart now opens the way the app is at
