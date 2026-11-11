@@ -10,6 +10,13 @@
 
 
 
+## 1.40.1
+- **OBF opens in its window again.** If Windows started OBF at login (as the icon by the clock), every restart after
+  an update came back as the icon too, even when you had the window open. A restart now opens the way the app is at
+  that moment: in its window, unless it was hidden by the clock. Starting with Windows still starts as the icon.
+- **Opening OBF while it's already running by the clock brings the window to the front**, instead of leaving it
+  behind other windows or only flashing on the taskbar.
+
 ## 1.40.0
 From the 11/10 report (1,331 finished bot trades: 30% won, median -6%):
 - **No more far-out contracts by accident.** When a contract cost more than the trade size or your contract price
