@@ -1632,6 +1632,11 @@ DEFAULT_SETTINGS = {
     "long_holds": True,          # include slow, longer-holding bots from the start
     "show_broker_value": True,   # a tile with your Alpaca account's own value (logged in)
     "strategy_miner": True,      # Free roam mines long stretches for settings that worked again and again; new eggs start from them
+    "miner_budget": 240,         # ...most candidates one miner study tries (rounds of 40, refining the closest) before giving up
+    "miner_finds": 3,            # ...it stops early once this many finds held up
+    "miner_minutes": 10.0,       # ...and spends at most this long on one stretch
+    "legends": True,             # proven bots are kept in the Legends hall when they leave; new eggs learn from them
+    "legend_share": 10,          # ...% of new eggs hatched from Legends
     "hindsight": True,           # bots learn from what would have worked (hindsight studies), and new eggs start from it
     "kamikazes": True,           # the kamikaze breed: all-or-nothing bets on cheap contracts, and the farm's rule testers
     "kami_share": 10,            # % of the farm kept for kamikazes (they have only a small say in your account)
@@ -2255,6 +2260,8 @@ def tournament_opts(settings):
                 long_holds=bool(settings.get("long_holds", True)),
                 scalp_share=scalp_share(settings), hindsight=bool(settings.get("hindsight", True)),
                 miner=bool(settings.get("strategy_miner", True)),
+                legends=bool(settings.get("legends", True)),
+                legend_share=min(0.4, max(0.0, float(settings.get("legend_share", 10) or 0) / 100)),
                 kami_share=(min(0.3, max(0.0, float(settings.get("kami_share", 10) or 0) / 100))
                             if settings.get("kamikazes", True) else 0.0),
                 coin_prefs=bool(settings.get("coin_prefs", True)), confidence_sizing=bool(settings.get("confidence_sizing", True)),
@@ -3148,6 +3155,7 @@ class Variant:
         self.cond_gain = {}    # condition (e.g. "vol:wild", "tod:open") -> summed equity change while it held
         self.cond_n = {}
         self.mine_src = None   # hatched from the Strategy miner's book: the find it came from (graded forward once)
+        self.legend_src = None  # hatched from a Legend: which one (graded forward once)
         self.hs_src = None     # hatched from the hindsight book: the instinct it came from (graded forward once)
 
     @property
@@ -3230,6 +3238,7 @@ class Tournament(FarmMixin):
         self.serial = 0
         self.lineage = {}       # uid -> family-tree record (kept after a bot is removed)
         self.elders = []        # genes of good bots that left the farm: they nudge future eggs (newest last)
+        self.legends = []       # bots with a proven record, kept for good (best first): new eggs and the miner learn from them
         self.champions = {}     # mood -> genes and record of the best bot seen in that mood (seasons)
         self.season = None      # the market mood of the current season
         self.seasons_log = []   # (decision, mood) whenever the season changed
@@ -3500,6 +3509,177 @@ class Tournament(FarmMixin):
         n = sum(e["fwd"][0] for e in book)
         w = sum(e["fwd"][1] for e in book)
         return 0.15 if n < 4 else min(0.15, max(0.05, 0.15 * (w / n) / 0.3))
+
+    # ---- Legends: bots with a proven record, kept for good (they don't vanish when they leave the farm) ----
+    def legend_case(self, v):
+        """Why bot v belongs among the Legends (a short reason), or None. Kamikazes never do. A legend either passed
+        its exams and made money, or beat just holding over 8+ finished trades without failing its exams, or was saved
+        as a long-term winner."""
+        if is_kami(v) or not v.eq or not v.sim.start:
+            return None
+        closed = v.wins + v.losses
+        lf = self.life(v)
+        exam = exam_verdict(v, getattr(self, "serial", 100))[0]
+        if lf["ret"] <= 0 or exam == "failed":
+            return None
+        if exam == "passed" and closed >= 3:
+            return "passed its exams and made money"
+        if closed >= 8 and (lf["edge"] or 0) > 0 and (lf["winrate"] or 0) >= 0.5:
+            return f"beat just holding over {closed} finished trades"
+        if getattr(v, "inducted", False) and closed >= 4:
+            return "long-term winner"
+        return None
+
+    def _legend_score(self, d):
+        """How much a legend counts: its record (edge over holding, or gain), how sure that is (trades), exams, and
+        how its eggs and re-tests did since (that counts most once there are some)."""
+        base = d.get("edge") if d.get("edge") is not None else d.get("ret", 0)
+        conf = min(1.0, (d.get("trades", 0) or 0) / 12.0) ** 0.5
+        s = max(0.0, base or 0) * 100 * conf + (3.0 if d.get("exam") == "passed" else 0.0)
+        s += 2.0 * min(5, d.get("again", 0))
+        born, good = (d.get("kids") or [0, 0])[:2]
+        if born >= 3:
+            s *= 0.4 + 1.2 * good / born
+        return round(s, 3)
+
+    def _legend_record(self, v, why, d=None):
+        lf = self.life(v)
+        exam = exam_verdict(v, getattr(self, "serial", 100))[0]
+        d = d if d is not None else dict(id=f"L{v.uid}-{int(time.time()) % 10**6}", inducted=time.time(), kids=[0, 0],
+                                         again=0, recalls=0, why=why)
+        d.update(uid=v.uid, nickname=bot_nickname(v.key()), label=v.label, genes=_genes(v), gen=getattr(v, "gen", 0),
+                 origin=getattr(v, "origin", ""), coins=list(self.coins), ret=round(lf["ret"], 4),
+                 edge=None if lf["edge"] is None else round(lf["edge"], 4), trades=v.wins + v.losses, wins=v.wins,
+                 losses=v.losses, winrate=None if lf["winrate"] is None else round(lf["winrate"], 3),
+                 maxdd=round(v.maxdd or 0, 4), age=v.age, exam=exam, scalper=is_scalp(v.name), alive=v in self.vars,
+                 updated=time.time())
+        d["score"] = self._legend_score(d)
+        return d
+
+    def sweep_legends(self, v=None, why_left=None):
+        """Adds bots that earned it to the Legends (or refreshes their record while they live). With v and why_left: v
+        is leaving the farm, and its legend (if it is one) keeps its final record. -> names newly made legends"""
+        if not self.o.get("legends", True):
+            return []
+        book = self.__dict__.setdefault("legends", [])
+        by_uid = {d.get("uid"): d for d in book if d.get("alive")}
+        new = []
+        for x in ([v] if v is not None else list(self.vars)):
+            d = by_uid.get(x.uid)
+            why = self.legend_case(x)
+            if d is not None:
+                self._legend_record(x, d.get("why"), d)
+            elif why:
+                key = json.dumps(_genes(x), sort_keys=True)
+                if any(json.dumps(b.get("genes"), sort_keys=True) == key for b in book):
+                    continue  # the same genes are already a legend (an egg of it, or brought back)
+                d = self._legend_record(x, why)
+                book.append(d)
+                new.append(d["nickname"])
+                self.events.append(f"Legend: {d['nickname']} ({x.label}) joined the Legends: {why}")
+            if d is not None and why_left:
+                d.update(alive=False, left=time.time(), why_left=why_left)
+        book.sort(key=lambda d: -d.get("score", 0))
+        # keep the best 60; a living legend that slips out simply re-earns its place later
+        del book[LEGENDS_MAX:]
+        return new
+
+    def legend_genes(self):
+        """Genes for a new egg from the Legends (tweaked a little, now and then crossed with another legend's
+        settings of the same family), or None."""
+        book = [d for d in (getattr(self, "legends", None) or []) if d["genes"].get("name") in STRATS
+                and not d.get("scalper") and not ((d.get("kids") or [0, 0])[0] >= 6 and (d.get("kids") or [0, 0])[1] == 0)]
+        if not book or not self.o.get("legends", True):
+            return None
+        d = self.rng.choices(book, weights=[max(0.05, x.get("score", 0)) for x in book])[0]
+        g = json.loads(json.dumps(d["genes"]))
+        g["params"] = self.mutate(g["name"], g["params"], 0.08)
+        g["_legend_id"] = d["id"]
+        return g
+
+    def grade_legend(self, v, ok):
+        """A legend's egg has shown how it does going forward: the legend's teaching record is updated (once per egg)."""
+        src = getattr(v, "legend_src", None)
+        if not src:
+            return
+        v.legend_src = None
+        d = next((x for x in (getattr(self, "legends", None) or []) if x.get("id") == src), None)
+        if d is None:
+            return
+        k = d.setdefault("kids", [0, 0])
+        k[0] += 1
+        k[1] += 1 if ok else 0
+        d["score"] = self._legend_score(d)
+
+    def legend_share(self):
+        """Share of new eggs hatched from the Legends: the setting (10%) while their eggs hold up, down to a third of
+        it if they don't."""
+        book = getattr(self, "legends", None) or []
+        base = float(self.o.get("legend_share", 0.10) or 0)
+        if not book or not self.o.get("legends", True) or base <= 0:
+            return 0.0
+        n = sum((d.get("kids") or [0, 0])[0] for d in book)
+        w = sum((d.get("kids") or [0, 0])[1] for d in book)
+        return base if n < 5 else min(base, max(base / 3, base * (w / n) / 0.3))
+
+    def legend_genes_for_miner(self):
+        """The best legends' genes, for the Strategy miner to re-test on a new stretch."""
+        return [d["genes"] for d in (getattr(self, "legends", None) or [])
+                if d["genes"].get("name") in WILDCARD_STRATS][:8]
+
+    def legends_mined_again(self, res):
+        """Legends the Strategy miner found working again on a new stretch: they count for more. -> their names"""
+        book = getattr(self, "legends", None) or []
+        keys = {_mine_key(r["genes"]) for r in res.get("results", []) if r.get("ok")}
+        out = []
+        for d in book:
+            if d["genes"].get("name") in STRATS and _mine_key(d["genes"]) in keys:
+                d["again"] = d.get("again", 0) + 1
+                d["score"] = self._legend_score(d)
+                out.append(d.get("nickname", "?"))
+        return out
+
+    def recall_legend(self, lid, closes=None):
+        """Brings a legend back to the farm as a new bot with its exact genes (it starts fresh and has to win again).
+        -> the bot, or None"""
+        d = next((x for x in (getattr(self, "legends", None) or []) if x.get("id") == lid), None)
+        if d is None or d.get("alive"):
+            return None
+        g = d["genes"]
+        if len(self.vars) >= self.cap:
+            cands = [v for v, _ in self.weakest() if v not in self.active]
+            if not cands:
+                return None
+            self._remove(cands[0], "dropped to make room")
+        v = self.add_variant(g["name"], dict(g["params"]), closes, note="Legend brought back:", tf=g.get("tf", 1),
+                             origin="legend", risk=g.get("risk"), traits=g.get("traits"), vetoes=g.get("vetoes"),
+                             layers=g.get("layers"))
+        if v:
+            d["recalls"] = d.get("recalls", 0) + 1
+            d.update(alive=True, uid=v.uid)
+        return v
+
+    def merge_legends(self, others):
+        """Adds legends from elsewhere (another farm, the saved Legends file). Same genes = the same legend: the
+        stronger record is kept. -> how many were new"""
+        book = self.__dict__.setdefault("legends", [])
+        have = {json.dumps(d.get("genes"), sort_keys=True): d for d in book}
+        new = 0
+        for d in others or []:
+            if not isinstance(d, dict) or not isinstance(d.get("genes"), dict) or d["genes"].get("name") not in STRATS:
+                continue
+            k = json.dumps(d["genes"], sort_keys=True)
+            if k in have:
+                if d.get("score", 0) > have[k].get("score", 0) and not have[k].get("alive"):
+                    have[k].update({x: y for x, y in d.items() if x not in ("alive", "uid")})
+                continue
+            d = dict(d, alive=False)
+            book.append(d)
+            have[k] = d
+            new += 1
+        book.sort(key=lambda d: -d.get("score", 0))
+        del book[LEGENDS_MAX:]
+        return new
 
     def hindsight_share(self):
         """Share of new eggs hatched from the hindsight book: 20% while its eggs hold up (1 in 4 doing well later),
@@ -3809,6 +3989,13 @@ class Tournament(FarmMixin):
             self.grade_hindsight(v, bool(v.eq) and v.sim.start > 0 and v.eq[-1] > v.sim.start)
         if v in self.vars and getattr(v, "mine_src", None):  # a mined egg leaving before its exams
             self.grade_mined(v, bool(v.eq) and v.sim.start > 0 and v.eq[-1] > v.sim.start)
+        if v in self.vars and getattr(v, "legend_src", None):  # a legend's egg leaving before its exams
+            self.grade_legend(v, bool(v.eq) and v.sim.start > 0 and v.eq[-1] > v.sim.start)
+        if v in self.vars:
+            try:
+                self.sweep_legends(v, why)  # a legend keeps its record after it leaves (and a bot can earn it on the way out)
+            except Exception:
+                note_error("_remove legends")
         if v in self.vars and is_kami(v):
             try:
                 self.kami_learn(v)
@@ -4057,6 +4244,8 @@ class Tournament(FarmMixin):
                 self.grade_hindsight(v, exam == "passed")
             if exam in ("passed", "failed") and getattr(v, "mine_src", None):
                 self.grade_mined(v, exam == "passed")
+            if exam in ("passed", "failed") and getattr(v, "legend_src", None):
+                self.grade_legend(v, exam == "passed")
             if w > 0 and exam != "off":  # results on days it never trained on: passing counts for more, failing for less
                 w *= {"passed": 1.3, "failed": 0.5}.get(exam, 0.85)
             if w > 0 and o.get("risk_adjusted", True):
@@ -4402,6 +4591,8 @@ class Tournament(FarmMixin):
         if not self.o.get("elders", True) or self.rng.random() > 0.3:
             return params
         el = [e for e in self.elders if e["name"] == name]
+        el += [dict(name=d["genes"]["name"], params=d["genes"]["params"], edge=max(1e-4, d.get("score", 0) / 100))
+               for d in (getattr(self, "legends", None) or []) if d["genes"].get("name") == name]  # legends teach too
         if not el:
             return params
         e = self.rng.choices(el, weights=[max(1e-4, x["edge"]) for x in el])[0]
@@ -4585,7 +4776,9 @@ class Tournament(FarmMixin):
         if self.o.get("scalp_only"):
             return self.spawn_scalp(closes)
         hg, src = None, "hindsight"
-        if self.rng.random() < self.mined_share():
+        if self.rng.random() < self.legend_share():
+            hg, src = self.legend_genes(), "legend"
+        if not hg and self.rng.random() < self.mined_share():
             hg, src = self.mined_genes(), "strategy miner"
         if not hg and self.rng.random() < self.hindsight_share():
             hg, src = self.hindsight_genes(), "hindsight"
@@ -4598,11 +4791,14 @@ class Tournament(FarmMixin):
                 if not cands:
                     return None
                 self._remove(cands[0], "dropped to make room")
-            v = self.add_variant(hg["name"], hg["params"], closes, note="Mined egg:" if src == "strategy miner" else "Hindsight egg:",
+            v = self.add_variant(hg["name"], hg["params"], closes,
+                                 note={"strategy miner": "Mined egg:", "legend": "Legend egg:"}.get(src, "Hindsight egg:"),
                                  tf=hg.get("tf", 1), origin=src, risk=hg.get("risk"), traits=hg.get("traits"),
                                  vetoes=hg.get("vetoes"), layers=hg.get("layers"))
             if v and src == "strategy miner":
                 v.mine_src = hg.get("_mine_id")
+            elif v and src == "legend":
+                v.legend_src = hg.get("_legend_id")
             elif v:
                 v.hs_src = hg["name"]
             return v
@@ -4635,7 +4831,7 @@ class Tournament(FarmMixin):
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
-                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src")
+                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src", "legend_src")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -4653,6 +4849,7 @@ class Tournament(FarmMixin):
                     elders=self.elders[-40:], champions=self.champions, season=self.season,
                     review=self.review, mut_stats=self.mut_stats, evolves=self.evolves,
                     seasons_log=self.seasons_log[-50:], hindsight=getattr(self, "hindsight", {}), mined=getattr(self, "mined", []),
+                    legends=getattr(self, "legends", []),
                     instincts={k: list(x) for k, x in self.instincts.items()}, instinct_best=dict(self.instinct_best),
                     trial_book=getattr(self, "trial_book", {}),
                     hold_curve=list(getattr(self, "hold_curve", []))[-(self.W * 10 + 2):], bots=bots,
@@ -4745,6 +4942,7 @@ class Tournament(FarmMixin):
         self.seasons_log = [tuple(x) for x in st.get("seasons_log") or []]
         self.hindsight = dict(st.get("hindsight") or {})
         self.mined = list(st.get("mined") or [])
+        self.legends = [d for d in (st.get("legends") or []) if isinstance(d, dict) and isinstance(d.get("genes"), dict)]
         self.last_px = {c: float(x) for c, x in (st.get("last_px") or {}).items() if isinstance(x, (int, float)) and x > 0}
         self.instincts = {k: [float(x[0]), int(x[1]), float(x[2]) if len(x) > 2 else float(x[0])]
                           for k, x in (st.get("instincts") or {}).items() if isinstance(x, (list, tuple)) and len(x) >= 2}
@@ -5069,6 +5267,8 @@ INSTINCT_PROVEN = 10   # reviews before a positive record counts as proven
 def teach_from(dst, src):
     """Passes a trained farm's memory to another farm: elders, post-trade review, mutation memory and season champions."""
     dst.elders = (dst.elders + [e for e in src.elders])[-40:]
+    if getattr(src, "legends", None) and hasattr(dst, "merge_legends"):
+        dst.merge_legends(json.loads(json.dumps(src.legends)))
     for k, x in src.review.items():
         d = dst.review.setdefault(k, [0, 0])
         d[0] += x[0]
@@ -5140,7 +5340,8 @@ def warm_islands(coins, start_cash, fee, pct, evolve, params, opts, cap, retire_
             lineage[str(int(u) + off)] = dict(rec, uid=int(u) + off, parents=[p + off for p in rec.get("parents", [])])
         off += top
     merged.update(bots=bots, lineage=lineage, serial=off, n=max(st["n"] for st in states),
-                  elders=[e for st in states for e in st.get("elders", [])][-40:])
+                  elders=[e for st in states for e in st.get("elders", [])][-40:],
+                  legends=[d for st in states for d in st.get("legends", [])])
     rv, ms = {}, {}
     for st in states:
         _merge_stats(rv, st.get("review"))
@@ -5206,13 +5407,59 @@ def _mine_run(g, closes, extra, a, z, cuts, start_cash, fee, pct, slip):
     return b.sim.equity({c: closes[c][z - 1] for c in coins}) / start_cash - 1, closed, wins, parts
 
 
+LEGENDS_MAX = 60    # how many legends a farm keeps (the best; the saved Legends file keeps up to 200)
+MINE_BUDGET = 240   # most instincts and settings one Strategy miner study tries before it gives up on a stretch
+MINE_FINDS = 3      # ...it stops early once this many finds held up
+MINE_SECS = 600     # ...and never runs longer than this (seconds), so Free roam's other studies get their turn
+
+
+def _mine_rand(nm, rng, caps, usual=False):
+    """A fresh miner candidate of one instinct: random settings (or its usual ones), a decision speed and a stop/target."""
+    spec, p = STRATS[nm], {}
+    for k, dv in spec["params"].items():
+        lo, hi = spec["bounds"][k]
+        p[k] = int(round(rng.uniform(lo, hi))) if isinstance(dv, int) else round(rng.uniform(lo, hi), 2)
+    if usual:
+        p = dict(spec["params"])
+    risk = {k: (round(rng.uniform(lo, caps.get(k, hi) * 0.5), 2) if rng.random() < 0.5 else 0.0)
+            for k, (lo, hi) in RISK_BOUNDS.items()}
+    return dict(name=nm, params=fix_params(nm, p), tf=rng.choice((1, 2, 3, 5, 10)), risk=risk, traits={}, vetoes={}, layers={})
+
+
+def _mine_tweak(g, rng, caps, scale=0.15):
+    """A near-miss tried again a little differently: its settings nudged (within the instinct's bounds), and now and
+    then a neighbouring decision speed or a different stop/target."""
+    g = json.loads(json.dumps(g))
+    spec = STRATS[g["name"]]
+    p = {}
+    for k, v in g["params"].items():
+        lo, hi = spec["bounds"].get(k, (v, v))
+        nv = v + (hi - lo) * rng.gauss(0, scale)
+        nv = min(hi, max(lo, nv))
+        p[k] = int(round(nv)) if isinstance(spec["params"].get(k), int) else round(nv, 2)
+    g["params"] = fix_params(g["name"], p)
+    if rng.random() < 0.3:
+        tfs = (1, 2, 3, 5, 10, 15)
+        i = tfs.index(g.get("tf", 1)) if g.get("tf", 1) in tfs else 0
+        g["tf"] = tfs[min(len(tfs) - 1, max(0, i + rng.choice((-1, 1))))]
+    if rng.random() < 0.25:
+        g["risk"] = {k: (round(rng.uniform(lo, caps.get(k, hi) * 0.5), 2) if rng.random() < 0.5 else 0.0)
+                     for k, (lo, hi) in RISK_BOUNDS.items()}
+    return g
+
+
 def mine_study(closes, extra, start_cash, fee, pct, slip, rng, n=40, parts=6, prior=None, stop=None, progress=None,
-               risk_caps=None):
+               risk_caps=None, budget=None, want=None, max_secs=None, legends=None):
     """Strategy miner: over a long stretch, which instincts and settings made money AGAIN AND AGAIN, not just once?
     The first 75% is cut into `parts` parts; each candidate trades straight through it and is scored on how many parts
-    it made money in (with trades). The steadiest are then checked on the last 25% they never saw. A find counts when
-    it made money in at least 4 of 6 parts (2/3), overall, and on the check.
-    prior: the miner's book (its finds are tried again, tweaked a little). -> dict(results=[...], parts, look_bars, check_bars)"""
+    it made money in (with trades). Contenders are then checked on the last 25% they never saw. A find counts when
+    it made money in at least 4 of 6 parts (2/3), overall, and on the check (with at least one finished trade there).
+    It works in rounds of `n` and doesn't give up after the first: each new round refines the near misses so far
+    (settings nudged, a neighbouring speed, another stop/target), fills in instincts it has barely tried, and adds
+    fresh ideas, until `want` finds held up, `budget` candidates were tried, or `max_secs` ran out.
+    prior: the miner's book (its finds are tried again, tweaked a little). legends: genes of the farm's Legends (tried
+    again as they are, so a legend that still works on a new stretch shows up). -> dict(results=[...], tried, rounds,
+    parts, need, look_bars, check_bars)"""
     coins = list(closes)
     L = min(len(closes[c]) for c in coins)
     a0 = max(WARM, min(L - 2, max(60, LOOKBACK // 2)))
@@ -5222,49 +5469,108 @@ def mine_study(closes, extra, start_cash, fee, pct, slip, rng, n=40, parts=6, pr
     cuts = [a0 + int((cut - a0) * (k + 1) / parts) for k in range(parts)]
     need = -(-parts * 2 // 3)
     caps = dict(risk_caps or FAST_RISK)
-    cands = []
+    budget = max(n, int(budget if budget is not None else MINE_BUDGET))
+    want = max(1, int(want if want is not None else MINE_FINDS))
+    max_secs = float(max_secs if max_secs is not None else MINE_SECS)
+    t0 = time.time()
+    names = list(WILDCARD_STRATS)
+    seen_keys, looked, checked, tries_of = set(), [], {}, {nm: 0 for nm in names}
+
+    def add(pool, g):
+        if g.get("name") not in STRATS:
+            return
+        k = _mine_key(g)
+        if k not in seen_keys:
+            seen_keys.add(k)
+            pool.append(g)
+
+    # round 1: the book (tweaked) and the legends (as they are), then every instinct at least once, then random
+    first = []
     for e in (prior or [])[:12]:
         g = json.loads(json.dumps(e["genes"]))
         if g.get("name") in STRATS:
             g["params"] = fix_params(g["name"], {k: (v * rng.uniform(0.9, 1.1) if isinstance(v, float) else v)
                                                  for k, v in g["params"].items()})
-            cands.append(g)
-    names = list(WILDCARD_STRATS)
-    while len(cands) < n:
-        nm = rng.choice(names)
-        spec, p = STRATS[nm], {}
-        for k, dv in spec["params"].items():
-            lo, hi = spec["bounds"][k]
-            p[k] = int(round(rng.uniform(lo, hi))) if isinstance(dv, int) else round(rng.uniform(lo, hi), 2)
-        if len(cands) % 4 == 0:
-            p = dict(spec["params"])
-        p = fix_params(nm, p)
-        risk = {k: (round(rng.uniform(lo, caps.get(k, hi) * 0.5), 2) if rng.random() < 0.5 else 0.0)
-                for k, (lo, hi) in RISK_BOUNDS.items()}
-        cands.append(dict(name=nm, params=p, tf=rng.choice((1, 2, 3, 5, 10)), risk=risk, traits={}, vetoes={}, layers={}))
-    cands = cands[:n]
-    looked = []
-    for i, g in enumerate(cands):
+            add(first, g)
+    for g in (legends or [])[:8]:
+        add(first, json.loads(json.dumps(g)))
+    order = names[:]
+    rng.shuffle(order)
+    for i, nm in enumerate(order):
+        if len(first) >= n:
+            break
+        add(first, _mine_rand(nm, rng, caps, usual=i % 4 == 0))
+    while len(first) < n:
+        add(first, _mine_rand(rng.choice(names), rng, caps, usual=len(first) % 4 == 0))
+    batch, rounds = first[:n], 0
+
+    def tick():
+        if progress:
+            progress(min(budget, len(looked)), budget)
+
+    def ok_of(x):
+        return x["worked"] >= need and x["look_ret"] > 0 and x["check_ret"] > 0 and x["check_closed"] >= 1
+
+    while batch:
+        rounds += 1
+        for g in batch:
+            if stop and stop():
+                raise TrainingStopped()
+            ret, closed, wins, pr = _mine_run(g, closes, extra, a0, cut, cuts, start_cash, fee, pct, slip)
+            worked = sum(1 for r_, c_ in pr if r_ > 0 and c_ > 0)
+            looked.append(dict(genes=g, ret=ret, closed=closed, wins=wins, worked=worked, pr=pr))
+            tries_of[g["name"]] = tries_of.get(g["name"], 0) + 1
+            tick()
+        # contenders (could still count) are checked on the part they never saw
+        for x in looked:
+            k = _mine_key(x["genes"])
+            if k in checked or x["closed"] < parts or x["worked"] < need or x["ret"] <= 0:
+                continue
+            if stop and stop():
+                raise TrainingStopped()
+            cret, cclosed, cwins, _ = _mine_run(x["genes"], closes, extra, cut, L, [], start_cash, fee, pct, slip)
+            checked[k] = dict(genes=x["genes"], look_ret=x["ret"], check_ret=cret, check_closed=cclosed,
+                              closed=x["closed"] + cclosed, wins=x["wins"] + cwins, worked=x["worked"], parts=parts,
+                              part_rets=[round(r_ * 100, 2) for r_, _ in x["pr"]], round=rounds)
+        finds = sum(1 for r in checked.values() if ok_of(r))
+        if finds >= want or len(looked) >= budget or time.time() - t0 > max_secs:
+            break
+        # next round: refine the near misses, try neglected instincts, and a few fresh ideas
+        room = min(n, budget - len(looked))
+        near = sorted([x for x in looked if x["closed"] >= max(2, parts // 2)],
+                      key=lambda x: (-x["worked"], -x["ret"]))[:8]
+        batch = []
+        guard = 0
+        while len(batch) < room and guard < room * 20:
+            guard += 1
+            r_ = rng.random()
+            if near and r_ < 0.5:  # half: tweak a near miss (the closer it came, the more often)
+                x = rng.choices(near, weights=[(x["worked"] + 1) ** 2 for x in near])[0]
+                add(batch, _mine_tweak(x["genes"], rng, caps, scale=0.08 + 0.1 * rng.random()))
+            elif r_ < 0.8:  # instincts it has tried least so far
+                lo = min(tries_of.values())
+                nm = rng.choice([k for k, c in tries_of.items() if c <= lo + 1])
+                add(batch, _mine_rand(nm, rng, caps))
+            else:
+                add(batch, _mine_rand(rng.choice(names), rng, caps))
+    # some of the best that didn't make it are checked too, so the log shows how close the study came
+    for x in sorted(looked, key=lambda x: (-x["worked"], -x["ret"])):
+        if len(checked) >= 6:
+            break
+        k = _mine_key(x["genes"])
+        if k in checked or x["closed"] < parts:
+            continue
         if stop and stop():
             raise TrainingStopped()
-        ret, closed, wins, pr = _mine_run(g, closes, extra, a0, cut, cuts, start_cash, fee, pct, slip)
-        worked = sum(1 for r_, c_ in pr if r_ > 0 and c_ > 0)
-        looked.append((g, ret, closed, wins, worked, pr))
-        if progress:
-            progress(i + 1, len(cands) + 10)
-    top = sorted([x for x in looked if x[2] >= parts], key=lambda x: (-x[4], -x[1]))[:10]
-    out = []
-    for j, (g, ret, closed, wins, worked, pr) in enumerate(top):
-        if stop and stop():
-            raise TrainingStopped()
-        cret, cclosed, cwins, _ = _mine_run(g, closes, extra, cut, L, [], start_cash, fee, pct, slip)
-        out.append(dict(genes=g, look_ret=ret, check_ret=cret, closed=closed + cclosed, wins=wins + cwins, worked=worked,
-                        parts=parts, part_rets=[round(r_ * 100, 2) for r_, _ in pr],
-                        ok=worked >= need and ret > 0 and cret > 0))
-        if progress:
-            progress(len(cands) + j + 1, len(cands) + 10)
+        cret, cclosed, cwins, _ = _mine_run(x["genes"], closes, extra, cut, L, [], start_cash, fee, pct, slip)
+        checked[k] = dict(genes=x["genes"], look_ret=x["ret"], check_ret=cret, check_closed=cclosed,
+                          closed=x["closed"] + cclosed, wins=x["wins"] + cwins, worked=x["worked"], parts=parts,
+                          part_rets=[round(r_ * 100, 2) for r_, _ in x["pr"]], round=rounds)
+    out = [dict(r, ok=ok_of(r)) for r in checked.values()]
     out.sort(key=lambda r: (not r["ok"], -r["worked"], -r["check_ret"]))
-    return dict(results=out, tried=len(cands), parts=parts, need=need, look_bars=cut - a0, check_bars=L - cut, at=time.time())
+    best = max((x["worked"] for x in looked), default=0)
+    return dict(results=out[:24], tried=len(looked), rounds=rounds, best_worked=best, parts=parts, need=need,
+                look_bars=cut - a0, check_bars=L - cut, at=time.time(), secs=round(time.time() - t0, 1))
 
 
 def hindsight_study(closes, extra, start_cash, fee, pct, slip, rng, n=48, prior=None, stop=None, progress=None,
@@ -6154,6 +6460,40 @@ def set_team(keys, on):
 
 def team():
     return [b for b in load_collection() if b.get("team")]
+
+
+# ---------------- Legends (bots with a proven record, kept for good across farms and sessions) ----------------
+def legends_path():
+    return os.path.join(HOME_DIR, "legends.json")
+
+
+def load_legends():
+    """The saved Legends (from every farm so far), best first. Never raises."""
+    try:
+        d = load_json(legends_path(), {}) or {}
+        out = [x for x in (d.get("legends") or []) if isinstance(x, dict) and isinstance(x.get("genes"), dict)
+               and x["genes"].get("name") in STRATS]
+    except Exception:
+        return []
+    return sorted(out, key=lambda x: -(x.get("score") or 0))
+
+
+def save_legends(farm_legends, app_version=""):
+    """Merges a farm's legends into the saved Legends file (same genes = the same legend: the newer record wins) and
+    keeps the best 200. -> how many are saved"""
+    have = {json.dumps(x["genes"], sort_keys=True): x for x in load_legends()}
+    for x in farm_legends or []:
+        have[json.dumps(x["genes"], sort_keys=True)] = json.loads(json.dumps(x))
+    keep = sorted(have.values(), key=lambda x: -(x.get("score") or 0))[:200]
+    save_json(legends_path(), dict(kind="legends", app_version=app_version, saved=time.time(), legends=keep))
+    return len(keep)
+
+
+def forget_legend(lid):
+    """Removes one legend from the saved Legends file (by id)."""
+    keep = [x for x in load_legends() if x.get("id") != lid]
+    save_json(legends_path(), dict(kind="legends", saved=time.time(), legends=keep))
+    return keep
 
 
 # ---------------- Hall of Fame (long-term winners, saved automatically) ----------------
