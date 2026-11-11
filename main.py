@@ -974,15 +974,29 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
     def load_farm(self):
         """The saved farm for this session, ready to carry on (or None)."""
         d = E.load_json(E.farm_path(self.sess_tag()))
-        if not isinstance(d, dict) or d.get("coins") != self.session_coins or float(d.get("bar", -1)) != float(self.session_bar):
+        if not isinstance(d, dict) or float(d.get("bar", -1)) != float(self.session_bar):
             return None
-        t = E.Tournament(self.session_coins, self.start_cash, *E.cost_model(self.settings)[:1],
+        saved = list((d.get("farm") or {}).get("coins") or d.get("coins") or [])  # the coins the bots were saved on
+        swapped = saved != self.session_coins
+        if swapped:
+            # the farm was saved on slightly different tickers (a ticker rotation that didn't finish saving): carry it
+            # over to today's tickers rather than start a new farm. Too different (another session) = not this farm.
+            same = len(set(saved) & set(self.session_coins))
+            if len(saved) != len(self.session_coins) or same < max(1, len(saved) - 2):
+                return None
+        t = E.Tournament(saved, self.start_cash, *E.cost_model(self.settings)[:1],
                          self.settings["trade_pct"] / 100, self.settings["evolve_every"], params=self.settings["params"],
                          opts=E.tournament_opts(self.settings), cap=int(self.settings["max_bots"]),
                          retire_steps=self.retire_steps(self.session_bar))
         try:
             if not t.restore(d.get("farm")):
                 return None
+            if swapped:
+                t.align_coins(list(self.session_coins), {})
+                gone = [c for c in saved if c not in self.session_coins]
+                self.q.put(("log", (f"Your farm was saved on {', '.join(gone)}; it carries on with "
+                                    f"{', '.join(c for c in self.session_coins if c not in saved)} instead (a ticker "
+                                    "swap). Every bot and what it learned is kept.", "good")))
             if getattr(t, "scoreboard_reset", False):
                 self.q.put(("log", ("This farm's track records were earned on practice prices that were far too generous "
                                     "(fixed in 1.23), so every bot starts a fresh scoreboard: money, results and exams "
@@ -16295,6 +16309,14 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 self.rotate_tickers()
         except Exception:
             self._record_error("ticker rotation")
+        try:  # safety net: the price feed must watch the session's tickers (a swap that stopped halfway froze it)
+            wa = getattr(self, "worker_args", None)
+            if self.running and wa and list(wa[0]) != list(self.session_coins) and not getattr(self, "_rotating", False):
+                self.worker_args = (list(self.session_coins),) + tuple(wa[1:])
+                self.launch_worker()
+                self.write("The price feed was watching old tickers; it now follows " + ", ".join(self.session_coins) + ".", "warn")
+        except Exception:
+            self._record_error("price feed check")
         if not self.closing():
             self.root.after(300000, self.rotate_tick)
 
@@ -16322,16 +16344,26 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 etfs = [c for c in cur if c in E.INDEX_ETFS]
                 outs = [(s_, c) for s_, c in mine if not (c in E.INDEX_ETFS and len(etfs) <= 1)]
                 cands = sorted(((v[0], c) for c, v in sc.items() if c not in cur), reverse=True)
-                swaps = []
+                by_coin = {d["coin"]: d for d in prods}
+                swaps, looked = [], 0
                 for s_old, old in outs[:max(0, int(self.settings.get("rotate_max", 2) or 0))]:
-                    if not cands:
-                        break
-                    s_new, new = cands[0]
-                    if s_new < 1.5 * max(s_old, 1e-9):
-                        break
-                    cands.pop(0)
-                    d = E.fetch_ohlcv(new, E.candle_gran(self.session_bar), 2000, self.quote)
-                    swaps.append((old, new, d, sc.get(old, (0, ""))[1], sc[new][1]))
+                    # a candidate's score guesses its volatility until its prices are in: once they are, it's scored
+                    # again on its real swing (a 3x ETF's contracts cost several times what the guess says)
+                    while cands and looked < 8:
+                        s_new, new = cands.pop(0)
+                        if s_new < 1.5 * max(s_old, 1e-9):
+                            cands = []
+                            break
+                        looked += 1
+                        try:
+                            d = E.fetch_ohlcv(new, E.candle_gran(self.session_bar), 2000, self.quote)
+                            real_vol = E.pricing_vol(d["c"], d.get("t")) if len(d.get("c") or []) > 60 else None
+                        except Exception:
+                            continue
+                        s_real, w_real = E.scout_score(by_coin[new], size, vol=real_vol)
+                        if s_real >= 1.5 * max(s_old, 1e-9):
+                            swaps.append((old, new, d, sc.get(old, (0, ""))[1], w_real))
+                            break
                 self.q.put(("call", lambda: self._apply_rotation(swaps, by_hand)))
             except Exception as e:
                 self.q.put(("call", lambda e=e: self._apply_rotation([], by_hand, str(e))))
@@ -16354,16 +16386,26 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 continue
             if any(tick_of(k) == old and q > 0 for k, q in self.pos.items()) or any(tick_of(k) == old for k in self.pending):
                 continue  # the account bought it meanwhile: keep it
-            # line the new ticker's bars up with the session's (same minutes; a missing minute repeats the one before)
-            by_t = {tt: i for i, tt in enumerate(d.get("t") or [])}
-            cl, hh, ll, vv, last_i = [], [], [], [], None
-            for tt in times:
-                i = by_t.get(tt, last_i)
-                if i is None:
-                    i = 0
-                last_i = i
-                cl.append(d["c"][i]); hh.append(d["h"][i]); ll.append(d["l"][i]); vv.append(d["v"][i] if by_t.get(tt) is not None else 0.0)
-            if not times or len(cl) != len(self.hist.get(ref) or []):
+            # line the new ticker's bars up with the session's (same minutes; a missing minute repeats the one before).
+            # Only as many bars as every one of its lists has: a download can come back with one list a bar short
+            try:
+                n_ = min(len(d.get(k) or []) for k in ("c", "t"))
+                col = {k: list(d.get(k) or [])[:n_] if len(d.get(k) or []) >= n_ else list(d.get("c") or [])[:n_]
+                       for k in ("c", "h", "l")}
+                vol_ = list(d.get("v") or [])[:n_]
+                vol_ += [0.0] * (n_ - len(vol_))
+                by_t = {tt: i for i, tt in enumerate((d.get("t") or [])[:n_])}
+                cl, hh, ll, vv, last_i = [], [], [], [], None
+                for tt in times:
+                    i = by_t.get(tt, last_i)
+                    if i is None:
+                        i = 0
+                    last_i = i
+                    cl.append(col["c"][i]); hh.append(col["h"][i]); ll.append(col["l"][i]); vv.append(vol_[i] if by_t.get(tt) is not None else 0.0)
+            except Exception:
+                E.note_error("_apply_rotation")
+                continue  # this swap's prices don't line up: keep the old ticker
+            if not n_ or not times or len(cl) != len(self.hist.get(ref) or []):
                 continue
             self.hist[new], self.hx[new] = cl, dict(h=hh, l=ll, v=vv, t=list(times))
             self.session_coins = [new if c == old else c for c in self.session_coins]
