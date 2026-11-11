@@ -10,6 +10,22 @@
 
 
 
+## 1.41.0
+From the 11/11 report (1,344 finished bot trades), the farm now learns three more things by itself:
+- **Holding overnight.** Trades held overnight did far better (median +6.5%, 59% won, 272 trades) than ones sold the
+  same day (-5.8%, 28% won, 1,072 trades). A new habit bots can carry and evolve: **holds overnight** (its signals don't
+  sell it in the last 30 minutes of the day; its stops and targets still do) or **flat before the close** (sells in
+  the last 15 minutes and opens nothing new in the last 20). The trade lessons compare overnight with same-day
+  trades, and about half the new eggs take the habit that's doing better.
+- **Days to expiry.** Contracts bought 3 days or less from expiry did worse (-9.4% vs -4.7%). When the farm's own
+  trades say so, about half the new eggs buy at least a week out.
+- **The hour it buys.** Trades opened after 2 pm did worst (16-24% won). When the lessons agree, about half the new
+  eggs carry the 'skip the closing rush' rule.
+- **Instincts that trade well hatch more often.** Random new eggs used to pick every instinct equally. Now, once
+  an instinct has 40+ finished trades on the farm, how they went sets its share: up to 2.5x for the best (VWAP
+  snap-back +10.9% median), down to a third for the worst (Speed shift -19.6%). Every instinct keeps a chance.
+- All of it shows under Learning > Trade lessons and in Farm knowledge, and travels with knowledge and camps.
+
 ## 1.40.2
 - **Fix: a ticker swap that stopped halfway froze the bots.** On 11/11 the rotation swapped AMZN for SOXL, then
   crashed on the next swap (a download whose price lists weren't all the same length). The session switched to
