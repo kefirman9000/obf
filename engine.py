@@ -704,14 +704,17 @@ def liquid(r, max_spread_pct=15.0, min_oi=50):
     return True
 
 
-def pick_contract(chain, S, typ, dte, otm_pct, now=None, min_sessions=1, max_spread_pct=0.0, min_oi=0):
+def pick_contract(chain, S, typ, dte, otm_pct, now=None, min_sessions=1, max_spread_pct=0.0, min_oi=0, max_otm=None):
     """The listed contract closest to what a bot wants: its type, about dte days out, about otm_pct% out of the money;
-    only ones inside the price range, liquid enough, and with more than min_sessions trading days left."""
+    only ones inside the price range, liquid enough, with more than min_sessions trading days left, and no farther out
+    of the money than max_otm % (default: the farm's ceiling, Settings; 0 = no limit)."""
+    lim = MAX_OTM[0] if max_otm is None else float(max_otm or 0)
     now = now or time.time()
     want_exp = now + dte * 86400
     want_K = S * (1 + otm_pct / 100) if typ == "call" else S * (1 - otm_pct / 100)
     cands = [r for r in chain if r["type"] == typ and r["exp"] > now + 86400 and r["ask"] > 0 and prem_ok(r["ask"])
-             and sessions_left(r["exp"], now) > min_sessions and liquid(r, max_spread_pct, min_oi)]
+             and sessions_left(r["exp"], now) > min_sessions and liquid(r, max_spread_pct, min_oi)
+             and (not lim or otm_dist(typ, r["K"], S) <= lim)]
     if not cands:
         return None
     return min(cands, key=lambda r: (abs(r["exp"] - want_exp) / 86400 / max(3, dte)) + abs(r["K"] - want_K) / S * 10)
@@ -1637,6 +1640,10 @@ DEFAULT_SETTINGS = {
     "miner_minutes": 10.0,       # ...and spends at most this long on one stretch
     "legends": True,             # proven bots are kept in the Legends hall when they leave; new eggs learn from them
     "legend_share": 10,          # ...% of new eggs hatched from Legends
+    "max_otm": 15.0,             # farthest out of the money any bot or the account buys (%); bots learn their own limit under it
+    "trade_lessons": True,       # the farm learns from its own closed trades (calls vs puts, how far out, how it sold, how
+                                 # long it held) and new eggs lean toward what worked
+    "exam_bots": 6,              # bots tested in each background exam round (it also runs while Free roam is on)
     "hindsight": True,           # bots learn from what would have worked (hindsight studies), and new eggs start from it
     "kamikazes": True,           # the kamikaze breed: all-or-nothing bets on cheap contracts, and the farm's rule testers
     "kami_share": 10,            # % of the farm kept for kamikazes (they have only a small say in your account)
@@ -1950,6 +1957,7 @@ def sessions_left(exp, now=None):
 
 
 PREM_RANGE = [0.0, 0.0]  # contract price range bots may buy, $ per share; 0 = no limit on that side
+MAX_OTM = [15.0]         # farthest out of the money any bot (or the account) buys, %; 0 = no limit. Kamikazes ignore it
 
 
 def set_prem_range(lo, hi):
@@ -1960,6 +1968,32 @@ def set_prem_range(lo, hi):
     if lo and hi and lo > hi:
         lo, hi = hi, lo
     PREM_RANGE[:] = [lo, hi]
+
+
+def set_max_otm(x):
+    try:
+        MAX_OTM[0] = max(0.0, float(x or 0))
+    except (TypeError, ValueError):
+        MAX_OTM[0] = 15.0
+    return MAX_OTM[0]
+
+
+def otm_dist(typ, K, S):
+    """How far out of the money a strike is, % of the stock price (negative = in the money)."""
+    if not S:
+        return 0.0
+    return (K / S - 1) * 100 if typ == "call" else (1 - K / S) * 100
+
+
+def otm_limit(g):
+    """The farthest out of the money a bot with genes/traits g buys: its own learned limit ('maxotm'), never past the
+    farm's ceiling (Settings), except kamikazes, whose whole idea is cheap far-out bets. 0 = no limit."""
+    g = g or {}
+    own = float(g.get("maxotm", 0) or 0)
+    if g.get("kami"):
+        return own
+    cap = MAX_OTM[0]
+    return min(own, cap) if own and cap else (own or cap)
 
 
 def prem_ok(p):
@@ -2112,6 +2146,13 @@ class OptionSim(Sim):
         if prem < MIN_PREMIUM:  # (real contracts this cheap hardly ever trade)
             self.opt.pop(c, None)
             return False
+        dist = otm_dist(typ, self.opt[c]["K"], S)
+        lim = otm_limit(g)
+        if lim and dist > lim:  # only a far-out contract fits the money: skip it (those lost most often)
+            self.opt.pop(c, None)
+            self.too_far = getattr(self, "too_far", 0) + 1
+            return False
+        self.opt[c]["otm0"] = round(dist, 2)  # how far out it was when bought (for the farm's trade lessons)
         slip = self.slip
         rs = self._real_slip(c, self.opt[c], prem)
         if rs is not None:  # a real contract on a past day: buys pay the ask (its real bid/ask gap), for every bot
@@ -2239,6 +2280,7 @@ def tournament_opts(settings):
     global MIN_DTE
     fee, slip = cost_model(settings)
     set_prem_range(settings.get("prem_min", 0), settings.get("prem_max", 0))
+    set_max_otm(settings.get("max_otm", 15))
     try:
         MIN_DTE = max(0, min(60, int(settings.get("min_dte", 7))))
     except (TypeError, ValueError):
@@ -2260,6 +2302,7 @@ def tournament_opts(settings):
                 long_holds=bool(settings.get("long_holds", True)),
                 scalp_share=scalp_share(settings), hindsight=bool(settings.get("hindsight", True)),
                 miner=bool(settings.get("strategy_miner", True)),
+                maxotm=MAX_OTM[0], lessons=bool(settings.get("trade_lessons", True)),
                 legends=bool(settings.get("legends", True)),
                 legend_share=min(0.4, max(0.0, float(settings.get("legend_share", 10) or 0) / 100)),
                 kami_share=(min(0.3, max(0.0, float(settings.get("kami_share", 10) or 0) / 100))
@@ -2340,6 +2383,8 @@ TRAITS = {
     "omode":   dict(lo=1, hi=3, kind=int, text=lambda v: {1: "calls only", 2: "puts only", 3: "calls and puts"}.get(int(v), "calls and puts")),
     "odte":    dict(lo=1, hi=60, kind=int, text=lambda v: f"buys contracts about {v} days from expiry"),
     "otm":     dict(lo=0.25, hi=12.0, kind=float, text=lambda v: f"strikes {v:g}% out of the money"),
+    "maxotm":  dict(lo=2.0, hi=40.0, kind=float,
+                    text=lambda v: f"never buys a contract over {v:g}% out of the money (skips the trade instead)"),
     "oexit":   dict(lo=1, hi=10, kind=int, text=lambda v: f"gets out {v} day{'s' if v != 1 else ''} before expiry"),
     "flatby":  dict(lo=5, hi=45, kind=int, text=lambda v: f"scalper: flat {v} min before the close, never overnight"),
     "vixmode": dict(lo=1, hi=5, kind=int, text=lambda v: VIX_MODES.get(int(v), VIX_MODES[5])),
@@ -2355,6 +2400,7 @@ TRAIT_NAMES = {"trail": "Trailing stop", "maxhold": "Max hold", "minhold": "Min 
                "minvol": "Min volatility", "rsicap": "Overbought guard", "confirm": "Confirmation",
                "entries": "Max entries", "exit": "Stops-only exit", "moods": "Mood gate", "adapt": "Adaptive stops",
                "omode": "Calls / puts (1 calls, 2 puts, 3 both)", "odte": "Days to expiry", "otm": "% out of the money",
+               "maxotm": "Farthest out it will buy (%)",
                "oexit": "Exit days before expiry", "flatby": "Flat before the close (minutes, scalpers)",
                "decay": "Decay exit (% a day)", "ivdrop": "Volatility-collapse exit (% drop)",
                "vixmode": "Volatility gate (1 calm, 2 rising, 3 spikes, 4 not spikes, 5 any)",
@@ -3148,6 +3194,8 @@ class Variant:
         self.live_eq0 = None     # its equity when it started trading live (after any replay)
         self.log = deque(maxlen=300)  # (decision number, coin, side, price) of this bot's own trades, for charts
         self.best_tr = self.worst_tr = None  # its best and worst finished trade, % of what it paid
+        self.trade_pcts = []    # its last 40 finished trades, % of what it paid (for its typical trade)
+        self.best_pl = 0.0      # its single best finished trade, $ (a record carried by one trade isn't proof)
         self.log_ct = {}  # (decision, ticker) -> "call" / "put" of the contract traded there
         self.roam_scan = None  # scalpers: [trades, wins, pl, paid] from Free roam's scalp roams on past days (fading)
         self.trade_eq = deque(maxlen=SCALP_JUDGE + 1)  # scalpers: (decision, equity) after each finished trade
@@ -3219,6 +3267,8 @@ class Tournament(FarmMixin):
         self.o.update(opts or {})
         if self.o.get("prem"):  # worker processes get the contract price range this way
             set_prem_range(*self.o["prem"])
+        if self.o.get("maxotm") is not None:  # ...and the farthest-out ceiling
+            set_max_otm(self.o["maxotm"])
         if self.o.get("cfee") is not None:
             CONTRACT_FEE[0] = float(self.o["cfee"])
         if self.o.get("sspread"):  # worker processes get the scalpers' spread limit this way
@@ -3238,6 +3288,7 @@ class Tournament(FarmMixin):
         self.serial = 0
         self.lineage = {}       # uid -> family-tree record (kept after a bot is removed)
         self.elders = []        # genes of good bots that left the farm: they nudge future eggs (newest last)
+        self.lessons = {}       # kind of trade -> [trades, summed gain %, wins] (calls/puts, how far out, exit, hold)
         self.legends = []       # bots with a proven record, kept for good (best first): new eggs and the miner learn from them
         self.champions = {}     # mood -> genes and record of the best bot seen in that mood (seasons)
         self.season = None      # the market mood of the current season
@@ -3510,6 +3561,116 @@ class Tournament(FarmMixin):
         w = sum(e["fwd"][1] for e in book)
         return 0.15 if n < 4 else min(0.15, max(0.05, 0.15 * (w / n) / 0.3))
 
+    # ---- judging a record by its typical trade, not one lucky one ----
+    def typical(self, v):
+        """Its typical (median) finished trade, % of what it paid, or None with fewer than 5."""
+        x = sorted(getattr(v, "trade_pcts", None) or [])
+        if len(x) < 5:
+            return None
+        m = len(x) // 2
+        return x[m] if len(x) % 2 else (x[m - 1] + x[m]) / 2
+
+    def one_hit(self, v):
+        """Is this bot's lifetime gain carried by a single trade? True when it has 3+ finished trades, its best one
+        doubled its money or more, and without that one trade it would have lost money overall. (One huge win can
+        also be a pricing fluke on a far-out contract.)"""
+        closed = v.wins + v.losses
+        best = float(getattr(v, "best_pl", 0) or 0)
+        if closed < 3 or best <= 0 or not v.eq or not v.sim.start or (v.best_tr or 0) < 100:
+            return False
+        return (v.eq[-1] - v.sim.start) - best <= 0
+
+    def proven_bots(self):
+        return [v for v in self.vars if self.proven(v)]
+
+    def standins(self, keep=lambda v: True):
+        return FarmMixin.standins(self, lambda v: keep(v) and not self.one_hit(v))
+
+    def hall_of_fame_candidates(self, min_win_steps, min_trades):
+        return [v for v in FarmMixin.hall_of_fame_candidates(self, min_win_steps, min_trades) if not self.one_hit(v)]
+
+    # ---- trade lessons: what the farm's own closed trades say about how to trade ----
+    def learn_lesson(self, t, pc):
+        """Files one finished trade under what kind of trade it was: call or put, how far out of the money it was
+        bought, how it was sold, and how long it was held. Gains count at most +200% (one fluke can't teach)."""
+        book = self.__dict__.setdefault("lessons", {})
+        ct = t.get("contract") or {}
+        pc = max(-100.0, min(200.0, pc))
+        keys = []
+        if ct.get("type") in ("call", "put"):
+            keys.append("side:" + ct["type"])
+        d = ct.get("otm0")
+        if d is not None:
+            keys.append("dist:" + ("0-5" if d < 5 else "5-15" if d < 15 else "15-30" if d < 30 else "30+"))
+        keys.append("exit:" + exit_kind(t.get("why")))
+        h = t.get("held")
+        if h is not None:
+            keys.append("hold:" + ("0-15" if h < 15 else "15-60" if h < 60 else "60-240" if h < 240 else "240+"))
+        for k in keys:
+            s = book.setdefault(k, [0.0, 0.0, 0.0])
+            if s[0] >= 600:  # recent trades count most
+                s[:] = [x / 2 for x in s]
+            s[0] += 1
+            s[1] += pc
+            s[2] += pc > 0
+
+    def _lesson(self, *keys):
+        """(trades, average %, share won) over these lesson keys together."""
+        book = getattr(self, "lessons", None) or {}
+        n = sum(book.get(k, [0, 0, 0])[0] for k in keys)
+        if n <= 0:
+            return 0, 0.0, 0.0
+        return n, sum(book.get(k, [0, 0, 0])[1] for k in keys) / n, sum(book.get(k, [0, 0, 0])[2] for k in keys) / n
+
+    def lesson_view(self):
+        """What the farm's trades say, once there's enough of them: dict with 'side' ('call'/'put': the one doing
+        clearly better), 'maxotm' (a limit that would have done clearly better), 'exit' ('rules' when selling on
+        signals did clearly worse than letting stops and targets do it), 'minhold' (when the quickest trades did
+        clearly worse). Each entry is (choice, plain-words evidence)."""
+        out, N, GAP = {}, LESSON_MIN, LESSON_GAP
+        c, p = self._lesson("side:call"), self._lesson("side:put")
+        if c[0] >= N and p[0] >= N and abs(c[1] - p[1]) >= GAP:
+            good, bad = ("call", "put") if c[1] > p[1] else ("put", "call")
+            g, b = (c, p) if good == "call" else (p, c)
+            out["side"] = (good, f"{good}s averaged {g[1]:+.1f}% over {g[0]:.0f} trades, {bad}s {b[1]:+.1f}% over {b[0]:.0f}")
+        buckets = ("dist:0-5", "dist:5-15", "dist:15-30", "dist:30+")
+        allb = self._lesson(*buckets)
+        if allb[0] >= N:
+            best = None
+            for i, lim in enumerate((5, 15, 30)):
+                x = self._lesson(*buckets[:i + 1])
+                if x[0] >= N and x[1] >= allb[1] + GAP and (best is None or x[1] > best[1][1]):
+                    best = (lim, x)
+            if best:
+                out["maxotm"] = (best[0], f"contracts within {best[0]}% averaged {best[1][1]:+.1f}% over {best[1][0]:.0f} "
+                                          f"trades, all of them {allb[1]:+.1f}%")
+        sig, rules = self._lesson("exit:signal"), self._lesson("exit:target", "exit:stop", "exit:trail", "exit:time")
+        if sig[0] >= N and rules[0] >= N and rules[1] - sig[1] >= GAP:
+            out["exit"] = ("rules", f"selling on signals averaged {sig[1]:+.1f}% over {sig[0]:.0f} trades; stops, targets "
+                                    f"and time limits {rules[1]:+.1f}% over {rules[0]:.0f}")
+        q, rest = self._lesson("hold:0-15"), self._lesson("hold:15-60", "hold:60-240")
+        if q[0] >= N and rest[0] >= N and rest[1] - q[1] >= GAP:
+            out["minhold"] = (15, f"trades held under 15 decisions averaged {q[1]:+.1f}% ({q[2] * 100:.0f}% won); "
+                                  f"held 15-240, {rest[1]:+.1f}%")
+        return out
+
+    def lesson_traits(self, t):
+        """A new egg leans toward what the farm's trades say works (each lesson applies to about half the eggs, so the
+        other way keeps being tried and the lesson stays honest)."""
+        if not self.o.get("lessons", True) or (t or {}).get("kami") or (t or {}).get("flatby"):
+            return t
+        lv = self.lesson_view()
+        t = dict(t)
+        if "side" in lv and "omode" not in t and self.rng.random() < 0.5:
+            t["omode"] = 1 if lv["side"][0] == "call" else 2
+        if "maxotm" in lv and self.rng.random() < 0.5:
+            t["maxotm"] = lv["maxotm"][0] * self.rng.uniform(0.8, 1.2)
+        if "exit" in lv and self.rng.random() < 0.4:
+            t["exit"] = 1
+        if "minhold" in lv and "minhold" not in t and self.rng.random() < 0.5:
+            t["minhold"] = self.rng.randint(12, 30)
+        return clean_traits(t)
+
     # ---- Legends: bots with a proven record, kept for good (they don't vanish when they leave the farm) ----
     def legend_case(self, v):
         """Why bot v belongs among the Legends (a short reason), or None. Kamikazes never do. A legend either passed
@@ -3520,7 +3681,10 @@ class Tournament(FarmMixin):
         closed = v.wins + v.losses
         lf = self.life(v)
         exam = exam_verdict(v, getattr(self, "serial", 100))[0]
-        if lf["ret"] <= 0 or exam == "failed":
+        if lf["ret"] <= 0 or exam == "failed" or self.one_hit(v):
+            return None
+        typ_ = self.typical(v)
+        if typ_ is not None and typ_ < TYPICAL_FLOOR:
             return None
         if exam == "passed" and closed >= 3:
             return "passed its exams and made money"
@@ -3766,7 +3930,7 @@ class Tournament(FarmMixin):
                 if k == "moods":
                     v = self.rng.randint(1, 14)
                 t[k] = v
-        return clean_traits(t)
+        return self.lesson_traits(clean_traits(t))
 
     def _rand_sub(self, avoid=None):
         name = self.rng.choice([n for n in WILDCARD_STRATS if n != avoid] or WILDCARD_STRATS)
@@ -4112,6 +4276,10 @@ class Tournament(FarmMixin):
                     pc_ = t["pl"] / paid_ * 100
                     v.best_tr = pc_ if v.best_tr is None else max(v.best_tr, pc_)
                     v.worst_tr = pc_ if v.worst_tr is None else min(v.worst_tr, pc_)
+                    v.trade_pcts = (list(getattr(v, "trade_pcts", None) or []) + [round(pc_, 2)])[-40:]
+                    v.best_pl = max(float(getattr(v, "best_pl", 0) or 0), float(t["pl"]))
+                    if not self.replaying and self.o.get("lessons", True):
+                        self.learn_lesson(t, pc_)
                 if t.get("flags") and not self.replaying:
                     for k in t["flags"]:
                         self.review.setdefault(k, [0, 0])[0 if t["pl"] <= 0 else 1] += 1
@@ -4248,6 +4416,12 @@ class Tournament(FarmMixin):
                 self.grade_legend(v, exam == "passed")
             if w > 0 and exam != "off":  # results on days it never trained on: passing counts for more, failing for less
                 w *= {"passed": 1.3, "failed": 0.5}.get(exam, 0.85)
+            if w > 0 and not is_kami(v):  # a record carried by one big trade, or a losing typical trade, counts for less
+                if self.one_hit(v):
+                    w *= 0.4
+                typ_ = self.typical(v)
+                if typ_ is not None and typ_ < TYPICAL_FLOOR:
+                    w *= 0.6
             if w > 0 and o.get("risk_adjusted", True):
                 w *= 0.5 + min(self.sortino(v), 5.0) / 2  # steady gains count for more than bumpy ones
             if w > 0:
@@ -4386,6 +4560,11 @@ class Tournament(FarmMixin):
             if got < need_r:
                 gaps.append(f"{need_r - got} more winning exam day{'s' if need_r - got != 1 else ''} at real option prices"
                             " (scalpers)")
+        if not kami and self.one_hit(v):
+            gaps.append("a record that isn't carried by a single trade (without its best one it lost money)")
+        typ_ = self.typical(v)
+        if not kami and typ_ is not None and typ_ < TYPICAL_FLOOR:
+            gaps.append(f"a better typical trade (half its trades lose more than {-typ_:.0f}%)")
         if self.o.get("proven_exam", True) and not kami:  # (kamikazes aren't examined: their record is their proof)
             verdict, d = exam_verdict(v, self.serial)
             if verdict == "failed":
@@ -4831,7 +5010,7 @@ class Tournament(FarmMixin):
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
-                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src", "legend_src")
+                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src", "legend_src", "trade_pcts", "best_pl")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -4849,7 +5028,7 @@ class Tournament(FarmMixin):
                     elders=self.elders[-40:], champions=self.champions, season=self.season,
                     review=self.review, mut_stats=self.mut_stats, evolves=self.evolves,
                     seasons_log=self.seasons_log[-50:], hindsight=getattr(self, "hindsight", {}), mined=getattr(self, "mined", []),
-                    legends=getattr(self, "legends", []),
+                    legends=getattr(self, "legends", []), lessons=getattr(self, "lessons", {}),
                     instincts={k: list(x) for k, x in self.instincts.items()}, instinct_best=dict(self.instinct_best),
                     trial_book=getattr(self, "trial_book", {}),
                     hold_curve=list(getattr(self, "hold_curve", []))[-(self.W * 10 + 2):], bots=bots,
@@ -4943,6 +5122,8 @@ class Tournament(FarmMixin):
         self.hindsight = dict(st.get("hindsight") or {})
         self.mined = list(st.get("mined") or [])
         self.legends = [d for d in (st.get("legends") or []) if isinstance(d, dict) and isinstance(d.get("genes"), dict)]
+        self.lessons = {k: [float(x) for x in s][:3] for k, s in (st.get("lessons") or {}).items()
+                        if isinstance(s, (list, tuple)) and len(s) >= 3}
         self.last_px = {c: float(x) for c, x in (st.get("last_px") or {}).items() if isinstance(x, (int, float)) and x > 0}
         self.instincts = {k: [float(x[0]), int(x[1]), float(x[2]) if len(x) > 2 else float(x[0])]
                           for k, x in (st.get("instincts") or {}).items() if isinstance(x, (list, tuple)) and len(x) >= 2}
@@ -5181,6 +5362,7 @@ def fresh_scoreboard(t):
     for v in t.vars:
         v.exams, v.backtests, v.roam_scan = [], [], None
         v.best_tr = v.worst_tr = None
+        v.trade_pcts, v.best_pl = [], 0.0
         v.coin_pl, v.mood_gain, v.mood_n, v.cond_gain, v.cond_n = {}, {}, {}, {}, {}
         v.live_high = None
         v.twin = None
@@ -5267,6 +5449,10 @@ INSTINCT_PROVEN = 10   # reviews before a positive record counts as proven
 def teach_from(dst, src):
     """Passes a trained farm's memory to another farm: elders, post-trade review, mutation memory and season champions."""
     dst.elders = (dst.elders + [e for e in src.elders])[-40:]
+    for k, s in (getattr(src, "lessons", None) or {}).items():
+        d_ = dst.__dict__.setdefault("lessons", {}).setdefault(k, [0.0, 0.0, 0.0])
+        for i in range(3):
+            d_[i] += s[i] * 0.5  # another farm's trades count for half
     if getattr(src, "legends", None) and hasattr(dst, "merge_legends"):
         dst.merge_legends(json.loads(json.dumps(src.legends)))
     for k, x in src.review.items():
@@ -5405,6 +5591,25 @@ def _mine_run(g, closes, extra, a, z, cuts, start_cash, fee, pct, slip):
             parts.append((eq / prev_eq - 1 if prev_eq else 0.0, cur_closed))
             prev_eq, cur_closed, ci = eq, 0, ci + 1
     return b.sim.equity({c: closes[c][z - 1] for c in coins}) / start_cash - 1, closed, wins, parts
+
+
+TYPICAL_FLOOR = -15.0  # a bot whose typical (median) trade loses more than this % can't be proven or a legend
+LESSON_MIN = 40       # trades each side of a comparison needs before the farm draws a trade lesson from it
+LESSON_GAP = 3.0      # ...and how much better (points of average gain per trade) the better way must be
+
+
+def exit_kind(why):
+    """How a trade was sold, from its reason: 'target', 'stop', 'trail', 'time' or 'signal'."""
+    w = str(why or "").lower()
+    if "profit target" in w:
+        return "target"
+    if "safety stop" in w:
+        return "stop"
+    if "trailing" in w:
+        return "trail"
+    if any(x in w for x in ("held as long", "decay", "expiry", "flat ", "volatility has dropped")):
+        return "time"
+    return "signal"
 
 
 LEGENDS_MAX = 60    # how many legends a farm keeps (the best; the saved Legends file keeps up to 200)
@@ -5733,6 +5938,13 @@ def farm_knowledge(t):
         items.append(dict(id=f"gate:{g}", kind="Volatility gate", title=VIX_MODES.get(g, ""), detail="scalpers' choice",
                           evidence=f"{n} scalpers, {win} winning", score=float(win), strong=win > 0,
                           data=dict(mode=g, genes=_genes(v) if v else None)))
+    # trade lessons: what the farm's own finished trades say
+    titles = {"side": "Prefer {}s", "maxotm": "Stay within {}% out of the money", "exit": "Let stops and targets sell",
+              "minhold": "Hold at least {} decisions"}
+    for k, (choice, ev) in (t.lesson_view() if hasattr(t, "lesson_view") else {}).items():
+        items.append(dict(id=f"lesson:{k}", kind="Trade lesson", title=titles[k].format(choice), detail="about half the new "
+                          "eggs lean this way; the rest keep testing the other way", evidence=ev, score=5.0, strong=True,
+                          data=dict(lessons={x: list(s) for x, s in (t.lessons or {}).items()})))
     # season champions, elders, mutation memory
     for m, ch in (t.champions or {}).items():
         items.append(dict(id=f"season:{m}", kind="Season champion", title=f"Champion of '{m}' markets",
@@ -5845,6 +6057,13 @@ def apply_knowledge(t, items, closes=None):
                     t.elders.append(dict(e))
                     del t.elders[:-40]
                 notes.append(f"{it['title']}: nudges this farm's future eggs")
+            elif k == "Trade lesson":
+                for x, s in (d.get("lessons") or {}).items():
+                    cur = t.__dict__.setdefault("lessons", {}).setdefault(x, [0.0, 0.0, 0.0])
+                    if cur[0] == 0:  # only where this farm has no evidence of its own; another farm's counts for half
+                        cur[:] = [float(s[i]) * 0.5 for i in range(3)]
+                notes.append(f"{it['title']}: this farm's new eggs lean that way too" if hasattr(t, "lesson_view") else
+                             f"{it['title']}: for reference only")
             elif k == "Mutation lesson":
                 st = t.mut_stats.setdefault(d["key"], [0, 0])
                 st[0] += d["stats"][0]
