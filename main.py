@@ -3969,7 +3969,25 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             return self.cost.get(coin, 0) / qty if qty else 0.0
         T = max(0.0, o["exp"] - time.time()) / E.YEAR
         vol = E.IV_HINT.get(t) or o.get("vol") or E.pricing_vol(self.hist.get(t) or [S], (self.hx.get(t) or {}).get("t"))
-        return E.bs_price(S, o["K"], T, vol, o["type"]) * E.CONTRACT
+        return E.bs_price(S, o["K"], T, vol, o["type"]) * E.CONTRACT * float(o.get("anchor") or 1.0)
+
+    def real_quote(self, o, fetch=False):
+        """(bid, ask) of the account's real listed contract when a quote under 3 minutes old is at hand (fetch=True:
+        asks Alpaca for one now if not), or None (no login, a model-only contract, or no quote)."""
+        sym = (o or {}).get("symbol")
+        if not sym or not self.client:
+            return None
+        q = self.opt_quotes.get(sym)
+        if not (q and time.time() - q[2] < 180 and q[1] > 0) and fetch and E.ALPACA.get("key"):
+            try:
+                q = E.option_quotes([sym]).get(sym)
+                if q:
+                    self.opt_quotes[sym] = q
+            except Exception:
+                q = None
+        if q and time.time() - q[2] < 180 and q[1] > 0:
+            return float(q[0]), float(q[1])
+        return None
 
     def ctx_list(self, coins=None):
         """The market-context tickers the bots watch (minus any they trade)."""
@@ -10751,23 +10769,30 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             val = self.position_price(c)
             if val <= 0:
                 continue
-            self.high[c] = max(self.high.get(c, val), val)
+            # a gain counts only when a real buyer pays it: with a real contract and a login, profit targets and
+            # trailing stops go by its real bid (and wait for a fresh quote), never by a model price
+            rq = self.real_quote(o) if o else None
+            real_c = bool(o and o.get("symbol") and self.client)
+            bid_val = rq[0] * E.CONTRACT if rq else (None if real_c else val)
+            if bid_val is not None:
+                self.high[c] = max(self.high.get(c, bid_val), bid_val)
             r = val / (self.cost[c] / q) - 1
+            rg = None if bid_val is None else bid_val / (self.cost[c] / q) - 1
             if sc:  # a scalp: the scalpers' own tight stop and target, and their time limit
                 if r <= -sc["sl"] / 100:
                     self.sell(c, self.last.get(tick_of(c), 0), "stop-loss")
-                elif r >= sc["tp"] / 100:
+                elif rg is not None and rg >= sc["tp"] / 100:
                     self.sell(c, self.last.get(tick_of(c), 0), "take-profit")
                 elif time.time() - sc.get("at", time.time()) >= sc.get("mins", 10) * 60:
                     self.sell(c, self.last.get(tick_of(c), 0), "scalp-time")
-                elif trail > 0 and val <= self.high[c] * (1 - trail):
+                elif trail > 0 and bid_val is not None and bid_val <= self.high[c] * (1 - trail):
                     self.sell(c, self.last.get(tick_of(c), 0), "trailing-stop")
                 continue
             if stop > 0 and r <= -stop:
                 self.sell(c, self.last.get(tick_of(c), 0), "stop-loss")
-            elif take > 0 and r >= take:
+            elif take > 0 and rg is not None and rg >= take:
                 self.sell(c, self.last.get(tick_of(c), 0), "take-profit")
-            elif trail > 0 and val <= self.high[c] * (1 - trail):
+            elif trail > 0 and bid_val is not None and bid_val <= self.high[c] * (1 - trail):
                 self.sell(c, self.last.get(tick_of(c), 0), "trailing-stop")
 
     def check_daily(self):
@@ -10947,7 +10972,12 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             o = dict(type=typ, K=K, exp=exp, symbol=real["symbol"])
             prem = real["ask"] * E.CONTRACT
             vol = float(real.get("iv") or 0) or E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
-            self.opt_quotes[real["symbol"]] = (real["bid"], real["ask"], cache[0])
+            self.opt_quotes[real["symbol"]] = (real["bid"], real["ask"], now if now - cache[0] > 90 else cache[0])
+            # the model's price for this contract vs what the market really quoted: kept, so when no fresh quote is at
+            # hand its value is the model's, scaled to this contract's real price (not the ticker's average volatility)
+            bs_ = E.bs_price(S, K, max(0.0, exp - now) / E.YEAR, vol, typ)
+            if bs_ > 0 and real["bid"] > 0:
+                o["anchor"] = round(min(1.5, max(0.3, (real["bid"] + real["ask"]) / 2 / bs_)), 4)
         else:
             K = round((S * (1 + otm / 100) if typ == "call" else S * (1 - otm / 100)) / step) * step
             exp = E.next_expiry(now, dte)
@@ -11024,6 +11054,10 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         half = E.half_spread(tick_of(c), value / E.CONTRACT) if o.get("scalp") else max(slip, 0.02)
         half += self.fill_adjust("sell")  # what Alpaca paper fills showed real sells cost (0 until it knows)
         fill = value if expired else value * (1 - half)
+        rq = None if expired else self.real_quote(o, fetch=True)
+        if rq is not None:  # a real listed contract: practice sells where a real sale would, at its bid
+            value = max(0.0, rq[0]) * E.CONTRACT
+            fill = value * (1 - max(0.0, self.fill_adjust("sell")))
         proceeds = qty * fill * (1 - (0 if expired else fee)) - (0 if expired else qty * E.CONTRACT_FEE[0])
         self.fees_paid += 0 if expired else qty * value * half + qty * fill * fee + qty * E.CONTRACT_FEE[0]
         pl = proceeds - self.cost.get(c, 0)
