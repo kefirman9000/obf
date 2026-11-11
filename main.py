@@ -203,6 +203,13 @@ SETTING_GROUPS = [
                       "a stretch, checked on the part after it), and new eggs start from what worked instead of at random", bool),
         ("strategy_miner", "Strategy miner: Free roam also mines long stretches for settings that made money again and "
                            "again (in most parts of the stretch, and after it), and new eggs hatch from those finds", bool),
+        ("miner_budget", "...most instincts and settings one miner study tries before giving up on a stretch (it works in "
+                         "rounds of 40, refining the closest ones each round)", int),
+        ("miner_finds", "...it stops early once this many finds held up", int),
+        ("miner_minutes", "...and spends at most this many minutes on one stretch", float),
+        ("legends", "Legends: bots with a proven record are kept in the Legends hall when they leave the farm (never lost), "
+                    "some new eggs hatch from them, and the miner re-tests them on new stretches", bool),
+        ("legend_share", "...% of new eggs hatched from Legends (less while their eggs don't hold up)", int),
         ("kamikazes", "Kamikaze breed: all-or-nothing bets on cheap far-out contracts with huge targets; each one also tests "
                       "one or two risky rules so your good bots don't have to. They get only a small say in your account", bool),
         ("kami_share", "...% of the farm kept for kamikazes", int),
@@ -2161,6 +2168,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         m.add_separator()
         m.add_command(label="Bot Library...", command=self.open_collection, accelerator="Ctrl+B")
         m.add_command(label="Hall of Fame...", command=self.open_hof, accelerator="Ctrl+H")
+        m.add_command(label="Legends (proven bots, kept for good)...", command=self.open_legends)
         m.add_command(label="Family (tree and bloodlines)...", command=self.open_family)
         m.add_command(label="Compare two bots...", command=lambda: self.compare_bots())
         m.add_command(label="Design an egg...", command=self.open_designer, accelerator="Ctrl+E")
@@ -5284,6 +5292,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                                    best=[b.get("score") for b in e.get("best", [])]) for k, e in (getattr(t, "hindsight", {}) or {}).items()},
                 hindsight_share=t.hindsight_share(), trial_book=getattr(t, "trial_book", {}),
                 rule_review=t.review, mutation_stats=t.mut_stats, elders=len(t.elders), knowledge=know,
+                legends=[{k: d.get(k) for k in ("nickname", "label", "why", "ret", "edge", "trades", "wins", "exam",
+                                                 "alive", "why_left", "kids", "again", "recalls", "score")}
+                         for d in (getattr(t, "legends", None) or [])],
                 top_bots=self._bot_rows(t), events=list(getattr(t, "events", []))[-40:],
                 all_bots=[dict(nickname=E.bot_nickname(v.key()), strategy=v.name, tf=v.tf, origin=v.origin,
                                status=t.info.get(id(v), {}).get("status"), age=v.age, live_n=v.live_n,
@@ -5878,6 +5889,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                     if note:
                         self.write(note, "bad")
             self.check_hof()
+            self.check_legends()
             for e in self.tourn.pop_events():
                 self.write("Wildcard: " + friendly_text(e[0].lower() + e[1:]))
             self.update_wild_msg()
@@ -7716,12 +7728,18 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
         def prog(d, n):
             self.roam_check_on(t)
-            cur.update(done=d, total=n, text=f"Mining: tried {d} of {n} instincts and settings across the stretch")
+            cur.update(done=d, total=n, text=f"Mining: tried {d} of up to {n} instincts and settings across the stretch "
+                                             f"(it keeps refining the closest ones until enough hold up)")
+        st = self.settings
         try:
-            res = self.cores.call(E.mine_study, closes, extra, self.start_cash, fee, self.settings["trade_pct"] / 100, slip,
+            res = self.cores.call(E.mine_study, closes, extra, self.start_cash, fee, st["trade_pct"] / 100, slip,
                                   rng, prior=getattr(t, "mined", []),
                                   stop=lambda: self.tourn is not t or not self.cfg.get("roam_on"), progress=prog,
-                                  risk_caps=t.risk_caps)
+                                  risk_caps=t.risk_caps,
+                                  budget=max(40, int(st.get("miner_budget", E.MINE_BUDGET) or E.MINE_BUDGET)),
+                                  want=max(1, int(st.get("miner_finds", E.MINE_FINDS) or E.MINE_FINDS)),
+                                  max_secs=max(60, float(st.get("miner_minutes", E.MINE_SECS / 60) or 10) * 60),
+                                  legends=t.legend_genes_for_miner() if hasattr(t, "legend_genes_for_miner") else None)
         except E.NoHistory:  # stretch too short for 6 parts: a hindsight study fits it instead
             self.roam_now = None
             return self._roam_hindsight(t)
@@ -7731,6 +7749,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 return
             new = t.learn_mined(res)
             ok = [r for r in res["results"] if r["ok"]]
+            again = t.legends_mined_again(res) if hasattr(t, "legends_mined_again") else []
             grad = ""
             if ok and self.seeded and not t.nursery_full() and not info.get("revisit"):
                 g = ok[0]["genes"]
@@ -7750,9 +7769,12 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             rec = dict(time=time.time(), kind="Strategy miner", revisit=bool(info.get("revisit")), start=info["start"], end=info["end"],
                        gran=info["gran"], bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=rows,
                        passed=len(ok), graduate=grad,
-                       summary=f"tried {res['tried']} instincts and settings over {res['parts']} parts; {len(ok)} made money in "
+                       summary=f"tried {res['tried']} instincts and settings over {res['parts']} parts in "
+                               f"{res.get('rounds', 1)} round{'s' if res.get('rounds', 1) != 1 else ''}; {len(ok)} made money in "
                                f"at least {res['need']} of them and after ({new} new to the book)"
-                               + (f"; {grad} hatched from the steadiest" if grad else ""))
+                               + ("" if ok else f"; the closest worked in {res.get('best_worked', 0)} of {res['parts']}")
+                               + (f"; {grad} hatched from the steadiest" if grad else "")
+                               + (f"; legend{'s' if len(again) != 1 else ''} {', '.join(again)} still worked here" if again else ""))
             self._roam_finish(rec, cur)
         self.q.put(("call", apply))
 
@@ -12948,6 +12970,17 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
         s_ = lambda k: (lambda: bool(st.get(k, True)), lambda on: self._set_flag("settings", k, on))
         c_ = lambda k, d=False: (lambda: bool(self.cfg.get(k, d)), lambda on: self._set_flag("cfg", k, on))
+        def legend_status():
+            t = self.tourn
+            book = list(getattr(t, "legends", None) or []) if t else []
+            if not book:
+                return f"None yet on this farm ({len(E.load_legends())} saved from earlier farms)."
+            born = sum((d.get("kids") or [0, 0])[0] for d in book)
+            good = sum((d.get("kids") or [0, 0])[1] for d in book)
+            alive = sum(1 for d in book if d.get("alive"))
+            return (f"{len(book)} legends ({alive} on the farm); best: {book[0].get('nickname')} "
+                    f"{(book[0].get('ret') or 0) * 100:+.1f}%" + (f"; their eggs: {good} of {born} did well" if born else "") + ".")
+
         def think_status():
             t = self.tourn
             n = getattr(t, "thinks", 0) if t else 0
@@ -12973,9 +13006,15 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                                    "practice farms live through them, and every lesson comes home.",
              roam_status, (lambda: bool(self.cfg.get("roam_on")), lambda on: self.toggle_roam(on)), self.open_roam),
             ("\u26cf", "Strategy miner", "Mines long stretches of the past for settings that made money again and again "
-                                        "(in most parts of the stretch, and after it), not just once. New eggs hatch from "
+                                        "(in most parts of the stretch, and after it), not just once. It doesn't give up "
+                                        "after one batch: round after round it refines the closest tries and fills in "
+                                        "instincts it barely tried (up to 240 per stretch, Settings). New eggs hatch from "
                                         "its finds; finds whose eggs don't hold up are dropped.",
              mine_status, s_("strategy_miner"), self.open_roam),
+            ("\u265b", "Legends", "Bots that proved themselves are kept here for good when they leave the farm. Some new "
+                                  "eggs hatch from them, elders' nudges include them, and the Strategy miner re-tests "
+                                  "them on new stretches.",
+             legend_status, s_("legends"), self.open_legends),
             ("\U0001f52e", "Hindsight", "Looks back at what WOULD have worked: many instincts and settings tried on the past, "
                                        "checked on prices they didn't see. New eggs start from what worked.",
              hind_status, s_("hindsight"), lambda: self.open_knowledge()),
@@ -16027,6 +16066,140 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         ttk.Button(b, text="Add to this run", command=add_run).pack(side="left", padx=6)
         ttk.Button(b, text="Remove", command=remove).pack(side="left")
         ttk.Button(b, text="Catch", command=lambda: self.catch_rows(chosen(), "hall of fame")).pack(side="left", padx=(6, 0))
+        ttk.Button(b, text="Refresh", command=fill).pack(side="left", padx=6)
+        ttk.Button(b, text="Close", command=w.destroy).pack(side="right")
+        status = ttk.Label(b, foreground=MUTED)
+        status.pack(side="right", padx=10)
+        fill()
+
+    # ---------------- Legends: bots with a proven record, kept for good ----------------
+    def check_legends(self):
+        """Keeps the Legends up to date (every 10 decisions): bots that earned it join, living legends' records are
+        refreshed, and the hall is saved to legends.json whenever it changes, so no legend is lost with a farm. The
+        first time a farm runs here, the saved Legends join its hall (new eggs and the miner learn from them)."""
+        t = self.tourn
+        if t is None or not self.settings.get("legends", True):
+            return
+        try:
+            if not getattr(t, "_legends_loaded", False):
+                t._legends_loaded = True
+                n = t.merge_legends(E.load_legends())
+                if n:
+                    self.write(f"\u265b {n} saved Legend{'s' if n != 1 else ''} joined this farm's hall: some new eggs "
+                               f"hatch from them, and the Strategy miner re-tests them.", "good")
+            if t.n % 10:
+                return
+            new = t.sweep_legends()
+            for nm in new:
+                d = next((x for x in t.legends if x.get("nickname") == nm), None)
+                if d:
+                    self.alert("hof", f"\u265b {nm} joined the Legends: {d.get('why')} ({d.get('ret', 0) * 100:+.1f}% over "
+                                      f"{d.get('trades', 0)} trades).")
+            sig = tuple((d.get("id"), d.get("alive"), tuple(d.get("kids") or ()), d.get("again", 0)) for d in t.legends)
+            if sig != getattr(t, "_legends_sig", None):
+                t._legends_sig = sig
+                E.save_legends(t.legends, self.version)
+        except Exception:
+            note = self._record_error("updating the Legends")
+            if note:
+                self.write(note, "bad")
+
+    def open_legends(self):
+        """The Legends hall: every bot that proved itself, on this farm now or long gone, with its record and what
+        it has taught since."""
+        if getattr(self, "leg_win", None) is not None and self.leg_win.winfo_exists():
+            return self.leg_win.lift()
+        w = self.leg_win = tk.Toplevel(self.root)
+        w.title("Legends")
+        w.geometry("1080x540")
+        top = ttk.Frame(w, padding=(10, 10, 10, 4))
+        top.pack(fill="x")
+        ttk.Label(top, text="\u265b Legends", font=("", 13, "bold")).pack(anchor="w")
+        ttk.Label(top, foreground=MUTED, wraplength=1040, text=(
+            "Bots that proved themselves stay here when they leave the farm, instead of disappearing: those that passed "
+            "their exams and made money, beat just holding over 8+ finished trades, or were long-term winners. About "
+            f"{int(self.settings.get('legend_share', 10) or 0)}% of new eggs hatch from them (less while their eggs don't "
+            "hold up), elders' nudges include them, and the Strategy miner re-tests them on new stretches ('Found again'). "
+            "Bring one back to let it compete again from scratch. Past wins don't guarantee future ones.")).pack(anchor="w", pady=(2, 0))
+        mid = ttk.Frame(w, padding=(10, 4))
+        mid.pack(fill="both", expand=True)
+        t = self.make_tree(mid, ("name", "strategy", "ret", "edge", "trades", "exam", "status", "kids", "again", "when"),
+                           (120, 270, 70, 85, 80, 70, 170, 70, 70, 110),
+                           ("Legend", "Strategy", "Return", "vs holding", "Trades (won)", "Exams", "Now", "Eggs did well",
+                            "Found again", "Joined"))
+        t.configure(selectmode="extended")
+        state = {"rows": []}
+
+        def rows():
+            farm = list(getattr(self.tourn, "legends", None) or []) if self.tourn else []
+            ids = {d.get("id") for d in farm}
+            saved = [dict(d, alive=False, _saved=True) for d in E.load_legends() if d.get("id") not in ids]
+            return farm + saved
+
+        def fill():
+            t.delete(*t.get_children())
+            state["rows"] = rows()
+            for i, d in enumerate(state["rows"]):
+                g = d["genes"]
+                k = d.get("kids") or [0, 0]
+                if d.get("alive"):
+                    now = "on the farm"
+                elif d.get("_saved"):
+                    now = "saved (another farm)"
+                else:
+                    now = "retired: " + str(d.get("why_left") or "left")
+                t.insert("", "end", iid=str(i), values=(
+                    d.get("nickname", "?"), friendly_label(g["name"], g["params"], g.get("tf", 1), self.session_bar),
+                    f"{(d.get('ret') or 0) * 100:+.1f}%", "-" if d.get("edge") is None else f"{d['edge'] * 100:+.1f}%",
+                    f"{d.get('trades', 0)} ({d.get('wins', 0)})", d.get("exam", "-"), now,
+                    f"{k[1]} of {k[0]}" if k[0] else "-", d.get("again", 0) or "-",
+                    datetime.fromtimestamp(d.get("inducted") or time.time()).strftime("%Y-%m-%d %H:%M")))
+            alive = sum(1 for d in state["rows"] if d.get("alive"))
+            status.config(text=f"{len(state['rows'])} legends, {alive} on the farm  |  {E.legends_path()}")
+
+        def chosen():
+            return [state["rows"][int(i)] for i in t.selection()]
+
+        def bring():
+            if not self.tourn or not self.seeded:
+                return messagebox.showinfo("Legends", "Start your farm first (Wildcard), then bring legends back.", parent=w)
+            sel = [d for d in chosen() if not d.get("alive")]
+            if not sel:
+                return messagebox.showinfo("Legends", "Select one or more legends that aren't on the farm.", parent=w)
+            closes = {c: self.hist[c] for c in self.session_coins}
+            n = 0
+            for d in sel:
+                if d.get("_saved"):
+                    self.tourn.merge_legends([{k: x for k, x in d.items() if k != "_saved"}])
+                    d = next((x for x in self.tourn.legends if x.get("genes") == d["genes"]), None)
+                if d and self.tourn.recall_legend(d["id"], closes):
+                    n += 1
+            self.flush_events()
+            self.refresh_board()
+            self.write(f"\u265b Brought back {n} legend{'s' if n != 1 else ''}: they start fresh and have to win again on "
+                       f"today's prices." if n else "Couldn't bring them back (the farm is full of bots that are winning).")
+            fill()
+
+        def catch():
+            sel = chosen() or state["rows"]
+            if sel:
+                self.catch_rows([dict(d["genes"]) for d in sel], "legends")
+
+        def forget():
+            sel = [d for d in chosen() if not d.get("alive")]
+            if not sel or not messagebox.askyesno("Legends", f"Forget {len(sel)} legend{'s' if len(sel) != 1 else ''} for "
+                                                             f"good? (Legends on the farm now can't be forgotten.)", parent=w):
+                return
+            for d in sel:
+                E.forget_legend(d.get("id"))
+                if self.tourn and d in getattr(self.tourn, "legends", []):
+                    self.tourn.legends.remove(d)
+            fill()
+        b = ttk.Frame(w, padding=10)
+        b.pack(fill="x")
+        ttk.Button(b, text="Bring back to the farm", style="Accent.TButton", command=bring).pack(side="left")
+        ttk.Button(b, text="Catch to Library", command=catch).pack(side="left", padx=6)
+        ttk.Button(b, text="Forget", command=forget).pack(side="left")
         ttk.Button(b, text="Refresh", command=fill).pack(side="left", padx=6)
         ttk.Button(b, text="Close", command=w.destroy).pack(side="right")
         status = ttk.Label(b, foreground=MUTED)

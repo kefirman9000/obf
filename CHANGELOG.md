@@ -10,6 +10,24 @@
 
 
 
+## 1.39.0
+- **The Strategy miner works harder before it gives up.** It used to try one batch of 40 instincts and settings per
+  stretch and stop, even when nothing held up. Now it works in rounds: each new round refines the closest tries so far
+  (settings nudged, a neighbouring decision speed, another stop/target), fills in instincts it has barely tried, and adds
+  fresh ideas. It never tries the same settings twice, and it stops once 3 finds held up, after 240 tries, or after 10
+  minutes on one stretch (Settings: miner budget, finds, minutes). A find now also needs at least one finished trade
+  on the part it never saw. On test data where the first batch's best worked in 2 of 6 parts, later rounds reached
+  5 of 6 and found settings that held up. Its log line says how many rounds it took, and how close it came when
+  nothing held up.
+- **Legends** (new, on by default; Tools menu, Learning list and Settings). Bots that proved themselves no longer
+  vanish when they leave the farm: those that passed their exams and made money, beat just holding over 8+ finished
+  trades, or were long-term winners join the Legends with their record, and keep it after they retire. The bots
+  learn from them: about 10% of new eggs hatch from a legend (less while their eggs don't hold up), elders' nudges
+  include them, and the Strategy miner re-tests the best legends on every new stretch ('Found again'). Each legend
+  shows how many of its eggs did well. Legends are saved to `legends.json` in your data folder (up to 200, best
+  first), so they carry over to new farms and sessions. In the Legends window you can bring one back to compete
+  again from scratch, catch it to your Library, or forget it. The detailed report includes them.
+
 ## 1.38.0
 - **Strategy miner** (new, on by default; Learning list and Settings). Free roam now also mines long stretches of the
   past (about 1 study in 6): it cuts the first 75% into 6 parts and tries 40 instincts and settings straight through,
