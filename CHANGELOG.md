@@ -10,6 +10,18 @@
 
 
 
+## 1.38.0
+- **Strategy miner** (new, on by default; Learning list and Settings). Free roam now also mines long stretches of the
+  past (about 1 study in 6): it cuts the first 75% into 6 parts and tries 40 instincts and settings straight through,
+  counting the parts each one made money in. The steadiest are checked on the last 25% they never saw. A find counts
+  only when it made money in at least 4 of the 6 parts, overall, and on the check. Finds go into the miner's book
+  (found again on another stretch = stronger), and up to 15% of new eggs hatch from them; the steadiest find of each
+  study hatches on your farm right away. Each mined egg is graded on its exams, and finds whose eggs keep failing
+  are dropped from the book. Its studies are in the Free roam log (filter: Strategy miner).
+- **Auto training camp teaches your farm before you press Continue.** When the app reopens with your farm loaded
+  but not running yet, the auto camp used to skip it ("start your farm"). Now the farm learns from every camp right
+  away (and is saved), and the camps' graduates wait and join as soon as it runs.
+
 ## 1.37.1
 - Fixed an error when pressing Bring / Save in the Training camp with no farm running or no bots passed: it now shows the note instead.
 

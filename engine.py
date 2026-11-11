@@ -1631,6 +1631,7 @@ DEFAULT_SETTINGS = {
     "think_between": True,       # a few times a minute the bots also decide on the candle that's still forming
     "long_holds": True,          # include slow, longer-holding bots from the start
     "show_broker_value": True,   # a tile with your Alpaca account's own value (logged in)
+    "strategy_miner": True,      # Free roam mines long stretches for settings that worked again and again; new eggs start from them
     "hindsight": True,           # bots learn from what would have worked (hindsight studies), and new eggs start from it
     "kamikazes": True,           # the kamikaze breed: all-or-nothing bets on cheap contracts, and the farm's rule testers
     "kami_share": 10,            # % of the farm kept for kamikazes (they have only a small say in your account)
@@ -2253,6 +2254,7 @@ def tournament_opts(settings):
                 vetoes=bool(settings.get("vetoes", True)), layers=bool(settings.get("layers", True)),
                 long_holds=bool(settings.get("long_holds", True)),
                 scalp_share=scalp_share(settings), hindsight=bool(settings.get("hindsight", True)),
+                miner=bool(settings.get("strategy_miner", True)),
                 kami_share=(min(0.3, max(0.0, float(settings.get("kami_share", 10) or 0) / 100))
                             if settings.get("kamikazes", True) else 0.0),
                 coin_prefs=bool(settings.get("coin_prefs", True)), confidence_sizing=bool(settings.get("confidence_sizing", True)),
@@ -3145,6 +3147,7 @@ class Variant:
         self.exams = []        # results on days / stretches it never trained on: {k: kind, edge: %, n: trades, at: time}
         self.cond_gain = {}    # condition (e.g. "vol:wild", "tod:open") -> summed equity change while it held
         self.cond_n = {}
+        self.mine_src = None   # hatched from the Strategy miner's book: the find it came from (graded forward once)
         self.hs_src = None     # hatched from the hindsight book: the instinct it came from (graded forward once)
 
     @property
@@ -3427,6 +3430,76 @@ class Tournament(FarmMixin):
         self.grade_hindsight(v, False)
         self._remove(v, "retired: a hindsight egg that lost on its first exam")
         return True
+
+    # ---- the Strategy miner's book: settings that worked again and again across a long stretch ----
+    def learn_mined(self, res):
+        """Records a Strategy miner run: each find that worked in most parts of the stretch (and after it) goes in the
+        book. Found again on another stretch, it counts as seen again (stronger). Keeps the best 24. -> new finds"""
+        book = self.__dict__.setdefault("mined", [])
+        new = 0
+        for r in res.get("results", []):
+            if not r.get("ok"):
+                continue
+            g = r["genes"]
+            key = _mine_key(g)
+            e = next((x for x in book if x.get("key") == key), None)
+            if e:
+                e["seen"] = e.get("seen", 1) + 1
+                e["worked"] += r["worked"]
+                e["parts"] += r["parts"]
+                e["check"] = round((e["check"] + r["check_ret"] * 100) / 2, 2)
+                e["at"] = res.get("at", time.time())
+                continue
+            new += 1
+            book.append(dict(id=f"m{int(time.time() * 1000) % 10**9}{new}", key=key, genes=g, worked=r["worked"],
+                             parts=r["parts"], look=round(r["look_ret"] * 100, 2), check=round(r["check_ret"] * 100, 2),
+                             seen=1, fwd=[0, 0], at=res.get("at", time.time())))
+        book.sort(key=lambda e: -self.mined_weight(e))
+        del book[24:]
+        return new
+
+    def mined_weight(self, e):
+        """How much a mined find counts: how often it worked across parts, how many stretches it was found on, and how
+        its eggs did afterwards (that counts most)."""
+        rate = (e.get("worked", 0) + 1) / (e.get("parts", 0) + 2)
+        return rate * min(4, e.get("seen", 1)) * (self.hindsight_fwd(e) * 2) ** 2
+
+    def mined_genes(self):
+        """Genes for a new egg from the Strategy miner's book (tweaked a little), or None."""
+        book = [e for e in (getattr(self, "mined", None) or []) if e["genes"].get("name") in WILDCARD_STRATS
+                and not ((e.get("fwd") or [0, 0])[0] >= 6 and (e.get("fwd") or [0, 0])[1] == 0)]
+        if not book or not self.o.get("miner", True):
+            return None
+        e = self.rng.choices(book, weights=[self.mined_weight(x) for x in book])[0]
+        g = json.loads(json.dumps(e["genes"]))
+        g["params"] = self.mutate(g["name"], g["params"], 0.08)
+        g["_mine_id"] = e["id"]
+        return g
+
+    def grade_mined(self, v, ok):
+        """A mined egg has shown how it does going forward: its find is graded (once per egg); finds whose eggs keep
+        failing afterwards are dropped from the book."""
+        src = getattr(v, "mine_src", None)
+        if not src:
+            return
+        v.mine_src = None
+        book = getattr(self, "mined", None) or []
+        e = next((x for x in book if x.get("id") == src), None)
+        if e is None:
+            return
+        e["fwd"][0] += 1
+        e["fwd"][1] += 1 if ok else 0
+        if e["fwd"][0] >= 4 and e["fwd"][1] * 4 < e["fwd"][0]:
+            book.remove(e)
+
+    def mined_share(self):
+        """Share of new eggs hatched from the Strategy miner's book: 15% while its finds hold up, down to 5% if not."""
+        book = getattr(self, "mined", None) or []
+        if not book or not self.o.get("miner", True):
+            return 0.0
+        n = sum(e["fwd"][0] for e in book)
+        w = sum(e["fwd"][1] for e in book)
+        return 0.15 if n < 4 else min(0.15, max(0.05, 0.15 * (w / n) / 0.3))
 
     def hindsight_share(self):
         """Share of new eggs hatched from the hindsight book: 20% while its eggs hold up (1 in 4 doing well later),
@@ -3734,6 +3807,8 @@ class Tournament(FarmMixin):
     def _remove(self, v, why):
         if v in self.vars and getattr(v, "hs_src", None):  # a hindsight egg leaving before its exams: how did it do?
             self.grade_hindsight(v, bool(v.eq) and v.sim.start > 0 and v.eq[-1] > v.sim.start)
+        if v in self.vars and getattr(v, "mine_src", None):  # a mined egg leaving before its exams
+            self.grade_mined(v, bool(v.eq) and v.sim.start > 0 and v.eq[-1] > v.sim.start)
         if v in self.vars and is_kami(v):
             try:
                 self.kami_learn(v)
@@ -3980,6 +4055,8 @@ class Tournament(FarmMixin):
                 status, w = "slowed", sc * cons ** 2
             if exam in ("passed", "failed") and getattr(v, "hs_src", None):
                 self.grade_hindsight(v, exam == "passed")
+            if exam in ("passed", "failed") and getattr(v, "mine_src", None):
+                self.grade_mined(v, exam == "passed")
             if w > 0 and exam != "off":  # results on days it never trained on: passing counts for more, failing for less
                 w *= {"passed": 1.3, "failed": 0.5}.get(exam, 0.85)
             if w > 0 and o.get("risk_adjusted", True):
@@ -4507,7 +4584,11 @@ class Tournament(FarmMixin):
         weakest duplicate. A scalpers-only farm (the live scalp lab) hatches a scalper instead."""
         if self.o.get("scalp_only"):
             return self.spawn_scalp(closes)
-        hg = self.hindsight_genes() if self.rng.random() < self.hindsight_share() else None
+        hg, src = None, "hindsight"
+        if self.rng.random() < self.mined_share():
+            hg, src = self.mined_genes(), "strategy miner"
+        if not hg and self.rng.random() < self.hindsight_share():
+            hg, src = self.hindsight_genes(), "hindsight"
         if hg and avoid and hg.get("name") == avoid:
             hg = None  # making room for other ideas: not another egg of the strategy that already fills the farm
         if hg:  # an egg from what would have worked, rather than a random one
@@ -4517,10 +4598,12 @@ class Tournament(FarmMixin):
                 if not cands:
                     return None
                 self._remove(cands[0], "dropped to make room")
-            v = self.add_variant(hg["name"], hg["params"], closes, note="Hindsight egg:", tf=hg.get("tf", 1),
-                                 origin="hindsight", risk=hg.get("risk"), traits=hg.get("traits"),
+            v = self.add_variant(hg["name"], hg["params"], closes, note="Mined egg:" if src == "strategy miner" else "Hindsight egg:",
+                                 tf=hg.get("tf", 1), origin=src, risk=hg.get("risk"), traits=hg.get("traits"),
                                  vetoes=hg.get("vetoes"), layers=hg.get("layers"))
-            if v:
+            if v and src == "strategy miner":
+                v.mine_src = hg.get("_mine_id")
+            elif v:
                 v.hs_src = hg["name"]
             return v
         name = self.rng.choice([n for n in WILDCARD_STRATS if n != avoid] or list(WILDCARD_STRATS))
@@ -4552,7 +4635,7 @@ class Tournament(FarmMixin):
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
-                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src")
+                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -4569,7 +4652,7 @@ class Tournament(FarmMixin):
                     last_px={c: float(x) for c, x in (self.last_px or {}).items() if x},
                     elders=self.elders[-40:], champions=self.champions, season=self.season,
                     review=self.review, mut_stats=self.mut_stats, evolves=self.evolves,
-                    seasons_log=self.seasons_log[-50:], hindsight=getattr(self, "hindsight", {}),
+                    seasons_log=self.seasons_log[-50:], hindsight=getattr(self, "hindsight", {}), mined=getattr(self, "mined", []),
                     instincts={k: list(x) for k, x in self.instincts.items()}, instinct_best=dict(self.instinct_best),
                     trial_book=getattr(self, "trial_book", {}),
                     hold_curve=list(getattr(self, "hold_curve", []))[-(self.W * 10 + 2):], bots=bots,
@@ -4661,6 +4744,7 @@ class Tournament(FarmMixin):
         self.season = st.get("season")
         self.seasons_log = [tuple(x) for x in st.get("seasons_log") or []]
         self.hindsight = dict(st.get("hindsight") or {})
+        self.mined = list(st.get("mined") or [])
         self.last_px = {c: float(x) for c, x in (st.get("last_px") or {}).items() if isinstance(x, (int, float)) and x > 0}
         self.instincts = {k: [float(x[0]), int(x[1]), float(x[2]) if len(x) > 2 else float(x[0])]
                           for k, x in (st.get("instincts") or {}).items() if isinstance(x, (list, tuple)) and len(x) >= 2}
@@ -5096,6 +5180,91 @@ def _hs_run(g, closes, extra, a, z, start_cash, fee, pct, slip):
                     best = pc if best is None else max(best, pc)
                     worst = pc if worst is None else min(worst, pc)
     return b.sim.equity({c: closes[c][z - 1] for c in coins}) / start_cash - 1, closed, wins, best, worst
+
+
+def _mine_key(g):
+    return g["name"] + "|" + ",".join(f"{k}={round(float(v), 1)}" for k, v in sorted(g["params"].items())) + f"|{g.get('tf', 1)}"
+
+
+def _mine_run(g, closes, extra, a, z, cuts, start_cash, fee, pct, slip):
+    """One candidate traded from bar a to z, valued at each cut too: (return, closed, wins, [(part return, part
+    closed trades)])."""
+    coins = list(closes)
+    b = _bt_bot(g, coins, start_cash, fee, pct, slip)
+    closed = wins = 0
+    parts, cur_closed, prev_eq, ci = [], 0, float(start_cash), 0
+    for i in range(a, z):
+        for _, t in bot_step(b, {c: View(closes[c], i + 1) for c in coins}, i, coins, slice_extra(extra, i + 1) if extra else None):
+            if t["side"] == "sell" and t.get("pl") is not None:
+                closed += 1
+                cur_closed += 1
+                wins += t["pl"] > 0
+        if ci < len(cuts) and i + 1 >= cuts[ci]:
+            eq = b.sim.equity({c: closes[c][i] for c in coins})
+            parts.append((eq / prev_eq - 1 if prev_eq else 0.0, cur_closed))
+            prev_eq, cur_closed, ci = eq, 0, ci + 1
+    return b.sim.equity({c: closes[c][z - 1] for c in coins}) / start_cash - 1, closed, wins, parts
+
+
+def mine_study(closes, extra, start_cash, fee, pct, slip, rng, n=40, parts=6, prior=None, stop=None, progress=None,
+               risk_caps=None):
+    """Strategy miner: over a long stretch, which instincts and settings made money AGAIN AND AGAIN, not just once?
+    The first 75% is cut into `parts` parts; each candidate trades straight through it and is scored on how many parts
+    it made money in (with trades). The steadiest are then checked on the last 25% they never saw. A find counts when
+    it made money in at least 4 of 6 parts (2/3), overall, and on the check.
+    prior: the miner's book (its finds are tried again, tweaked a little). -> dict(results=[...], parts, look_bars, check_bars)"""
+    coins = list(closes)
+    L = min(len(closes[c]) for c in coins)
+    a0 = max(WARM, min(L - 2, max(60, LOOKBACK // 2)))
+    cut = a0 + int((L - a0) * 0.75)
+    if (cut - a0) < parts * 40 or L - cut < 40:
+        raise NoHistory("too few candles for the Strategy miner")
+    cuts = [a0 + int((cut - a0) * (k + 1) / parts) for k in range(parts)]
+    need = -(-parts * 2 // 3)
+    caps = dict(risk_caps or FAST_RISK)
+    cands = []
+    for e in (prior or [])[:12]:
+        g = json.loads(json.dumps(e["genes"]))
+        if g.get("name") in STRATS:
+            g["params"] = fix_params(g["name"], {k: (v * rng.uniform(0.9, 1.1) if isinstance(v, float) else v)
+                                                 for k, v in g["params"].items()})
+            cands.append(g)
+    names = list(WILDCARD_STRATS)
+    while len(cands) < n:
+        nm = rng.choice(names)
+        spec, p = STRATS[nm], {}
+        for k, dv in spec["params"].items():
+            lo, hi = spec["bounds"][k]
+            p[k] = int(round(rng.uniform(lo, hi))) if isinstance(dv, int) else round(rng.uniform(lo, hi), 2)
+        if len(cands) % 4 == 0:
+            p = dict(spec["params"])
+        p = fix_params(nm, p)
+        risk = {k: (round(rng.uniform(lo, caps.get(k, hi) * 0.5), 2) if rng.random() < 0.5 else 0.0)
+                for k, (lo, hi) in RISK_BOUNDS.items()}
+        cands.append(dict(name=nm, params=p, tf=rng.choice((1, 2, 3, 5, 10)), risk=risk, traits={}, vetoes={}, layers={}))
+    cands = cands[:n]
+    looked = []
+    for i, g in enumerate(cands):
+        if stop and stop():
+            raise TrainingStopped()
+        ret, closed, wins, pr = _mine_run(g, closes, extra, a0, cut, cuts, start_cash, fee, pct, slip)
+        worked = sum(1 for r_, c_ in pr if r_ > 0 and c_ > 0)
+        looked.append((g, ret, closed, wins, worked, pr))
+        if progress:
+            progress(i + 1, len(cands) + 10)
+    top = sorted([x for x in looked if x[2] >= parts], key=lambda x: (-x[4], -x[1]))[:10]
+    out = []
+    for j, (g, ret, closed, wins, worked, pr) in enumerate(top):
+        if stop and stop():
+            raise TrainingStopped()
+        cret, cclosed, cwins, _ = _mine_run(g, closes, extra, cut, L, [], start_cash, fee, pct, slip)
+        out.append(dict(genes=g, look_ret=ret, check_ret=cret, closed=closed + cclosed, wins=wins + cwins, worked=worked,
+                        parts=parts, part_rets=[round(r_ * 100, 2) for r_, _ in pr],
+                        ok=worked >= need and ret > 0 and cret > 0))
+        if progress:
+            progress(len(cands) + j + 1, len(cands) + 10)
+    out.sort(key=lambda r: (not r["ok"], -r["worked"], -r["check_ret"]))
+    return dict(results=out, tried=len(cands), parts=parts, need=need, look_bars=cut - a0, check_bars=L - cut, at=time.time())
 
 
 def hindsight_study(closes, extra, start_cash, fee, pct, slip, rng, n=48, prior=None, stop=None, progress=None,
