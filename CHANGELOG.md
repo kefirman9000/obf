@@ -10,6 +10,17 @@
 
 
 
+## 1.41.1
+- **Practice no longer books gains a real sale wouldn't get.** Logged in to Alpaca, practice buys real contracts at
+  their real ask, but it valued and sold them at the quote's midpoint, or, with no quote from the last 3 minutes,
+  at a model price from the ticker's average volatility. On 11/11 it bought 2 RIVN 14 calls at $0.48 and "locked in
+  +$29.58" two seconds later at a model $0.63; the Alpaca paper copy sold at the real $0.47 (-$6). Now:
+  - practice sells a real contract at its real **bid** (it asks Alpaca for a quote first if the last one is old),
+  - profit targets and trailing stops only fire on a fresh real bid (stops still work as before),
+  - with no fresh quote, a contract's value is the model's, scaled to that contract's real price when it was bought,
+  - the quote checked at purchase counts as fresh.
+  Practice results will look a little lower from here, and closer to what your Alpaca paper account shows.
+
 ## 1.41.0
 From the 11/11 report (1,344 finished bot trades), the farm now learns three more things by itself:
 - **Holding overnight.** Trades held overnight did far better (median +6.5%, 59% won, 272 trades) than ones sold the
