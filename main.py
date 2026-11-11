@@ -201,6 +201,8 @@ SETTING_GROUPS = [
         ("long_holds", "Slow, longer-holding bots from the start", bool),
         ("hindsight", "Hindsight: Free roam also looks back at what WOULD have worked (many instincts and settings tried on "
                       "a stretch, checked on the part after it), and new eggs start from what worked instead of at random", bool),
+        ("strategy_miner", "Strategy miner: Free roam also mines long stretches for settings that made money again and "
+                           "again (in most parts of the stretch, and after it), and new eggs hatch from those finds", bool),
         ("kamikazes", "Kamikaze breed: all-or-nothing bets on cheap far-out contracts with huge targets; each one also tests "
                       "one or two risky rules so your good bots don't have to. They get only a small say in your account", bool),
         ("kami_share", "...% of the farm kept for kamikazes", int),
@@ -941,8 +943,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
     def save_farm(self, force=False):
         """Saves the whole farm (every bot, its history and family tree) next to the session, so it carries on
         where it left off. Done every 20 decisions and whenever the bot stops, switches mode or the app closes."""
-        if not (self.session and self.tourn and self.seeded):
-            return
+        restored = self.tourn is not None and self.tourn is getattr(self, "_restored_farm", None)
+        if not (self.session and self.tourn and (self.seeded or (force and restored))):
+            return  # (a restored farm not running yet is saved only on purpose: e.g. after a camp taught it)
         if not force and (self.bar_n % 20 or time.time() - getattr(self, "_farm_saved", 0) < 300):
             return  # routine farm saves: every 20 decisions, and never more than once every 5 minutes
         self._farm_saved = time.time()
@@ -5613,6 +5616,22 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         except Exception:
             return True
 
+    def join_camp_grads(self, grads):
+        """Auto training camp graduates join the running farm (prices loaded). -> how many joined."""
+        if not (self.tourn and self.seeded and grads):
+            return 0
+        closes = {c_: self.hist[c_] for c_ in self.session_coins}
+        n = 0
+        for r in grads:
+            g = r["genes"]
+            v = self.tourn.add_variant(g["name"], g["params"], closes, 1.0, note="From the auto training camp:",
+                                       tf=g["tf"], origin="training camp", risk=g["risk"], traits=g["traits"],
+                                       vetoes=g["vetoes"], layers=g["layers"])
+            if v:
+                v.layer_stats = {k: list(x) for k, x in r["layer_stats"].items()}
+                n += 1
+        return n
+
     def _handle_msg(self, kind, data):
         if kind == "log":
             self.write(*data) if isinstance(data, tuple) else self.write(data)
@@ -5625,6 +5644,15 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             self.seeded, self.last_bar = True, 0.0
             n = min((len(v) for v in self.hist.values()), default=0)
             self.write(f"History loaded ({n} bars per coin)." if n else "Starting without history (cold start).")
+            grads, self.camp_grads = list(getattr(self, "camp_grads", []) or []), []
+            if grads and n:
+                try:
+                    k = self.join_camp_grads(grads)
+                    if k:
+                        self.flush_events()
+                        self.write(f"\u2694 {k} auto training camp graduate{'s' if k != 1 else ''} joined your farm.", "good")
+                except Exception:
+                    pass
         elif kind == "prices":
             if self.running:
                 self.on_prices(data)
@@ -6959,20 +6987,21 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
         def auto_apply(res):
             """Auto: the farm learns from the run and its exam passers join it (no pop-ups)."""
-            if not (self.tourn and self.seeded):
-                return self.write("\u2694 Auto training camp: start your farm (Wildcard) and the camps' lessons and "
-                                  "graduates go to it.", "warn")
-            E.teach_from(self.tourn, res["tourn"])
-            closes = {c_: self.hist[c_] for c_ in self.session_coins}
-            n = 0
-            for r in [r for r in res["results"] if r["passed"]][:3]:
-                g = r["genes"]
-                v = self.tourn.add_variant(g["name"], g["params"], closes, 1.0, note="From the auto training camp:",
-                                           tf=g["tf"], origin="training camp", risk=g["risk"], traits=g["traits"],
-                                           vetoes=g["vetoes"], layers=g["layers"])
-                if v:
-                    v.layer_stats = {k: list(x) for k, x in r["layer_stats"].items()}
-                    n += 1
+            if not self.tourn:
+                if time.time() - st.get("nofarm_at", 0) > 1800:  # (once in a while, not after every camp)
+                    st["nofarm_at"] = time.time()
+                    self.write("\u2694 Auto training camp: there's no farm to teach yet. Start your farm (Wildcard) and "
+                               "the camps' lessons and graduates go to it.", "warn")
+                return
+            E.teach_from(self.tourn, res["tourn"])  # a restored farm learns even before Continue
+            grads = [dict(genes=r["genes"], layer_stats=r["layer_stats"]) for r in res["results"] if r["passed"]][:3]
+            if not self.seeded:  # its prices aren't loaded yet: graduates wait and join once it runs
+                self.camp_grads = (list(getattr(self, "camp_grads", []) or []) + grads)[-6:]
+                self.save_farm(force=True)
+                return self.write("\u2694 Auto training camp: your farm learned from it" +
+                                  (f"; {len(grads)} graduate{'s' if len(grads) != 1 else ''} will join once the farm "
+                                   "is running." if grads else " (it isn't running yet)."), "good")
+            n = self.join_camp_grads(grads)
             self.flush_events()
             self.refresh_board()
             self.save_farm(force=True)
@@ -7377,7 +7406,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                     if time.time() - getattr(self, "_roam_last", 0) < wait:
                         continue
                     k += 1
-                    if self.settings.get("hindsight", True) and k % 5 == 4:
+                    if self.settings.get("strategy_miner", True) and k % 6 == 1:
+                        self._roam_mine(t)
+                    elif self.settings.get("hindsight", True) and k % 5 == 4:
                         self._roam_hindsight(t)
                     elif self.cfg.get("roam_scalp", True) and (t.scalpers() or t.kamikazes()) and k % 4 == 2:
                         self._roam_scalp(t)
@@ -7667,6 +7698,61 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                        hold=round(info["hold"] * 100, 2), mood=info["mood"], results=rows, passed=len(ok), graduate=grad,
                        summary=f"tried {res['tried']} instincts and settings; {len(ok)} would have worked (on prices they "
                                f"hadn't seen too)" + (f"; {grad} hatched from the best" if grad else ""))
+            self._roam_finish(rec, cur)
+        self.q.put(("call", apply))
+
+    def _roam_mine(self, t):
+        """Strategy miner: on a long stretch of the past, which instincts and settings made money in most of its parts
+        (not just once), and after it too? Finds go in the miner's book, new eggs start from them, and the steadiest
+        find hatches on your farm right away."""
+        rng = random.Random()
+        closes, extra, info = self._roam_pick(rng, 1500, prefer=self.farm_gran())
+        self.roam_now = dict(info, kind="Strategy miner", phase="study",
+                             text="Mining: which settings worked again and again here?", bots=[], done=0, total=1, t0=time.time())
+        cur = self.roam_now
+        self.roam_feed.append(dict(kind="sep", text=f"Strategy miner on {self._when(info['start'], True)} to "
+                                                    f"{self._when(info['end'], True)}  ({E.fmt_bar(info['gran'] / 60)} candles)"))
+        fee, slip = E.cost_model(self.settings)
+
+        def prog(d, n):
+            self.roam_check_on(t)
+            cur.update(done=d, total=n, text=f"Mining: tried {d} of {n} instincts and settings across the stretch")
+        try:
+            res = self.cores.call(E.mine_study, closes, extra, self.start_cash, fee, self.settings["trade_pct"] / 100, slip,
+                                  rng, prior=getattr(t, "mined", []),
+                                  stop=lambda: self.tourn is not t or not self.cfg.get("roam_on"), progress=prog,
+                                  risk_caps=t.risk_caps)
+        except E.NoHistory:  # stretch too short for 6 parts: a hindsight study fits it instead
+            self.roam_now = None
+            return self._roam_hindsight(t)
+
+        def apply():
+            if self.tourn is not t:
+                return
+            new = t.learn_mined(res)
+            ok = [r for r in res["results"] if r["ok"]]
+            grad = ""
+            if ok and self.seeded and not t.nursery_full() and not info.get("revisit"):
+                g = ok[0]["genes"]
+                key = E._mine_key(g)
+                e = next((x for x in getattr(t, "mined", []) if x.get("key") == key), None)
+                v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
+                                  note="Mined egg:", tf=g["tf"], origin="strategy miner", risk=g["risk"],
+                                  traits=g["traits"], vetoes=g["vetoes"], layers=g["layers"])
+                if v:
+                    v.mine_src = e["id"] if e else None  # graded later on days it didn't look at
+                    grad = E.bot_nickname(v.key())
+                    self.refresh_board()
+            rows = [(STRAT_LABELS.get(r["genes"]["name"], r["genes"]["name"]) + " (" + ", ".join(f"{k}={x}" for k, x in r["genes"]["params"].items())
+                     + f"; worked in {r['worked']} of {r['parts']} parts)",
+                     round(r["check_ret"] * 100, 2), r["closed"], round(r["look_ret"] * 100, 2), r["closed"], r["wins"], None, None)
+                    for r in res["results"][:6]]
+            rec = dict(time=time.time(), kind="Strategy miner", revisit=bool(info.get("revisit")), start=info["start"], end=info["end"],
+                       gran=info["gran"], bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=rows,
+                       passed=len(ok), graduate=grad,
+                       summary=f"tried {res['tried']} instincts and settings over {res['parts']} parts; {len(ok)} made money in "
+                               f"at least {res['need']} of them and after ({new} new to the book)"
+                               + (f"; {grad} hatched from the steadiest" if grad else ""))
             self._roam_finish(rec, cur)
         self.q.put(("call", apply))
 
@@ -7975,7 +8061,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         win rate and its single best and worst trade."""
         agg = {}
         for r in getattr(self, "roam_log", []) or []:
-            if r.get("kind") == "Hindsight":
+            if r.get("kind") in ("Hindsight", "Strategy miner"):
                 continue
             for x in (self.roam_result(r, x) for x in r.get("results", [])):
                 nm = x["name"]
@@ -8140,7 +8226,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         fr.pack(fill="x", pady=(4, 2))
         tk.Label(fr, text="Show", bg=BG, fg=MUTED).pack(side="left")
         flt = tk.StringVar(value="All")
-        ttk.Combobox(fr, textvariable=flt, values=["All", "Good finds", "Bad results", "Self-tests", "Practice farms", "Scalp roams", "Hindsight",
+        ttk.Combobox(fr, textvariable=flt, values=["All", "Good finds", "Bad results", "Self-tests", "Practice farms", "Scalp roams", "Hindsight", "Strategy miner",
                                                  "Feature tests"],
                      state="readonly", width=14).pack(side="left", padx=6)
         lb = tk.Frame(t2, bg=BG)
@@ -8243,7 +8329,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 return "mixed"  # a measurement, not a find
             if r["kind"] == "Scalp roam":
                 return "good" if r.get("pl", 0) > 0 else "bad"
-            if r["kind"] == "Hindsight":
+            if r["kind"] in ("Hindsight", "Strategy miner"):
                 return "good" if r.get("passed") else "bad"
             good = sum(1 for x in res if self.roam_result(r, x)["ret"] > 0)
             return "good" if good * 2 > len(res) else "bad" if good == 0 else "mixed"
@@ -8256,6 +8342,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 if (f_ == "Good finds" and v_ != "good") or (f_ == "Bad results" and v_ != "bad") or \
                         (f_ == "Self-tests" and r["kind"] != "Self-test") or (f_ == "Practice farms" and r["kind"] != "Practice farm") or \
                         (f_ == "Scalp roams" and r["kind"] != "Scalp roam") or (f_ == "Hindsight" and r["kind"] != "Hindsight") or \
+                        (f_ == "Strategy miner" and r["kind"] != "Strategy miner") or \
                         (f_ == "Feature tests" and r["kind"] != "Feature test"):
                     continue
                 ex = r["summary"] + (":  " + ",  ".join(f"{x['name']} {x['ret']:+.1f}%" for x in (self.roam_result(r, x) for x in r.get("results", [])[:4]))
@@ -12784,6 +12871,18 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             last = (getattr(self, "roam_log", None) or [None])[-1]
             return f"{n} studies done." + (f"  Last: {last['kind']}: {last['summary']}"[:140] if last else "")
 
+        def mine_status():
+            t = self.tourn
+            book = getattr(t, "mined", []) if t else []
+            if not book:
+                return "Nothing mined yet. It runs inside Free roam (about 1 study in 6)."
+            top = book[0]
+            f = top.get("fwd") or [0, 0]
+            return (f"{len(book)} repeat winner{'s' if len(book) != 1 else ''} in the book. Best: "
+                    f"{STRAT_LABELS.get(top['genes']['name'], top['genes']['name'])}, worked in {top['worked']} of "
+                    f"{top['parts']} parts, found on {top.get('seen', 1)} stretch{'es' if top.get('seen', 1) != 1 else ''}"
+                    + (f"; its eggs held up {f[1]} of {f[0]} times" if f[0] else "") + ".")
+
         def hind_status():
             t = self.tourn
             book = getattr(t, "hindsight", {}) if t else {}
@@ -12873,6 +12972,10 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             ("\u25c7", "Free roam", "The farm goes back in time by itself: bots test themselves on stretches of the past, "
                                    "practice farms live through them, and every lesson comes home.",
              roam_status, (lambda: bool(self.cfg.get("roam_on")), lambda on: self.toggle_roam(on)), self.open_roam),
+            ("\u26cf", "Strategy miner", "Mines long stretches of the past for settings that made money again and again "
+                                        "(in most parts of the stretch, and after it), not just once. New eggs hatch from "
+                                        "its finds; finds whose eggs don't hold up are dropped.",
+             mine_status, s_("strategy_miner"), self.open_roam),
             ("\U0001f52e", "Hindsight", "Looks back at what WOULD have worked: many instincts and settings tried on the past, "
                                        "checked on prices they didn't see. New eggs start from what worked.",
              hind_status, s_("hindsight"), lambda: self.open_knowledge()),
