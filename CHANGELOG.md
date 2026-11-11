@@ -10,6 +10,9 @@
 
 
 
+## 1.37.1
+- Fixed an error when pressing Bring / Save in the Training camp with no farm running or no bots passed: it now shows the note instead.
+
 ## 1.37.0
 - **Chart any ticker.** Each chart now has a small box next to its dropdowns: type a ticker (F, PFE, anything) and
   press Enter or Show to chart it there. Tickers outside your session are downloaded and kept fresh about once a
