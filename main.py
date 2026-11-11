@@ -156,12 +156,19 @@ SETTING_GROUPS = [
                      "Example: 0.50 = no contracts under $50. The bots move their strike to fit, or skip the trade (0 = no limit)", float),
         ("prem_max", "Most expensive contract the bots may buy, in $ per share. Example: 3.00 = nothing over $300 a "
                      "contract (0 = no limit). Applies to practice, backtests, every farm and LIVE", float),
+        ("max_otm", "Farthest out of the money any bot (or the account) buys, % of the stock price. Far-out contracts lost "
+                    "most often; each bot also learns its own, tighter limit. Kamikazes are exempt. Example: 15 (0 = no limit)", float),
         ("bot_allowance", "Allowance per bot: the most of your starting money that one bot's buy votes may have tied up "
                           "at once. Stops one bad dragon draining the account. Example: 25 with $1,000 = $250 per bot (0 = no limit)", float),
     ]),
     ("Wildcard", "How the bot treats strategies that are winning, shaky or failing.", [
-        ("auto_exams", "Exams with Free roam off: every 20 minutes, up to 3 bots that still need exams are tested on history "
-                       "they never trained on (they learn nothing from it; it only records how they did)", bool),
+        ("auto_exams", "Background exams: every 20 minutes (every 10 with Free roam off) the bots that most need exams are "
+                       "tested on a fresh stretch of history they never trained on (they learn nothing from it; it only "
+                       "records how they did). Bots closest to a verdict go first", bool),
+        ("exam_bots", "...bots tested in each exam round", int),
+        ("trade_lessons", "Trade lessons: the farm learns from its own finished trades (calls vs puts, how far out of the "
+                          "money, selling on signals vs stops and targets, how long it held), and about half the new eggs "
+                          "lean toward what worked", bool),
         ("keep_variety", "Keep backup strategies: when one strategy fills over half the farm, half the new eggs try other "
                          "strategies, and the last two of any strategy are dropped last", bool),
         ("min_dte", "Minimum days to expiry: bots that hold overnight never buy contracts closer to expiry than this "
@@ -1306,20 +1313,23 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         self.q.put(("call", apply))
 
     def exam_pass(self):
-        """Every 20 minutes while the farm runs and Free roam is OFF: up to 3 bots that still need exams are tested on
-        a stretch of history none of them trained on, at their own candle size. It's only an exam: the bots learn
-        nothing from it (Free roam does the learning), it only records how they did on unseen prices. A stretch is
-        downloaded once and kept on disk; without a connection it simply waits for the next round."""
-        self.root.after(20 * 60 * 1000, self.exam_pass)
+        """Background exams, every 20 minutes (10 with Free roam off) while the farm runs: the bots that most need exams
+        are tested on a FRESH stretch of history none of them trained on, at their own candle size. Bots closest to a
+        verdict go first (they already have an exam or two), then the leaders. It's only an exam: the bots learn nothing
+        from it, it only records how they did on unseen prices. The stretch is then left for Free roam to study."""
+        roam = bool(self.cfg.get("roam_on"))
+        self.root.after((20 if roam else 10) * 60 * 1000, self.exam_pass)
         t = self.tourn
-        if (not self.settings.get("auto_exams", True) or self.cfg.get("roam_on") or self.cfg.get("essentials")
+        if (not self.settings.get("auto_exams", True) or self.cfg.get("essentials")
                 or getattr(self, "_exam_busy", False)
                 or not (self.running and self.wild and t and self.seeded)):
             return
         ranked = [v for v, _ in t.ranking()]
-        need = [v for v in list(dict.fromkeys(list(t.active) + ranked[:25]))
+        need = [v for v in list(dict.fromkeys(list(t.active) + ranked[:40]))
                 if not E.is_kami(v) and E.exam_verdict(v, t.serial)[0] == "untested"]
-        picks = need[:3]
+        # closest to a verdict first: an exam or two already taken, then the farm's order
+        need.sort(key=lambda v: -min(E.EXAM_MIN, len([x for x in (v.exams or []) if x.get("n", 0) > 0])))
+        picks = need[:max(1, min(12, int(self.settings.get("exam_bots", 6) or 6)))]
         if not picks:
             return
         self._exam_busy = True
@@ -1331,9 +1341,25 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             import random as _r
             self._exam_thread = threading.get_ident()
             try:
-                closes, extra, info = self._roam_pick(_r.Random(), prefer=gran)
-                if info.get("revisit") or info.get("gran") != gran:
-                    return  # only first visits at their own candle size count as exams
+                rng = _r.Random()
+                shown = self.roam_now
+                got = None
+                for _try in range(2):  # a fresh stretch (a reused one was already studied: not unseen any more)
+                    closes, extra, info = self._roam_fetch(rng, 400, prefer=gran)
+                    if roam and self.cfg.get("roam_on"):
+                        self.roam_now = shown  # (fetching shows its own status: put Free roam's back)
+                    if info.get("gran") == gran:
+                        got = (closes, extra, info)
+                        break
+                if got is None:
+                    return  # only stretches at their own candle size count as exams
+                closes, extra, info = got
+                try:  # Free roam may study it afterwards (it's only an exam: nothing learned from it yet)
+                    pool = self.__dict__.setdefault("_roam_pool", E.StretchPool())
+                    info = pool.add(tuple(self.session_coins), max(1, int(self.settings.get("roam_reuse", 3) or 1)),
+                                    closes, extra, info)
+                except Exception:
+                    E.note_error("exam_pass pool")
                 out = [(v, self.cores.call(E.backtest_bot, v, closes, extra, cash, fee, pct, slip)) for v in picks]
 
                 def apply():
@@ -5295,6 +5321,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 legends=[{k: d.get(k) for k in ("nickname", "label", "why", "ret", "edge", "trades", "wins", "exam",
                                                  "alive", "why_left", "kids", "again", "recalls", "score")}
                          for d in (getattr(t, "legends", None) or [])],
+                lessons=dict(stats=getattr(t, "lessons", {}), view={k: list(x) for k, x in t.lesson_view().items()}
+                             if hasattr(t, "lesson_view") else {}),
+                one_hit=[E.bot_nickname(v.key()) for v in t.vars if hasattr(t, "one_hit") and t.one_hit(v)],
                 top_bots=self._bot_rows(t), events=list(getattr(t, "events", []))[-40:],
                 all_bots=[dict(nickname=E.bot_nickname(v.key()), strategy=v.name, tf=v.tf, origin=v.origin,
                                status=t.info.get(id(v), {}).get("status"), age=v.age, live_n=v.live_n,
@@ -7816,33 +7845,54 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         self.roam_now = dict(kind="Scalp roam", phase="download", gran=60, coins=tickers, start=None, end=None,
                              text="Choosing a trading day for the scalpers", t0=time.time(), done=0, total=1, exam=exam)
         cur = self.roam_now
+        # days that came back short before (too few tickers with 1-minute prices) go to the back of the line, so the
+        # same few bad days can't block every scalp roam; after 2 short tries a day is skipped for good
+        miss = self.__dict__.setdefault("roam_miss", {})
+        order = sorted(order, key=lambda d: miss.get(d.isoformat(), 0))
         day = None
-        for d in order[:8]:
-            day0 = E.ny_time(d.isoformat(), 9, 30)
-            close = day0 + 390 * 60
+
+        def try_days(order):
+            day = None
             bars = {}
-            got_any = False
-            for i, sym in enumerate(tickers + ["VIXY", "SPY"]):
-                self.roam_check_on(t)
-                cur.update(start=day0, end=close, text=f"Loading 1-minute prices for {d:%b %d %Y}: {sym} ({i + 1} of {len(tickers) + 2})")
-                try:
-                    x = (E.fetch_ohlcv(sym, 60, 470, self.quote) if live
-                         else E.fetch_range(sym, 60, day0 - 4 * 86400, close + 60, self.quote))
-                except Exception:
-                    continue
-                got_any = got_any or bool(x.get("t"))
-                keep = [j for j, tt in enumerate(x.get("t") or []) if tt <= close + 60][-470:]
-                if sum(1 for j in keep if x["t"][j] >= day0) >= (20 if live else 200):  # it really traded that day
-                    bars[sym] = {k: [x[k][j] for j in keep] for k in ("c", "h", "l", "v", "t")}
-            if len([c for c in bars if c not in ("VIXY",)]) >= 4:
-                day = d
-                if not live and not exam:  # taken: the next replay moves on to the next day
-                    self.roam_days.add(d.isoformat())
-                break
-            if live:
-                break
-            if got_any and not bars:  # prices came back but nobody traded: a holiday, never ask again
-                self.roam_dead.add(d.isoformat())
+            for d in order[:8]:
+                day0 = E.ny_time(d.isoformat(), 9, 30)
+                close = day0 + 390 * 60
+                bars = {}
+                got_any = False
+                for i, sym in enumerate(tickers + ["VIXY", "SPY"]):
+                    self.roam_check_on(t)
+                    cur.update(start=day0, end=close, text=f"Loading 1-minute prices for {d:%b %d %Y}: {sym} ({i + 1} of {len(tickers) + 2})")
+                    try:
+                        x = (E.fetch_ohlcv(sym, 60, 470, self.quote) if live
+                             else E.fetch_range(sym, 60, day0 - 4 * 86400, close + 60, self.quote))
+                    except Exception:
+                        continue
+                    got_any = got_any or bool(x.get("t"))
+                    keep = [j for j, tt in enumerate(x.get("t") or []) if tt <= close + 60][-470:]
+                    if sum(1 for j in keep if x["t"][j] >= day0) >= (20 if live else 200):  # it really traded that day
+                        bars[sym] = {k: [x[k][j] for j in keep] for k in ("c", "h", "l", "v", "t")}
+                if len([c for c in bars if c not in ("VIXY",)]) >= 4:
+                    day = d
+                    if not live and not exam:  # taken: the next replay moves on to the next day
+                        self.roam_days.add(d.isoformat())
+                    break
+                if live:
+                    break
+                if got_any and not bars:  # prices came back but nobody traded: a holiday, never ask again
+                    self.roam_dead.add(d.isoformat())
+                elif got_any:  # some tickers traded, too few with 1-minute prices
+                    miss[d.isoformat()] = miss.get(d.isoformat(), 0) + 1
+                    if miss[d.isoformat()] >= 2:
+                        self.roam_dead.add(d.isoformat())
+            return day, bars
+        day, bars = try_days(order)
+        if day is None and not live and not exam:
+            # no fresh day worked this time: replay a day the scalpers already studied rather than nothing
+            seen = [d for d in days if d.isoformat() in covered and not E.is_exam_day(d)]
+            rng.shuffle(seen)
+            if seen:
+                cur.update(text="No fresh day had enough 1-minute prices: replaying one the scalpers studied before")
+                day, bars = try_days(seen)
         if day is None:
             raise E.NoHistory("no trading day with enough 1-minute prices for the scalp roam")
         ctx = {k: dict(c=bars[k]["c"], t=bars[k]["t"]) for k in ("VIXY", "SPY") if k in bars}
@@ -9723,7 +9773,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
     def pick_rules(self):
         return dict(min_sessions=max(1, int(self.settings.get("expiry_days", 2) or 2)),
                     max_spread_pct=float(self.settings.get("max_spread_pct", 0) or 0),
-                    min_oi=int(self.settings.get("min_oi", 0) or 0))
+                    min_oi=int(self.settings.get("min_oi", 0) or 0),
+                    max_otm=float(self.settings.get("max_otm", 15) or 0))
 
     def expiry_guard(self):
         """Runs every minute while OBF is open, bot running or not: sells contracts inside the expiry window during
@@ -10854,7 +10905,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                     rng = E.prem_range_text()
                     self.write(f"Skipped a {typ} on {t_}: no listed contract near what the bots want"
                                + (f" inside your contract price range ({rng})" if rng else "") + " with a tight enough "
-                               "bid/ask gap.", "warn")
+                               "bid/ask gap" + (f", within {E.MAX_OTM[0]:g}% out of the money (Settings: farthest out)"
+                                                if E.MAX_OTM[0] else "") + ".", "warn")
                 return
             if now - cache[0] > 90:  # the chain is minutes old: check this contract's price now, or skip it
                 try:
@@ -11293,7 +11345,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             if not pick:
                 rng = E.prem_range_text()
                 raise RuntimeError(f"no {typ} contracts with prices near what the bots want"
-                                   + (f" inside your contract price range ({rng})" if rng else ""))
+                                   + (f" inside your contract price range ({rng})" if rng else "")
+                                   + (f" within {E.MAX_OTM[0]:g}% out of the money" if E.MAX_OTM[0] else ""))
             ask = pick["ask"]
             qty = int(spend // (ask * E.CONTRACT))
             if qty < 1 and ask * E.CONTRACT <= min(self.cash + spend, spend * 2.5):
@@ -12970,6 +13023,18 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
         s_ = lambda k: (lambda: bool(st.get(k, True)), lambda on: self._set_flag("settings", k, on))
         c_ = lambda k, d=False: (lambda: bool(self.cfg.get(k, d)), lambda on: self._set_flag("cfg", k, on))
+        def lesson_status():
+            t = self.tourn
+            if not t or not hasattr(t, "lesson_view"):
+                return "No farm yet."
+            n = t._lesson("exit:target", "exit:stop", "exit:trail", "exit:time", "exit:signal")[0]
+            lv = t.lesson_view()
+            if not lv:
+                return f"Learning from {n:,.0f} finished trades; no clear lesson yet (needs {E.LESSON_MIN}+ on each side)."
+            short = {"side": lambda c: f"prefer {c}s", "maxotm": lambda c: f"stay within {c}% out",
+                     "exit": lambda c: "let stops/targets sell", "minhold": lambda c: f"hold {c}+ decisions"}
+            return f"From {n:,.0f} trades: " + "; ".join(short[k](x[0]) for k, x in lv.items()) + "."
+
         def legend_status():
             t = self.tourn
             book = list(getattr(t, "legends", None) or []) if t else []
@@ -13011,6 +13076,10 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                                         "instincts it barely tried (up to 240 per stretch, Settings). New eggs hatch from "
                                         "its finds; finds whose eggs don't hold up are dropped.",
              mine_status, s_("strategy_miner"), self.open_roam),
+            ("\U0001f4d3", "Trade lessons", "The farm learns from its own finished trades: calls vs puts, how far out of "
+                                          "the money, selling on signals vs stops and targets, and how long it held. About "
+                                          "half the new eggs lean toward what worked; the rest keep testing the other way.",
+             lesson_status, s_("trade_lessons"), lambda: self.open_knowledge()),
             ("\u265b", "Legends", "Bots that proved themselves are kept here for good when they leave the farm. Some new "
                                   "eggs hatch from them, elders' nudges include them, and the Strategy miner re-tests "
                                   "them on new stretches.",

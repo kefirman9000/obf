@@ -10,6 +10,32 @@
 
 
 
+## 1.40.0
+From the 11/10 report (1,331 finished bot trades: 30% won, median -6%):
+- **No more far-out contracts by accident.** When a contract cost more than the trade size or your contract price
+  range, the bots walked their strike out until it was cheap enough, up to 60 strikes away. That's how a bot that
+  wanted 2% out of the money ended up 20-40% out, and those lost most (-7% to -9% a trade, vs +2% to +5% within 15%).
+  Now nothing is bought farther out than **15%** (Settings > Farthest out; 0 = no limit): the trade is skipped
+  instead. Each bot can also learn its own, tighter limit (a new habit, 'Farthest out it will buy'). Kamikazes are
+  exempt (cheap far-out bets are their idea). The account's own contract picks follow the same limit.
+- **Trade lessons** (new, on by default; Learning list and Knowledge). The farm learns from its own finished trades:
+  calls vs puts, how far out of the money, selling on signals vs letting stops, targets and time limits do it, and
+  how long it held. Once there are 40+ trades on each side and one way is clearly better (3+ points a trade), about
+  half the new eggs lean that way (calls only, a farthest-out limit, stops-only selling, a minimum hold); the other
+  half keep testing the other way, so a lesson can change its mind. One fluke trade counts at most +200%. Lessons
+  travel with Knowledge and training camps, and show in the detailed report.
+- **A record carried by one trade isn't proof.** If a bot's lifetime gain comes from one trade that doubled its money
+  or more, and without it the bot lost money, it can't be proven, stand in, join the Hall of Fame or the Legends,
+  and its say counts for less. Same for a bot whose typical (median) trade loses more than 15%. (One +1,784% trade
+  in the report was likely a pricing fluke on a far-out contract.)
+- **More exams.** Bots can't be proven or become Legends without 3 exams, and 120 of 150 bots had none. The exam
+  pass now also runs while Free roam is on (every 20 minutes; every 10 with it off), tests 6 bots a round (Settings),
+  starts with the bots closest to a verdict, and always uses a fresh stretch: before, about 2 in 3 rounds landed on
+  a stretch Free roam had already studied and quietly did nothing.
+- **Fix: the scalp roam got stuck** on 'no trading day with enough 1-minute prices'. It kept retrying the same oldest
+  8 days even when too few tickers had 1-minute prices on them. Now a day that comes back short twice is skipped, and
+  when no fresh day works it replays a day the scalpers studied before instead of failing.
+
 ## 1.39.0
 - **The Strategy miner works harder before it gives up.** It used to try one batch of 40 instincts and settings per
   stretch and stop, even when nothing held up. Now it works in rounds: each new round refines the closest tries so far
