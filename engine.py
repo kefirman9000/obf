@@ -2464,7 +2464,10 @@ def opts_for_bars(opts, gran_seconds):
     return dict(opts, scalp_share=0.0) if float(gran_seconds or 0) > 300 else dict(opts)
 
 
-RISK_BOUNDS = {"sl": (2.0, 95.0), "tp": (2.0, 500.0)}  # a bot's own stop / target on the PREMIUM it paid, % (0 = none)
+# a bot's own stop / target on the PREMIUM it paid, % (0 = none). Stops start at 10%: what a contract costs includes the
+# bid/ask gap (often 3-5% of it), so a tighter stop sold on that gap alone, the next bar. On 11/12, 102 stops under 5%
+# fired after a median of 1 bar. (A 2% stop is sensible on a stock; one of the classic starters still carries it.)
+RISK_BOUNDS = {"sl": (10.0, 95.0), "tp": (2.0, 500.0)}
 FAST_RISK = {"sl": 80.0, "tp": 300.0}   # options move a lot: a 50% stop on a premium is ordinary
 SLOW_RISK = {"sl": 90.0, "tp": 500.0}
 
@@ -3766,6 +3769,9 @@ class Tournament(FarmMixin):
         if "trail" in t:  # the bot's trailing stop (none, tight, wide) and how often it decides
             tw = float(t.get("trail") or 0)
             keys.append("trail:" + ("none" if tw <= 0 else "0-8" if tw < 8 else "8-20" if tw < 20 else "20+"))
+        if "sl" in t:
+            w_ = float(t.get("sl") or 0)
+            keys.append("sl:" + ("none" if w_ <= 0 else "0-15" if w_ < 15 else "15-40" if w_ < 40 else "40+"))
         if t.get("tf"):
             f_ = int(t["tf"])
             keys.append("tf:" + ("1-2" if f_ <= 2 else "3-5" if f_ <= 5 else "10-15" if f_ <= 15 else "30+"))
@@ -3827,6 +3833,10 @@ class Tournament(FarmMixin):
         if tight[0] >= N and other[0] >= N and other[1] - tight[1] >= GAP:
             out["trail"] = (12, f"bots with trailing stops under 8% averaged {tight[1]:+.1f}% a trade ({tight[2] * 100:.0f}% won); "
                                 f"wider or none, {other[1]:+.1f}%")
+        tight, other = self._lesson("sl:0-15"), self._lesson("sl:15-40", "sl:40+", "sl:none")
+        if tight[0] >= N and other[0] >= N and other[1] - tight[1] >= GAP:
+            out["stop"] = (15, f"bots with safety stops under 15% averaged {tight[1]:+.1f}% a trade ({tight[2] * 100:.0f}% won); "
+                               f"wider or none, {other[1]:+.1f}%")
         fast, slow = self._lesson("tf:1-2"), self._lesson("tf:3-5", "tf:10-15", "tf:30+")
         if fast[0] >= N and slow[0] >= N and slow[1] - fast[1] >= GAP:
             out["pace"] = (3, f"bots deciding every 1-2 candles averaged {fast[1]:+.1f}% a trade ({fast[2] * 100:.0f}% won); "
@@ -3875,6 +3885,8 @@ class Tournament(FarmMixin):
         """A bot adjusts its own exits from how its own trades went (scalpers and kamikazes keep their breed's rules):
         - its trailing stop keeps selling it at a loss while its other exits do better: it widens the trail by half
           (dropping it past 30%),
+        - its safety stop keeps firing within 3 candles of buying (6+ times, at a loss): it widens the stop by half
+          (up to 60%),
         - its quick trades (held under 15 candles) lose while its longer ones do better: it starts holding at least
           that long before its signals may sell.
         Each change is written in the farm's news, and the bot's habit record starts over after a change, so it
@@ -3897,6 +3909,12 @@ class Tournament(FarmMixin):
                 did = f"widened its trailing stop to {tr['trail']:.0f}% ({ev})"
             hb.pop("trail", None)
             hb.pop("other", None)
+        elif v.risk.get("sl") and n("whip") >= SELF_TUNE_MIN and avg("whip") < 0 and v.risk["sl"] < 60:
+            new_ = round(min(60.0, v.risk["sl"] * 1.5), 2)
+            did = (f"widened its safety stop to {new_:g}% (it was stopped out {n('whip'):.0f} times within 3 candles of "
+                   f"buying, averaging {avg('whip'):+.1f}%)")
+            v.risk = clean_risk(dict(v.risk, sl=new_))
+            hb.pop("whip", None)
         elif not tr.get("minhold") and not tr.get("exit") and n("quick") >= SELF_TUNE_MIN and n("long") >= SELF_TUNE_MIN \
                 and avg("long") - avg("quick") >= SELF_TUNE_GAP:
             tr["minhold"] = max(2, -(-15 // max(1, v.tf)))
@@ -3917,10 +3935,13 @@ class Tournament(FarmMixin):
         Gains count at most +200%, and older trades fade (halved after 30)."""
         hb = v.__dict__.setdefault("habits", {})
         pc = max(-100.0, min(200.0, pc))
-        keys = ["trail" if exit_kind(t.get("why")) == "trail" else "other"]
+        kind = exit_kind(t.get("why"))
+        keys = ["trail" if kind == "trail" else "other"]
         h = t.get("held")
         if h is not None:
             keys.append("quick" if h < 15 else "long")
+            if kind == "stop" and h <= 3 * max(1, v.tf):
+                keys.append("whip")  # stopped out right after buying: the stop sits inside the contract's normal wobble
         for k in keys:
             s_ = hb.setdefault(k, [0.0, 0.0])
             if s_[0] >= 30:
@@ -4466,7 +4487,7 @@ class Tournament(FarmMixin):
         for k, (lo, hi) in RISK_BOUNDS.items():
             hi = self.risk_caps.get(k, hi)
             r[k] = round(self.rng.uniform(lo, hi * 0.5), 2) if self.rng.random() < 0.5 else 0.0
-        return r
+        return self.lesson_risk(r)
 
     def mutate_risk(self, r):
         out = {}
@@ -4479,7 +4500,18 @@ class Tournament(FarmMixin):
             elif v and roll < 0.45:
                 v *= self.rng.uniform(0.7, 1.3)
             out[k] = min(v, hi)
-        return clean_risk(out)
+        return self.lesson_risk(clean_risk(out))
+
+    def lesson_risk(self, r):
+        """A new bot's safety stop leans the way the farm's trades say: when bots with stops under 15% did clearly
+        worse, about half the new ones with a stop that tight get one of 15-40% instead. (Scalpers and kamikazes are
+        reshaped by their own breed's rules afterwards.)"""
+        if not self.o.get("lessons", True):
+            return r
+        lv = self.lesson_view()
+        if "stop" in lv and 0 < float(r.get("sl", 0) or 0) < lv["stop"][0] and self.rng.random() < 0.5:
+            r = dict(r, sl=round(self.rng.uniform(lv["stop"][0], 40.0), 2))
+        return r
 
 
     def _run(self, v, closes, n, mood=None, extra=None):
@@ -4562,7 +4594,8 @@ class Tournament(FarmMixin):
                         v.windfalls = (list(getattr(v, "windfalls", None) or [])
                                        + [[v.age, round(t["pl"] - paid_ * WINDFALL_CAP / 100, 2)]])[-10:]
                     if not self.replaying and self.o.get("lessons", True):
-                        habit_ = {} if is_scalp(v.name) or is_kami(v) else dict(tf=v.tf, trail=v.traits.get("trail", 0))
+                        habit_ = {} if is_scalp(v.name) or is_kami(v) else dict(tf=v.tf, trail=v.traits.get("trail", 0),
+                                                                                    sl=v.risk.get("sl", 0))
                         self.learn_lesson(dict(t, strat=v.name, **habit_), pc_)
                     if not self.replaying:
                         self.note_habit(v, t, pc_)
@@ -6241,7 +6274,8 @@ def farm_knowledge(t):
     titles = {"side": "Prefer {}s", "maxotm": "Stay within {}% out of the money", "exit": "Let stops and targets sell",
               "minhold": "Hold at least {} decisions",
               "night": "{}", "dte": "Buy at least {} days from expiry", "late": "Don't open in the last {} minutes",
-              "trail": "Trailing stops {}% or wider (or none)", "pace": "Decide every {} candles or slower"}
+              "trail": "Trailing stops {}% or wider (or none)", "pace": "Decide every {} candles or slower",
+              "stop": "Safety stops {}% or wider"}
     for k, (choice, ev) in (t.lesson_view() if hasattr(t, "lesson_view") else {}).items():
         if k not in titles:
             continue

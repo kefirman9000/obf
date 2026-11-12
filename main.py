@@ -13151,7 +13151,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                      "exit": lambda c: "let stops/targets sell", "minhold": lambda c: f"hold {c}+ decisions",
                      "night": lambda c: "hold overnight" if c == 1 else "go flat before the close",
                      "dte": lambda c: f"buy {c}+ days from expiry", "late": lambda c: f"don't open in the last {c} min",
-                     "trail": lambda c: f"trailing stops {c}%+ or none", "pace": lambda c: f"decide every {c}+ candles"}
+                     "trail": lambda c: f"trailing stops {c}%+ or none", "pace": lambda c: f"decide every {c}+ candles",
+                     "stop": lambda c: f"safety stops {c}%+"}
             return f"From {n:,.0f} trades: " + "; ".join(short[k](x[0]) for k, x in lv.items() if k in short) + "."
 
         def legend_status():

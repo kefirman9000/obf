@@ -10,6 +10,17 @@
 
 
 
+## 1.44.0
+From the 1:12 pm report:
+- **Safety stops start at 10%.** What a bot pays for a contract includes the bid/ask gap, often 3-5% of the price,
+  so a 2% stop sold on the gap alone, the next bar. 102 stops under 5% fired after a median of 1 bar, and every
+  safety-stop sale lost (198 of them, averaging -15.6%). Bots already carrying a tighter stop move up to 10% when the
+  farm loads. One of the classic starters (Turtle breakout) came with a stock trader's 2% stop.
+- **Bots widen a stop that keeps firing right after they buy.** When a bot is stopped out within 3 candles of
+  buying 6+ times at a loss, it widens its own stop by half (up to 60%) and says so in the farm's news.
+- **New trade lesson: safety stops.** When bots with stops under 15% do clearly worse than bots with wider stops (or
+  none), about half the new eggs with a stop that tight get 15-40% instead.
+
 ## 1.43.0
 The bots learn to fix their own habits. In the 11/12 report, trailing-stop sales won 9% of the time (104 trades),
 and trades held only 1-2 decisions won 12% while ones held 30+ won 44%: each quick round trip pays the bid/ask gap.

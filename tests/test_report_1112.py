@@ -100,3 +100,30 @@ def test_bot_tunes_its_own_exits():
     t.o["self_tune"] = False
     v.traits, v.habits = {"trail": 6.0}, {"trail": [9, -90.0], "other": [9, 72.0]}
     assert t.self_tune(v) is None
+
+
+def test_stops_never_sit_inside_the_bid_ask_gap():
+    assert E.clean_risk({"sl": 2.0})["sl"] == 10.0  # a 2% stop sold on the gap alone, the next bar
+    assert E.clean_risk({"sl": 0})["sl"] == 0.0
+
+
+def test_bot_widens_a_stop_that_fires_right_after_buying():
+    from test_proving import farm, plain
+    t, _ = farm()
+    v = plain(t)
+    v.risk = E.clean_risk({"sl": 12.0})
+    for _ in range(E.SELF_TUNE_MIN):
+        t.note_habit(v, {"why": "its own safety stop (12%)", "held": 1}, -14.0)
+    assert "safety stop to 18%" in t.self_tune(v) and v.risk["sl"] == 18.0
+
+
+def test_farm_learns_wider_stops():
+    from test_proving import farm
+    t, _ = farm()
+    for _ in range(E.LESSON_MIN):
+        t.learn_lesson(dict(side="sell", why="its own safety stop (10%)", held=1, contract={"type": "call"}, sl=10), -12.0)
+        t.learn_lesson(dict(side="sell", why="its own profit target", held=40, contract={"type": "call"}, sl=30), 5.0)
+    assert t.lesson_view()["stop"][0] == 15
+    t.rng.seed(2)
+    stops = [t.lesson_risk({"sl": 10.0, "tp": 0.0})["sl"] for _ in range(100)]
+    assert 10.0 in stops and any(x >= 15 for x in stops)
