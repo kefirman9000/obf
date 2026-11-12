@@ -10,6 +10,23 @@
 
 
 
+## 1.43.0
+The bots learn to fix their own habits. In the 11/12 report, trailing-stop sales won 9% of the time (104 trades),
+and trades held only 1-2 decisions won 12% while ones held 30+ won 44%: each quick round trip pays the bid/ask gap.
+- **Bots tune their own exits.** A bot whose trailing stop keeps selling it at a loss while its other sales do
+  better (6+ of each, 5+ points apart) widens the trail by half, and drops it past 30%. A bot whose quick trades
+  (held under 15 candles) lose while its longer ones do better starts holding at least that long before its signals
+  may sell. Each change shows in the farm's news, and the bot then judges the new setting on fresh trades.
+  Scalpers and kamikazes keep their breed's rules. Settings > Learning: "Tune its own exits" (on).
+- **Two new trade lessons for new eggs**, like the overnight and days-to-expiry lessons:
+  - *trailing stops*: when bots with trails under 8% do clearly worse, about half the new eggs carrying a tight
+    trail get a wider one (12-30%) or none,
+  - *pace*: when bots deciding every 1-2 candles do clearly worse, about half the new (non-scalper) bots that fast
+    slow down to every 3-15 candles.
+- **Trailing stops can now evolve up to 40%** (was 12%). An option contract often moves 12% in minutes, so the old
+  ceiling only allowed trails that noise would trip.
+- Free roam's feature tests measure what self-tuning is worth, like every other learning switch.
+
 ## 1.42.0
 From the 11/12 report:
 - **Practice prices follow the volatility smile.** Every strike was priced at the ticker's near-the-money volatility,

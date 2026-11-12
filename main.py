@@ -252,6 +252,8 @@ SETTING_GROUPS = [
         ("post_review", "Post-trade review: losing trades teach which never-rules to try next", bool),
         ("learn_losses", "Learn from its own losses: a bot takes on a never-rule that would have stopped several of its "
                          "losing trades (and few winners)", bool),
+        ("self_tune", "Tune its own exits: a bot whose trailing stop keeps selling it at a loss widens it (or drops it), "
+                      "and one whose quick trades lose starts holding longer", bool),
         ("multicore", "Learn on several processor cores at once at the start (faster warm-up)", bool),
         ("study_cores", "Studies on their own cores: training camps, Free roam's studies, hindsight and backtests run in "
                         "separate processes, so they use other processor cores and the window stays smooth", bool),
@@ -13148,8 +13150,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             short = {"side": lambda c: f"prefer {c}s", "maxotm": lambda c: f"stay within {c}% out",
                      "exit": lambda c: "let stops/targets sell", "minhold": lambda c: f"hold {c}+ decisions",
                      "night": lambda c: "hold overnight" if c == 1 else "go flat before the close",
-                     "dte": lambda c: f"buy {c}+ days from expiry", "late": lambda c: f"don't open in the last {c} min"}
-            return f"From {n:,.0f} trades: " + "; ".join(short[k](x[0]) for k, x in lv.items()) + "."
+                     "dte": lambda c: f"buy {c}+ days from expiry", "late": lambda c: f"don't open in the last {c} min",
+                     "trail": lambda c: f"trailing stops {c}%+ or none", "pace": lambda c: f"decide every {c}+ candles"}
+            return f"From {n:,.0f} trades: " + "; ".join(short[k](x[0]) for k, x in lv.items() if k in short) + "."
 
         def legend_status():
             t = self.tourn

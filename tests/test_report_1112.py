@@ -55,3 +55,48 @@ def test_opening_rush():
     assert E.open_spread_mult(_ny(9, 40)) == 1.5
     assert E.open_spread_mult(_ny(11, 0)) == 1.0
 
+
+
+def _sell(why, held, pc, trail=0.0, tf=1):
+    return dict(side="sell", why=why, held=held, contract={"type": "call"}, tf=tf, trail=trail), pc
+
+
+def test_farm_learns_trail_and_pace_lessons():
+    from test_proving import farm
+    t, _ = farm()
+    for _ in range(E.LESSON_MIN):
+        t.learn_lesson(*_sell("its trailing stop (5%)", 30, -12.0, trail=5, tf=1))
+        t.learn_lesson(*_sell("its own profit target", 30, 6.0, trail=0, tf=5))
+    lv = t.lesson_view()
+    assert lv["trail"][0] == 12 and lv["pace"][0] == 3
+    t.rng.seed(1)
+    eggs = [t.lesson_traits({"trail": 4.0}) for _ in range(200)]
+    assert any("trail" not in e for e in eggs) and any(e.get("trail", 0) >= 12 for e in eggs)
+    assert any(e.get("trail") == 4.0 for e in eggs)  # about half keep testing the other way
+    paces = [t.lesson_tf(1) for _ in range(200)]
+    assert any(p >= 3 for p in paces) and 1 in paces
+
+
+def test_bot_tunes_its_own_exits():
+    from test_proving import farm, plain
+    t, _ = farm()
+    v = plain(t)
+    v.traits = {"trail": 6.0}
+    for _ in range(E.SELF_TUNE_MIN):
+        t.note_habit(v, {"why": "its trailing stop (6%)", "held": 40}, -10.0)
+        t.note_habit(v, {"why": "its own profit target", "held": 40}, 8.0)
+    assert "widened" in (t.self_tune(v) or "") and v.traits["trail"] == 9.0
+    assert t.self_tune(v) is None  # its record starts over: judged again on new trades
+    v.traits = {"trail": 25.0}
+    for _ in range(E.SELF_TUNE_MIN):
+        t.note_habit(v, {"why": "its trailing stop (25%)", "held": 40}, -10.0)
+        t.note_habit(v, {"why": "RSI said sell", "held": 40}, 8.0)
+    assert "dropped" in t.self_tune(v) and "trail" not in v.traits
+    v.habits = {}
+    for _ in range(E.SELF_TUNE_MIN):
+        t.note_habit(v, {"why": "RSI said sell", "held": 3}, -9.0)
+        t.note_habit(v, {"why": "RSI said sell", "held": 60}, 4.0)
+    assert "holds at least" in t.self_tune(v) and v.traits["minhold"] >= 2
+    t.o["self_tune"] = False
+    v.traits, v.habits = {"trail": 6.0}, {"trail": [9, -90.0], "other": [9, 72.0]}
+    assert t.self_tune(v) is None

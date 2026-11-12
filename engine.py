@@ -1612,6 +1612,7 @@ DEFAULT_SETTINGS = {
     "time_habits": True,         # bots can learn to skip the opening / closing rush (never-rules graded in hindsight)
     "agree_sizing": True,        # the account trades bigger when several different strategies agree, smaller when split
     "learn_losses": True,        # a bot takes on a never-rule itself when that rule would have stopped several of its losses
+    "self_tune": True,           # a bot widens a trailing stop or holds longer when its own trades say so
     "post_review": True,         # after losing trades the farm notes which never-rule would have helped, and tries those more
     "islands": 3,                # separate sub-farms that only swap a champion now and then (1 = one big farm)
     "adapt_exits": False,        # (off by default since 1.36: Free roam's tests leaned against it; still tested) bots can evolve stops and targets that widen in wild markets and tighten in calm ones
@@ -2424,6 +2425,7 @@ def tournament_opts(settings):
                 htf_studies=bool(settings.get("htf_studies", True)), lead_study=bool(settings.get("lead_study", True)),
                 ctx=[c for c in (settings.get("ctx_tickers") or []) if valid_coin(c)] if settings.get("ctx_studies", True) else [],
                 post_review=bool(settings.get("post_review", True)), learn_losses=bool(settings.get("learn_losses", True)),
+                self_tune=bool(settings.get("self_tune", True)),
                 time_habits=bool(settings.get("time_habits", True)), agree_sizing=bool(settings.get("agree_sizing", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), scalp_real_exams=int(_numor(settings.get("scalp_real_exams", 2), 2)), mut_memory=bool(settings.get("mut_memory", True)),
                 proven_only=bool(settings.get("proven_only", True)), keep_veterans=bool(settings.get("keep_veterans", True)), keep_variety=bool(settings.get("keep_variety", True)), proven_exam=bool(settings.get("proven_exam", True)),
@@ -2480,7 +2482,7 @@ def clean_risk(r):
 
 # Traits: extra habits every bot can evolve on top of its strategy. 0 / empty = off.
 TRAITS = {
-    "trail":   dict(lo=0.5, hi=12.0, kind=float, text=lambda v: f"trailing stop {v:g}%"),
+    "trail":   dict(lo=0.5, hi=40.0, kind=float, text=lambda v: f"trailing stop {v:g}%"),
     "maxhold": dict(lo=3, hi=200, kind=int, text=lambda v: f"sells after {v} decisions"),
     "minhold": dict(lo=2, hi=300, kind=int, text=lambda v: f"holds at least {v} decisions"),
     "cool":    dict(lo=1, hi=30, kind=int, text=lambda v: f"waits {v} decisions after selling"),
@@ -3340,6 +3342,7 @@ class Variant:
         self.trade_pcts = []    # its last 40 finished trades, % of what it paid (for its typical trade)
         self.best_pl = 0.0      # its single best finished trade, $ (a record carried by one trade isn't proof)
         self.windfalls = []     # [age, $ beyond +WINDFALL_CAP%] of its trades that made more than that (scored capped)
+        self.habits = {}        # its own trades by how they were sold / held: {kind: [trades, summed %]} (self_tune)
         self.log_ct = {}  # (decision, ticker) -> "call" / "put" of the contract traded there
         self.roam_scan = None  # scalpers: [trades, wins, pl, paid] from Free roam's scalp roams on past days (fading)
         self.trade_eq = deque(maxlen=SCALP_JUDGE + 1)  # scalpers: (decision, equity) after each finished trade
@@ -3760,6 +3763,12 @@ class Tournament(FarmMixin):
         h = t.get("held")
         if h is not None:
             keys.append("hold:" + ("0-15" if h < 15 else "15-60" if h < 60 else "60-240" if h < 240 else "240+"))
+        if "trail" in t:  # the bot's trailing stop (none, tight, wide) and how often it decides
+            tw = float(t.get("trail") or 0)
+            keys.append("trail:" + ("none" if tw <= 0 else "0-8" if tw < 8 else "8-20" if tw < 20 else "20+"))
+        if t.get("tf"):
+            f_ = int(t["tf"])
+            keys.append("tf:" + ("1-2" if f_ <= 2 else "3-5" if f_ <= 5 else "10-15" if f_ <= 15 else "30+"))
         for k in keys:
             s = book.setdefault(k, [0.0, 0.0, 0.0])
             if s[0] >= 600:  # recent trades count most
@@ -3814,6 +3823,14 @@ class Tournament(FarmMixin):
         sh, lg = self._lesson("dte:0-3"), self._lesson("dte:4-10", "dte:11+")
         if sh[0] >= N and lg[0] >= N and lg[1] - sh[1] >= GAP:
             out["dte"] = (7, f"contracts bought 3 days or less from expiry averaged {sh[1]:+.1f}%; with more time, {lg[1]:+.1f}%")
+        tight, other = self._lesson("trail:0-8"), self._lesson("trail:none", "trail:8-20", "trail:20+")
+        if tight[0] >= N and other[0] >= N and other[1] - tight[1] >= GAP:
+            out["trail"] = (12, f"bots with trailing stops under 8% averaged {tight[1]:+.1f}% a trade ({tight[2] * 100:.0f}% won); "
+                                f"wider or none, {other[1]:+.1f}%")
+        fast, slow = self._lesson("tf:1-2"), self._lesson("tf:3-5", "tf:10-15", "tf:30+")
+        if fast[0] >= N and slow[0] >= N and slow[1] - fast[1] >= GAP:
+            out["pace"] = (3, f"bots deciding every 1-2 candles averaged {fast[1]:+.1f}% a trade ({fast[2] * 100:.0f}% won); "
+                              f"slower ones {slow[1]:+.1f}%")
         late, early = self._lesson("open:14-15"), self._lesson("open:9", "open:10-11", "open:12-13")
         if late[0] >= N and early[0] >= N and early[1] - late[1] >= GAP:
             out["late"] = (60, f"trades opened after 2 pm averaged {late[1]:+.1f}%; opened earlier, {early[1]:+.1f}%")
@@ -3838,7 +3855,78 @@ class Tournament(FarmMixin):
             t["night"] = lv["night"][0]
         if "dte" in lv and float(t.get("odte", 99) or 99) < 7 and self.rng.random() < 0.5:
             t["odte"] = self.rng.randint(7, 21)
+        if "trail" in lv and 0 < float(t.get("trail", 0) or 0) < lv["trail"][0] and self.rng.random() < 0.5:
+            if self.rng.random() < 0.5:
+                t.pop("trail")  # no trailing stop: its target and safety stop sell it
+            else:
+                t["trail"] = self.rng.uniform(lv["trail"][0], 30.0)
         return clean_traits(t)
+
+    def lesson_tf(self, tf):
+        """A new bot's pace leans the way the farm's trades say too: when bots deciding every 1-2 candles did clearly
+        worse, about half the new ones that would decide that fast slow down to every 3+ candles."""
+        lv = self.lesson_view() if self.o.get("lessons", True) else {}
+        if "pace" in lv and clamp_tf(tf) < lv["pace"][0] and self.rng.random() < 0.5:
+            return self.rng.choice([x for x in TIMEFRAMES if lv["pace"][0] <= x <= 15])
+        return tf
+
+    # ---- bots tuning their own habits from their own trades ----
+    def self_tune(self, v):
+        """A bot adjusts its own exits from how its own trades went (scalpers and kamikazes keep their breed's rules):
+        - its trailing stop keeps selling it at a loss while its other exits do better: it widens the trail by half
+          (dropping it past 30%),
+        - its quick trades (held under 15 candles) lose while its longer ones do better: it starts holding at least
+          that long before its signals may sell.
+        Each change is written in the farm's news, and the bot's habit record starts over after a change, so it
+        judges the new setting on its own trades. -> text of what changed, or None."""
+        if is_scalp(v.name) or is_kami(v) or not self.o.get("self_tune", True):
+            return None
+        hb = getattr(v, "habits", None) or {}
+        avg = lambda k: hb[k][1] / hb[k][0] if hb.get(k) and hb[k][0] else 0.0
+        n = lambda k: hb.get(k, [0])[0]
+        tr = dict(v.traits)
+        did = None
+        tw = float(tr.get("trail", 0) or 0)
+        if tw > 0 and n("trail") >= SELF_TUNE_MIN and n("other") >= SELF_TUNE_MIN and avg("other") - avg("trail") >= SELF_TUNE_GAP:
+            ev = f"its {n('trail'):.0f} trailing-stop sales averaged {avg('trail'):+.1f}%, its other sales {avg('other'):+.1f}%"
+            if tw * 1.5 > 30:
+                tr.pop("trail")
+                did = f"dropped its trailing stop ({ev})"
+            else:
+                tr["trail"] = tw * 1.5
+                did = f"widened its trailing stop to {tr['trail']:.0f}% ({ev})"
+            hb.pop("trail", None)
+            hb.pop("other", None)
+        elif not tr.get("minhold") and not tr.get("exit") and n("quick") >= SELF_TUNE_MIN and n("long") >= SELF_TUNE_MIN \
+                and avg("long") - avg("quick") >= SELF_TUNE_GAP:
+            tr["minhold"] = max(2, -(-15 // max(1, v.tf)))
+            did = (f"now holds at least {tr['minhold']} decisions (its {n('quick'):.0f} trades held under 15 candles averaged "
+                   f"{avg('quick'):+.1f}%, longer ones {avg('long'):+.1f}%)")
+            hb.pop("quick", None)
+            hb.pop("long", None)
+        if not did:
+            return None
+        v.traits = clean_traits(tr)
+        v.habits = hb
+        v.mut_kinds = list(getattr(v, "mut_kinds", None) or []) + ["self-tuned"]
+        self.events.append(f"{v.label} {did}")
+        return did
+
+    def note_habit(self, v, t, pc):
+        """Files one of the bot's own finished trades for self_tune: how it was sold and how long it was held.
+        Gains count at most +200%, and older trades fade (halved after 30)."""
+        hb = v.__dict__.setdefault("habits", {})
+        pc = max(-100.0, min(200.0, pc))
+        keys = ["trail" if exit_kind(t.get("why")) == "trail" else "other"]
+        h = t.get("held")
+        if h is not None:
+            keys.append("quick" if h < 15 else "long")
+        for k in keys:
+            s_ = hb.setdefault(k, [0.0, 0.0])
+            if s_[0] >= 30:
+                s_[:] = [x / 2 for x in s_]
+            s_[0] += 1
+            s_[1] += pc
 
     def lesson_vetoes(self, vt):
         """A new egg's never-rules lean toward what the trades say too: trades opened late in the day did worse ->
@@ -4474,7 +4562,10 @@ class Tournament(FarmMixin):
                         v.windfalls = (list(getattr(v, "windfalls", None) or [])
                                        + [[v.age, round(t["pl"] - paid_ * WINDFALL_CAP / 100, 2)]])[-10:]
                     if not self.replaying and self.o.get("lessons", True):
-                        self.learn_lesson(dict(t, strat=v.name), pc_)
+                        habit_ = {} if is_scalp(v.name) or is_kami(v) else dict(tf=v.tf, trail=v.traits.get("trail", 0))
+                        self.learn_lesson(dict(t, strat=v.name, **habit_), pc_)
+                    if not self.replaying:
+                        self.note_habit(v, t, pc_)
                 if t.get("flags") and not self.replaying:
                     for k in t["flags"]:
                         self.review.setdefault(k, [0, 0])[0 if t["pl"] <= 0 else 1] += 1
@@ -4902,6 +4993,11 @@ class Tournament(FarmMixin):
         if self.drop_twins():
             self._rate()
         self.instinct_tick()
+        for v in list(self.vars):  # bots tune their own exits from their own trades
+            try:
+                self.self_tune(v)
+            except Exception:
+                note_error("self_tune")
         for v in self.vars:  # strikes: checks spent benched (slowed counts half, standby none)
             st = self.info[id(v)]["status"]
             if st == "active":
@@ -5071,7 +5167,8 @@ class Tournament(FarmMixin):
             vt, vs = self.inherit_vetoes([parent])
             ly, ls = self.inherit_layers([parent], parent.name)
             child = self._new(parent.name, self.elder_nudge(parent.name, self.mutate(parent.name, parent.params, scale)),
-                              self.mutate_tf(parent.tf),
+                              (self.mutate_tf(parent.tf) if is_scalp(parent.name) or is_kami(parent)
+                               else self.lesson_tf(self.mutate_tf(parent.tf))),
                               self.mutate_risk(parent.risk), self.mutate_traits(parent.traits), vt, ly)
             child.veto_stats, child.layer_stats = vs, ls
             self._register(child, [parent], "tweaked")
@@ -5191,7 +5288,7 @@ class Tournament(FarmMixin):
             v = self.spawn_classic(closes)
             if v:
                 return v
-        return self.add_variant(name, p, closes, note="Random new strategy:", tf=self.rng.choice(TIMEFRAMES),
+        return self.add_variant(name, p, closes, note="Random new strategy:", tf=self.lesson_tf(self.rng.choice(TIMEFRAMES)),
                                 origin="random", risk=self.rand_risk(), traits=self.rand_traits(0.35),
                                 vetoes=self.lesson_vetoes(self.rand_vetoes()), layers=self.rand_layers())
 
@@ -5206,7 +5303,7 @@ class Tournament(FarmMixin):
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
-                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src", "legend_src", "trade_pcts", "best_pl", "windfalls")
+                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src", "legend_src", "trade_pcts", "best_pl", "windfalls", "habits")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -5794,6 +5891,8 @@ def _mine_run(g, closes, extra, a, z, cuts, start_cash, fee, pct, slip):
 
 
 TYPICAL_FLOOR = -15.0  # a bot whose typical (median) trade loses more than this % can't be proven or a legend
+SELF_TUNE_MIN = 6     # a bot's own trades each side of a comparison before it changes its own habits
+SELF_TUNE_GAP = 5.0   # ...and how much better (points of average gain per trade) the other way must be
 LESSON_MIN = 40       # trades each side of a comparison needs before the farm draws a trade lesson from it
 LESSON_GAP = 3.0      # ...and how much better (points of average gain per trade) the better way must be
 
@@ -6141,8 +6240,11 @@ def farm_knowledge(t):
     # trade lessons: what the farm's own finished trades say
     titles = {"side": "Prefer {}s", "maxotm": "Stay within {}% out of the money", "exit": "Let stops and targets sell",
               "minhold": "Hold at least {} decisions",
-              "night": "{}", "dte": "Buy at least {} days from expiry", "late": "Don't open in the last {} minutes"}
+              "night": "{}", "dte": "Buy at least {} days from expiry", "late": "Don't open in the last {} minutes",
+              "trail": "Trailing stops {}% or wider (or none)", "pace": "Decide every {} candles or slower"}
     for k, (choice, ev) in (t.lesson_view() if hasattr(t, "lesson_view") else {}).items():
+        if k not in titles:
+            continue
         items.append(dict(id=f"lesson:{k}", kind="Trade lesson", title=titles[k].format({1: "Hold overnight", 2: "Go flat before the close"}.get(choice, choice) if k == "night" else choice), detail="about half the new "
                           "eggs lean this way; the rest keep testing the other way", evidence=ev, score=5.0, strong=True,
                           data=dict(lessons={x: list(s) for x, s in (t.lessons or {}).items()})))
