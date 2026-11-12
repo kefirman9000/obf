@@ -10,6 +10,31 @@
 
 
 
+## 1.42.0
+From the 11/12 report:
+- **Practice prices follow the volatility smile.** Every strike was priced at the ticker's near-the-money volatility,
+  but the market charges much more for strikes well below the stock. A 10%-out NVDA put came out at $66 when the
+  market would have asked about $200, so when NVDA opened 14% lower the bots booked +1,342% where a real trade would
+  have shown about +400%. Contracts are now priced on a smile measured from each ticker's live option chain (a
+  typical stock's until it's read). Far-out contracts look dearer, and their wins smaller and more honest.
+- **One huge trade can't carry a bot's score.** Whatever a single trade made beyond +200% of what it paid no longer
+  counts toward the bot's ranking (it keeps the money). Electric Marten was the farm's only "active" bot on that one
+  NVDA put alone. Farms saved before this cap their bots' best trade the same way.
+- **No profit-taking on the opening prints.** In the first 5 minutes after the 9:30 open, bots' profit targets and
+  trailing stops wait (stops still work), and estimated option fills pay twice the usual bid/ask gap (1.5x until
+  9:45). NVDA's first print on 11/12 was $149.71 and it was back over $160 ten minutes later.
+- **Practice no longer sells after the close.** Contracts near expiry were sold at 4:41 pm and 6:16 pm, at prices no
+  one could trade at. The expiry guard now sells during market hours (an expired contract still settles).
+- **No more ping-pong.** Bots that disagree passed one NVDA put back and forth three times in 13 minutes, paying the
+  gap each time. A contract opened on a signal now isn't closed by another signal for 5 minutes, and after a signal
+  closes one, nothing new opens on that ticker by signal for 10 minutes. Stops, targets and expiry never wait.
+- **Scalp roams on estimated option prices count a quarter.** They showed +100% to +215% on premium where days with
+  real prices showed about even. Only real-price days can graduate a scalper or make it an elder.
+- **Fix: ticker rotation crashed on an empty download** (11/11 and 11/12). A candidate needs its own prices before
+  it can be swapped in.
+- **Feature tests skip switches that hardly ever change a result** (the twin test matched itself in 19 of 22 tests).
+  They still get an occasional turn.
+
 ## 1.41.1
 - **Practice no longer books gains a real sale wouldn't get.** Logged in to Alpaca, practice buys real contracts at
   their real ask, but it valued and sold them at the quote's midpoint, or, with no quote from the last 3 minutes,

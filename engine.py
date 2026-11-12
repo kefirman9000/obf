@@ -1507,6 +1507,10 @@ def learn_spreads(c, rows, S=None):
     vx = sum((x - mx) ** 2 for x, _ in pts)
     b = max(0.0, sum((x - mx) * (y - my) for x, y in pts) / vx) if vx > 0 else 0.0
     a = max(0.01, my - b * mx)
+    try:
+        learn_skew(c, rows, S)
+    except Exception:
+        note_error("learn_skew")
     _load_spreads()
     SPREAD_FIT[c] = [round(a, 4), round(min(b, 0.5), 4), time.time()]
     try:
@@ -1544,6 +1548,23 @@ def minutes_to_close(ts):
     d = datetime.fromtimestamp(ts, timezone.utc)
     ny = d - timedelta(hours=_ny_offset(d))
     return (ny.replace(hour=16, minute=0, second=0, microsecond=0) - ny).total_seconds() / 60
+
+
+OPEN_SETTLE_MIN = 5  # minutes after the 9:30 open when bots' profit targets and trailing stops wait
+
+
+def opening_rush(ts, within=OPEN_SETTLE_MIN):
+    """True in the first `within` minutes after the 9:30 open (New York). The first prints of the day can be far off
+    where the stock really trades, and option quotes are at their widest: on 11/12 NVDA's first print was $149.71
+    (it was back over $160 ten minutes later), and three bots booked +300% to +1,300% on puts at that one print."""
+    m = 390 - minutes_to_close(ts)
+    return 0 <= m < within
+
+
+def open_spread_mult(ts):
+    """How much wider option bid/ask gaps run right after the open than later in the day (estimated prices only)."""
+    m = 390 - minutes_to_close(ts)
+    return 2.0 if 0 <= m < 5 else 1.5 if 0 <= m < 15 else 1.0
 
 
 # ---------------- settings ----------------
@@ -1802,6 +1823,83 @@ RATE = 0.04               # risk-free rate used for pricing
 YEAR = 365.0 * 86400
 IV_HINT = {}              # underlying -> implied volatility from the live option chain (used when known)
 _VOL_CACHE = {}
+SKEW_FIT = {}             # underlying -> [down, up, when]: the volatility smile measured on the live option chain
+SKEW_DEFAULT = (2.5, 0.8)  # a typical stock's smile, until its own chain is read
+_SKEW_LOADED = [False]
+
+
+def _skew_path():
+    return os.path.join(HOME_DIR, "cache", "skew.json")
+
+
+def _load_skew():
+    if not _SKEW_LOADED[0]:
+        _SKEW_LOADED[0] = True
+        try:
+            for k, v in (load_json(_skew_path(), {}) or {}).items():
+                if isinstance(v, list) and len(v) >= 2 and k not in SKEW_FIT:
+                    SKEW_FIT[k] = v
+        except Exception:
+            pass
+
+
+def smile(c, K, S):
+    """How much more (or less) volatility the market charges at strike K than near the money, as a multiplier.
+    Real option prices aren't priced at one volatility: strikes well below the stock (cheap puts, the crash insurance)
+    trade at much higher volatility than the at-the-money contracts the ticker's implied volatility comes from. One
+    flat volatility made a 10% out-of-the-money put look about a third of its real price, so a gap through its strike
+    booked +1,300% that a real trade would have shown as about +400%. The smile is a straight line in log(K/S) on
+    each side of the money (measured on the ticker's own chain when it's been read, a typical stock's otherwise),
+    held between 0.7x and 2.2x."""
+    if not (K and S and K > 0 and S > 0):
+        return 1.0
+    _load_skew()
+    fit = SKEW_FIT.get(c) or SKEW_DEFAULT
+    dn, up = float(fit[0]), float(fit[1])
+    k = math.log(K / S)
+    m = 1.0 + (dn * -k if k < 0 else up * k)
+    return min(2.2, max(0.7, m))
+
+
+def learn_skew(c, rows, S):
+    """Measures the ticker's volatility smile from its live chain: implied volatility at each strike vs the one
+    nearest the money, on the nearest expiry that's 2+ days out and has quotes on both sides. Saved for restarts."""
+    if not S or S <= 0:
+        return None
+    now = time.time()
+    good = [r for r in rows if r.get("iv") and float(r["iv"]) > 0 and r.get("K") and r.get("exp", 0) - now > 2 * 86400
+            and abs(math.log(r["K"] / S)) < 0.25]
+    if len(good) < 8:
+        return None
+    for exp in sorted({r["exp"] for r in good}):
+        rs = [r for r in good if r["exp"] == exp]
+        if len(rs) < 8:
+            continue
+        # out-of-the-money contracts carry the cleaner volatility: puts below the stock, calls above it
+        rs = [r for r in rs if (r["type"] == "put") == (r["K"] <= S)] or rs
+        atm = [float(r["iv"]) for r in rs if abs(math.log(r["K"] / S)) < 0.025]
+        if not atm:
+            continue
+        base = sorted(atm)[len(atm) // 2]
+        dn = [(float(r["iv"]) / base - 1) / -math.log(r["K"] / S) for r in rs if math.log(r["K"] / S) < -0.03]
+        up = [(float(r["iv"]) / base - 1) / math.log(r["K"] / S) for r in rs if math.log(r["K"] / S) > 0.03]
+        if len(dn) < 2 and len(up) < 2:
+            continue
+        med = lambda xs, d: sorted(xs)[len(xs) // 2] if len(xs) >= 2 else d
+        _load_skew()
+        SKEW_FIT[c] = [round(min(6.0, max(0.0, med(dn, SKEW_DEFAULT[0]))), 3),
+                       round(min(4.0, max(-1.0, med(up, SKEW_DEFAULT[1]))), 3), now]
+        try:
+            save_json(_skew_path(), SKEW_FIT)
+        except Exception:
+            note_error("learn_skew")
+        return SKEW_FIT[c]
+    return None
+
+
+def strike_vol(c, K, S, base):
+    """The volatility to price strike K with, from the ticker's near-the-money volatility `base`."""
+    return base * smile(c, K, S)
 
 
 def _ncdf(x):
@@ -2170,6 +2268,8 @@ class OptionSim(Sim):
             if 2 * slip * 100 > SCALP_SPREAD[0]:
                 self.opt.pop(c, None)
                 return False
+        if rs is None:
+            slip = min(0.5, slip * open_spread_mult(self.now))  # estimated: gaps are widest right after the open
         fill = prem * (1 + slip)
         spend = min(self.start * self.pct * mult, self.cash)
         qty = int(spend // fill)
@@ -2202,7 +2302,7 @@ class OptionSim(Sim):
         # the market's own (implied) volatility when it's known; otherwise the one the contract was bought with. Measured
         # volatility from a few candles (right after a restart, say) could reprice it to a fake gain or loss in a minute.
         vol = IV_HINT.get(c) or o.get("vol") or self._vol(c)
-        return bs_price(S, o["K"], T, vol, o["type"]) * CONTRACT
+        return bs_price(S, o["K"], T, strike_vol(c, o["K"], S, vol), o["type"]) * CONTRACT
 
     def _count_fill(self, o):
         if self.book is not None:
@@ -2231,6 +2331,8 @@ class OptionSim(Sim):
         rs = self._real_slip(c, o, prem)
         if rs is not None:  # a real contract on a past day: sells get the bid
             slip = max(slip if (self.genes or {}).get("flatby") else 0.0, rs)
+        else:
+            slip = min(0.5, slip * open_spread_mult(self.now))  # estimated: gaps are widest right after the open
         fill = prem if expired else prem * (1 - slip)
         proceeds = q * fill * (1 - (0 if expired else self.fee)) - (0 if expired else q * CONTRACT_FEE[0])
         self.fees += 0 if expired else q * prem * slip + q * fill * self.fee + q * CONTRACT_FEE[0]
@@ -2601,6 +2703,21 @@ SCALP_JUDGE = 30   # a scalper is judged on its last this-many finished trades
 SCALP_MIN = 8      # ...once it has at least this many
 
 
+WINDFALL_CAP = 200.0  # % a single trade may count for in a bot's score
+
+
+def windfall_excess(v):
+    """$ to take off a bot's equity when it's scored: whatever its trades in the scoring window made beyond
+    +WINDFALL_CAP% of what they paid. On 11/12 a 10%-out NVDA put bought for $66 sold for $960 at the open (+1,342%),
+    and that one trade made its bot the farm's top 'active' bot. A gain that size is mostly luck (or a pricing quirk)
+    and says little about the next trade; the bot keeps its money, it just isn't ranked on it."""
+    wf = getattr(v, "windfalls", None)
+    if not wf:
+        return 0.0
+    start = v.age - len(v.eq)
+    return sum(float(x) for a, x in wf if a > start and x > 0)
+
+
 def scalp_record(v):
     """A scalper's (decision, equity) after each of its recent finished trades, when it has enough of them."""
     te = getattr(v, "trade_eq", None)
@@ -2823,8 +2940,9 @@ def option_exit(sim, c, S, tr):
     if tr.get("decay"):
         T = max(0.0, o["exp"] - sim.now) / YEAR
         if T > 0:
-            p0 = bs_price(S, o["K"], T, vol, o["type"])
-            p1 = bs_price(S, o["K"], max(0.0, T - 1 / 365), vol, o["type"])
+            sv = strike_vol(c, o["K"], S, vol)
+            p0 = bs_price(S, o["K"], T, sv, o["type"])
+            p1 = bs_price(S, o["K"], max(0.0, T - 1 / 365), sv, o["type"])
             if p0 > 0.005 and (p0 - p1) / p0 * 100 >= tr["decay"]:
                 return "decay"
     v0 = float(o.get("vol") or 0)
@@ -2876,13 +2994,14 @@ def bot_step(v, closes, n, coins, extra=None):
             if tr.get("vixwide"):  # a volatility jump: room to breathe (a spike gets the full width)
                 reg_ = vol_regime(closes, extra, c)[0]
                 k_ *= tr["vixwide"] if reg_ == "spiking" else (1 + tr["vixwide"]) / 2 if reg_ == "rising" else 1.0
+            settle = opt and opening_rush(sim.now)  # (the first prints of the day: no taking profits on them)
             if why is not None:
                 pass
             elif v.risk["sl"] and r <= -v.risk["sl"] * k_:
                 why = "stop"
-            elif v.risk["tp"] and r >= v.risk["tp"] * k_:
+            elif v.risk["tp"] and r >= v.risk["tp"] * k_ and not settle:
                 why = "target"
-            elif why is None and tr.get("trail") and mk <= v.hi[c] * (1 - tr["trail"] * k_ / 100):
+            elif why is None and tr.get("trail") and mk <= v.hi[c] * (1 - tr["trail"] * k_ / 100) and not settle:
                 why = "trail"
             elif tr.get("maxhold") and n - v.since.get(c, n) >= tr["maxhold"] * v.tf:
                 why = "time"
@@ -3220,6 +3339,7 @@ class Variant:
         self.best_tr = self.worst_tr = None  # its best and worst finished trade, % of what it paid
         self.trade_pcts = []    # its last 40 finished trades, % of what it paid (for its typical trade)
         self.best_pl = 0.0      # its single best finished trade, $ (a record carried by one trade isn't proof)
+        self.windfalls = []     # [age, $ beyond +WINDFALL_CAP%] of its trades that made more than that (scored capped)
         self.log_ct = {}  # (decision, ticker) -> "call" / "put" of the contract traded there
         self.roam_scan = None  # scalpers: [trades, wins, pl, paid] from Free roam's scalp roams on past days (fading)
         self.trade_eq = deque(maxlen=SCALP_JUDGE + 1)  # scalpers: (decision, equity) after each finished trade
@@ -4350,6 +4470,9 @@ class Tournament(FarmMixin):
                     v.worst_tr = pc_ if v.worst_tr is None else min(v.worst_tr, pc_)
                     v.trade_pcts = (list(getattr(v, "trade_pcts", None) or []) + [round(pc_, 2)])[-40:]
                     v.best_pl = max(float(getattr(v, "best_pl", 0) or 0), float(t["pl"]))
+                    if pc_ > WINDFALL_CAP:  # the part of a huge win past +WINDFALL_CAP% doesn't count toward its score
+                        v.windfalls = (list(getattr(v, "windfalls", None) or [])
+                                       + [[v.age, round(t["pl"] - paid_ * WINDFALL_CAP / 100, 2)]])[-10:]
                     if not self.replaying and self.o.get("lessons", True):
                         self.learn_lesson(dict(t, strat=v.name), pc_)
                 if t.get("flags") and not self.replaying:
@@ -4416,7 +4539,7 @@ class Tournament(FarmMixin):
         need = self.min_trades if v.tf < 10 else 1  # slow, long-holding bots trade rarely by design
         if len(v.eq) < v.eq.maxlen or len(v.sim.tbars) < need or v.eq[0] <= 0:
             return None
-        return v.eq[-1] / v.eq[0] - 1
+        return (v.eq[-1] - windfall_excess(v)) / v.eq[0] - 1
 
     def consistency(self, v):
         """Share of the 4 recent sub-periods in which the variant made money (0..1). Scalpers: 4 blocks of trades."""
@@ -5083,7 +5206,7 @@ class Tournament(FarmMixin):
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
-                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src", "legend_src", "trade_pcts", "best_pl")
+                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src", "legend_src", "trade_pcts", "best_pl", "windfalls")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -5144,6 +5267,10 @@ class Tournament(FarmMixin):
                     if k in d and k not in ("name", "params", "tf", "risk", "traits"):
                         setattr(v, k, d[k])
                 v.eq = deque(d.get("eq", []), maxlen=int(d.get("eq_max") or v.eq.maxlen))
+                bt_ = max([float(x) for x in (v.trade_pcts or [])] or [0.0])
+                if "windfalls" not in d and bt_ > WINDFALL_CAP and float(v.best_pl or 0) > 0:
+                    # saved before windfalls were kept: its best trade counts as recent, capped like a new one
+                    v.windfalls = [[v.age, round(float(v.best_pl) * (1 - WINDFALL_CAP / bt_), 2)]]
                 v.log = deque([tuple(x) for x in d.get("log", [])], maxlen=300)
                 v.bad = d.get("bad", 0)
                 s = d.get("sim") or {}
@@ -5435,7 +5562,7 @@ def fresh_scoreboard(t):
     for v in t.vars:
         v.exams, v.backtests, v.roam_scan = [], [], None
         v.best_tr = v.worst_tr = None
-        v.trade_pcts, v.best_pl = [], 0.0
+        v.trade_pcts, v.best_pl, v.windfalls = [], 0.0, []
         v.coin_pl, v.mood_gain, v.mood_n, v.cond_gain, v.cond_n = {}, {}, {}, {}, {}
         v.live_high = None
         v.twin = None
@@ -6348,7 +6475,7 @@ def scout_score(d, trade_size=None, vol=None):
     move = 1 + min(chg, 8) / 4
     vol = vol or IV_HINT.get(c) or (0.2 if c in INDEX_ETFS else 0.4)  # (a guess until its own prices are measured)
     K = round(S * 1.02 / strike_step(S)) * strike_step(S)
-    cost = bs_price(S, K, 14 / 365, vol, "call") * CONTRACT
+    cost = bs_price(S, K, 14 / 365, strike_vol(c, K, S, vol), "call") * CONTRACT
     afford = 1.0 if not trade_size or cost <= trade_size else max(0.15, trade_size / cost)
     hs = half_spread(c, cost / CONTRACT) if cost > 0 else 0.5
     tight = max(0.3, 1 - 2 * hs)

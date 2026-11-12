@@ -3968,7 +3968,12 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             qty = self.pos.get(coin, 0)
             return self.cost.get(coin, 0) / qty if qty else 0.0
         T = max(0.0, o["exp"] - time.time()) / E.YEAR
-        vol = E.IV_HINT.get(t) or o.get("vol") or E.pricing_vol(self.hist.get(t) or [S], (self.hx.get(t) or {}).get("t"))
+        if E.IV_HINT.get(t):
+            vol = E.strike_vol(t, o["K"], S, E.IV_HINT[t])
+        elif o.get("vol0"):  # priced at the strike's own volatility when bought: it carries on with that
+            vol = E.strike_vol(t, o["K"], S, o["vol0"])
+        else:
+            vol = o.get("vol") or E.pricing_vol(self.hist.get(t) or [S], (self.hx.get(t) or {}).get("t"))
         return E.bs_price(S, o["K"], T, vol, o["type"]) * E.CONTRACT * float(o.get("anchor") or 1.0)
 
     def real_quote(self, o, fetch=False):
@@ -5503,7 +5508,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             vol = E.IV_HINT.get(c) or E.pricing_vol(self.hist.get(c) or [S], (self.hx.get(c) or {}).get("t"))
             exp = E.next_expiry(time.time(), 14)
             K = round(S * 1.02 / E.strike_step(S)) * E.strike_step(S)
-            cost = E.bs_price(S, K, max(0, exp - time.time()) / E.YEAR, vol, "call") * E.CONTRACT
+            cost = E.bs_price(S, K, max(0, exp - time.time()) / E.YEAR, E.strike_vol(c, K, S, vol), "call") * E.CONTRACT
             afford[c] = dict(price=round(S, 2), vol=round(vol, 3), contract_2pct_otm_14d=round(cost, 2),
                              trade_size=round(size, 2), affordable=cost <= size)
         farms = {}
@@ -7334,6 +7339,16 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         head = text.split(":")[0] if ":" in text[:60] else text
         return head if len(head) <= 70 else head[:67].rstrip() + "..."
 
+    @staticmethod
+    def feature_idle(rows):
+        """True for a switch whose on and off runs came out identical in 3 of every 4 recent tests (the 11/12 report:
+        the twin test matched itself in 19 of 22). Testing it again mostly costs two whole farm runs for nothing."""
+        last = list(rows or [])[-8:]
+        if len(last) < 6:
+            return False
+        same = sum(1 for a, b, *_ in last if abs(a - b) < 1e-9)
+        return same >= 0.75 * len(last)
+
     def _roam_features(self, t):
         """Feature test: the same practice farm lives through the same stretch twice, with one learning switch on and
         then off, and its best bots (by training) sit an exam on prices they never saw. The difference goes into the
@@ -7341,7 +7356,10 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         import random as _r
         rng = _r.Random()
         book = self.__dict__.setdefault("roam_features", {})
-        key = E.pick_feature(E.feature_candidates(self.settings, self.learning_switches()), book, rng)
+        cands = E.feature_candidates(self.settings, self.learning_switches())
+        if rng.random() < 0.8:  # switches that hardly ever change a result get an occasional turn, not every turn
+            cands = [k for k in cands if not self.feature_idle(book.get(k))] or cands
+        key = E.pick_feature(cands, book, rng)
         if not key:  # every switch is off: nothing to compare
             return self._roam_check(t)
         closes, extra, info = self._roam_pick(rng, 700, prefer=self.farm_gran())
@@ -8020,15 +8038,19 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 rows.append((g, b, pct))
                 v = by_uid.get(g["uid"]) if g["uid"] > 0 else None
                 if v is not None and not live:  # its record across past days (older days slowly count for less)
+                    # a day on estimated option prices counts a quarter: estimated scalps came out at +100% to +200% on
+                    # premium where days with real prices came out near even (11/12 report)
+                    w_ = 1.0 if real_day else 0.25
                     rs = v.roam_scan or [0, 0, 0.0, 0.0]
-                    v.roam_scan = [round(rs[0] * 0.9 + b[0], 2), round(rs[1] * 0.9 + b[1], 2), rs[2] * 0.9 + b[2], rs[3] * 0.9 + b[3]]
+                    v.roam_scan = [round(rs[0] * 0.9 + b[0] * w_, 2), round(rs[1] * 0.9 + b[1] * w_, 2),
+                                   rs[2] * 0.9 + b[2] * w_, rs[3] * 0.9 + b[3] * w_]
                     if exam and not E.is_kami(v):  # a held-back day: an exam, and nothing is learned from it
                         if b[0]:
                             E.add_exam(v, "day", pct, b[0], day.isoformat(), 60)
                             if real_day:
                                 v.exams[-1]["real"] = True  # counts toward a scalper's real-price exams
                         continue
-                    if b[0] >= 8 and b[2] > 0:  # a scalper that paid on a day it never saw: an elder for future eggs
+                    if b[0] >= 8 and b[2] > 0 and real_day:  # paid on a day it never saw (real prices): an elder for eggs
                         t.elders.append(dict(name=v.name, params=dict(v.params), tf=v.tf, edge=b[2] / b[3]))
                         del t.elders[:-40]
             mine = [(g, b, pct) for g, b, pct in rows if g["uid"] >= 0 and b[0] >= 10]
@@ -8038,7 +8060,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             grad = ""
             if not live and not exam:
                 self.roam_days.add(day.isoformat())
-            if new and self.seeded and len(t.vars) < t.cap + 2 and not exam and not t.nursery_full():
+            if new and real_day and self.seeded and len(t.vars) < t.cap + 2 and not exam and not t.nursery_full():
+                # (only a day on real option prices graduates a scalper: estimated prices flattered scalps several times over)
                 g = new[0][0]
                 v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
                                   note="Free roam scalp graduate:", tf=g["tf"], origin="free roam", risk=g["risk"],
@@ -8859,6 +8882,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         total = cost * (1 + fee)
         self.cash -= total
         self.fees_paid += cost * fee
+        self.__dict__.setdefault("_opened_at", {})[c] = time.time()
         self.opt[c] = o
         self.pos[c], self.cost[c] = qty, total
         self.opt_quotes[r["symbol"]] = (r["bid"], r["ask"], time.time())
@@ -9799,6 +9823,16 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
     def near_expiry(self, o):
         return E.sessions_left(o["exp"]) <= max(1, int(self.settings.get("expiry_days", 2) or 2))
 
+    def hours_open(self):
+        """Is the stock market open right now? Alpaca's clock when the app has it, else the regular weekday hours.
+        Options only trade 9:30-4 New York: practice mustn't sell at a price no one could have traded at (on 11/10 and
+        11/11 it closed two contracts as 'expiry' at 4:41 pm and 6:16 pm)."""
+        mkt = self.market if isinstance(self.market, dict) else {}
+        if "is_open" in mkt:
+            return bool(mkt.get("is_open"))
+        m = E.minutes_to_close(time.time())
+        return 0 < m <= 390 and datetime.now().weekday() < 5
+
     def expiring_soon(self, extra=0):
         """Labels of account contracts inside the expiry window (+ extra trading days)."""
         out = []
@@ -9833,12 +9867,10 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
                 def work():
                     try:
-                        is_open = True
-                        if self.live:
-                            try:
-                                is_open = bool(E.market_clock().get("is_open"))
-                            except Exception:
-                                is_open = False
+                        try:
+                            is_open = bool(E.market_clock().get("is_open"))
+                        except Exception:  # (no login / offline: practice goes by the clock, live waits)
+                            is_open = False if self.live else self.hours_open()
                         self.q.put(("call", lambda: self._guard_act(held, is_open)))
                     finally:
                         self._guard_busy = False
@@ -9882,7 +9914,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         for c, o in held:
             if self.pos.get(c, 0) <= 0 or c in self.pending or not self.near_expiry(o):
                 continue
-            if is_open or not self.live:
+            if is_open or (not self.live and time.time() >= o["exp"]):  # (an expired practice contract settles)
                 if not self.running:
                     self.write(f"Expiry guard: selling {self.contract_label(c)} (expires "
                                f"{datetime.fromtimestamp(o['exp']).strftime('%a %b %d')}).", "warn")
@@ -10759,7 +10791,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             if q <= 0 or c in self.pending:
                 continue
             o = self.opt.get(c)
-            if o and self.near_expiry(o):
+            if o and self.near_expiry(o) and (self.live or self.hours_open() or time.time() >= o["exp"]):
                 self.sell(c, self.last.get(tick_of(c), 0), "expiry")
                 continue
             sc = (o or {}).get("scalp")
@@ -10893,6 +10925,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
     def open_option(self, c, typ, S, reason="signal", mult=1.0, genes=None):
         g = genes or {}
         t_ = tick_of(c)  # c is the account's book ("SPY" or "SPY~scalp"), t_ the ticker
+        if reason == "signal" and not g.get("_scalp") and self.churn_blocked(c, False):
+            return
         mode = int(g.get("omode", 3) or 3)
         if (typ == "call" and mode == 2) or (typ == "put" and mode == 1):
             return
@@ -10971,18 +11005,21 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             K, exp = real["K"], real["exp"]
             o = dict(type=typ, K=K, exp=exp, symbol=real["symbol"])
             prem = real["ask"] * E.CONTRACT
-            vol = float(real.get("iv") or 0) or E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
+            base_ = E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
+            vol = float(real.get("iv") or 0) or E.strike_vol(t_, K, S, base_)
             self.opt_quotes[real["symbol"]] = (real["bid"], real["ask"], now if now - cache[0] > 90 else cache[0])
             # the model's price for this contract vs what the market really quoted: kept, so when no fresh quote is at
             # hand its value is the model's, scaled to this contract's real price (not the ticker's average volatility)
-            bs_ = E.bs_price(S, K, max(0.0, exp - now) / E.YEAR, vol, typ)
+            # (against the same price the contract is valued at later: the ticker's volatility on this strike's smile)
+            bs_ = E.bs_price(S, K, max(0.0, exp - now) / E.YEAR, E.strike_vol(t_, K, S, base_), typ)
             if bs_ > 0 and real["bid"] > 0:
                 o["anchor"] = round(min(1.5, max(0.3, (real["bid"] + real["ask"]) / 2 / bs_)), 4)
         else:
             K = round((S * (1 + otm / 100) if typ == "call" else S * (1 - otm / 100)) / step) * step
             exp = E.next_expiry(now, dte)
             T = max(0.0, exp - now) / E.YEAR
-            vol = E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
+            base_ = E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
+            vol = E.strike_vol(t_, K, S, base_)
             prem = E.bs_price(S, K, T, vol, typ) * E.CONTRACT
             if (E.PREM_RANGE[0] or E.PREM_RANGE[1]) and not E.prem_ok(prem / E.CONTRACT):
                 cheaper = 1 if typ == "call" else -1  # walk the strike into the price range, never past 25% from the stock
@@ -10991,6 +11028,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                     K += way * step
                     if K <= 0 or abs(K / S - 1) > 0.25:
                         break
+                    vol = E.strike_vol(t_, K, S, base_)
                     prem = E.bs_price(S, K, T, vol, typ) * E.CONTRACT
                     if E.prem_ok(prem / E.CONTRACT):
                         break
@@ -10998,6 +11036,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                     return
             o = dict(type=typ, K=K, exp=exp, symbol=E.occ_symbol(t_, exp, typ, K))
         o["vol"] = round(float(vol), 4)  # what it was priced with: used again when the market's own volatility isn't known
+        o["vol0"] = round(float(base_), 4)  # the ticker's near-the-money volatility then (the smile is applied on top)
         fee, slip = E.cost_model(self.settings)
         half = self.fill_adjust("buy") if real else max(slip, 0.02)  # a real fill already paid the ask (plus what paper fills taught)
         if scalp and not real:  # a scalp pays this ticker's real bid/ask gap, and only takes tight ones
@@ -11025,17 +11064,36 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         self.cash -= cost
         if scalp:
             o = dict(o, scalp=dict(scalp, at=time.time()))
+        self.__dict__.setdefault("_opened_at", {})[c] = time.time()
         self.opt[c] = o
         self.pos[c] = qty
         self.cost[c] = cost
         self.log_trade("buy", c, qty, fill / E.CONTRACT, cost, None, reason)
         self.mirror_open(c, o, qty, reason)
 
+    CHURN_HOLD = 300   # s: a contract opened on a signal isn't closed by another signal sooner than this
+    CHURN_COOL = 600   # s: after a signal closes a contract, no new one opens on that ticker by signal for this long
+
+    def churn_blocked(self, c, closing):
+        """Bots that disagree used to pass one ticker back and forth: on 11/10 the account bought and sold the same
+        NVDA put three times in 13 minutes (a Dips-in-an-uptrend bot kept buying it, Buy-low bots kept closing it),
+        paying the bid/ask gap each time. Signals now wait a few minutes; stops, targets and expiry never wait."""
+        now = time.time()
+        if closing:
+            at = (getattr(self, "_opened_at", None) or {}).get(c)
+            return bool(at and now - at < self.CHURN_HOLD and not (self.opt.get(c) or {}).get("scalp"))
+        at = (getattr(self, "_sig_closed", None) or {}).get(c)
+        return bool(at and now - at < self.CHURN_COOL)
+
     def sell(self, c, px, reason="signal"):
         """Close the account's contract on this ticker."""
         qty = self.pos.get(c, 0)
         if qty <= 0 or c in self.pending:
             return
+        if reason == "signal":
+            if self.churn_blocked(c, True):
+                return
+            self.__dict__.setdefault("_sig_closed", {})[c] = time.time()
         if self.live and reason not in self.SAFETY_EXITS and self.is_day_trade(c) and self.pdt_blocked():
             if time.time() - self._pdt_note.get(c, 0) > 1800:
                 self._pdt_note[c] = time.time()
@@ -11654,6 +11712,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             sc_ = getattr(self, "scalp_next", {}).pop(c, None)
             if sc_:
                 o = dict(o, scalp=dict(sc_, at=time.time()))
+            self.__dict__.setdefault("_opened_at", {})[c] = time.time()
             self.opt[c] = o
             self.pos[c] = self.pos.get(c, 0) + qty
             self.cost[c] = self.cost.get(c, 0) + amount
@@ -15072,7 +15131,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         t_ = tick_of(c)
         S = self.last.get(t_) or (self.hist.get(t_) or [0])[-1]
         T = max(0.0, o["exp"] - time.time()) / E.YEAR
-        vol = E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t"))
+        vol = E.strike_vol(t_, o["K"], S, E.IV_HINT.get(t_) or E.pricing_vol(self.hist.get(t_) or [S], (self.hx.get(t_) or {}).get("t")))
         d, g, th, vg = E.bs_greeks(S, o["K"], T, vol, o["type"])
         q = self.pos[c]
         val = self.position_price(c)
@@ -15149,7 +15208,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             step = E.strike_step(S)
             K = round((S * (1 + otm / 100) if typ == "call" else S * (1 - otm / 100)) / step) * step
             exp = E.next_expiry(time.time(), dte)
-            vol = E.IV_HINT.get(c) or E.pricing_vol(self.hist.get(c) or [S], (self.hx.get(c) or {}).get("t"))
+            vol = E.strike_vol(c, K, S, E.IV_HINT.get(c) or E.pricing_vol(self.hist.get(c) or [S], (self.hx.get(c) or {}).get("t")))
             prem = E.bs_price(S, K, max(0, exp - time.time()) / E.YEAR, vol, typ) * E.CONTRACT
             n = int(a // prem) if prem > 0 else 0
             est.config(text=(f"{c} at {fmt_px(S)}: a {datetime.fromtimestamp(exp):%b %d} {K:g} {typ} costs about "
@@ -16395,9 +16454,13 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                         looked += 1
                         try:
                             d = E.fetch_ohlcv(new, E.candle_gran(self.session_bar), 2000, self.quote)
-                            real_vol = E.pricing_vol(d["c"], d.get("t")) if len(d.get("c") or []) > 60 else None
                         except Exception:
                             continue
+                        # a candidate whose download came back empty or short can't be lined up with the session
+                        # (on 11/11 and 11/12 one crashed the swap); it isn't swapped in on a guess either
+                        if min(len(d.get("c") or []), len(d.get("t") or [])) <= 60:
+                            continue
+                        real_vol = E.pricing_vol(d["c"], d.get("t"))
                         s_real, w_real = E.scout_score(by_coin[new], size, vol=real_vol)
                         if s_real >= 1.5 * max(s_old, 1e-9):
                             swaps.append((old, new, d, sc.get(old, (0, ""))[1], w_real))
@@ -16428,6 +16491,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             # Only as many bars as every one of its lists has: a download can come back with one list a bar short
             try:
                 n_ = min(len(d.get(k) or []) for k in ("c", "t"))
+                if n_ < 2 or not times:
+                    continue  # nothing to line up: keep the old ticker
                 col = {k: list(d.get(k) or [])[:n_] if len(d.get(k) or []) >= n_ else list(d.get("c") or [])[:n_]
                        for k in ("c", "h", "l")}
                 vol_ = list(d.get("v") or [])[:n_]
