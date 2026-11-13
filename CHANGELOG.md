@@ -10,6 +10,14 @@
 
 
 
+## 1.45.0
+- **The farm's trade lessons now reach bots already in it**, not only new eggs. Half the bots (by birth number) take
+  each lesson on once: wider safety stops, wider or no trailing stops, a minimum hold, buying further from expiry.
+  The other half keep their setting, so the farm keeps seeing both ways and a lesson that stops being true shows up.
+  Up to 10 bots change each time the farm evolves, and each change is in the news ("...widened its safety stop to
+  24% (the farm's trades: ...)"). On 11/13 bots with stops under 15% averaged -14.0% a trade and wider or none
+  +1.1%, but only new eggs were changing. Settings > Learning: "Trade lessons" and "Tune its own exits" both apply.
+
 ## 1.44.0
 From the 1:12 pm report:
 - **Safety stops start at 10%.** What a bot pays for a contract includes the bid/ask gap, often 3-5% of the price,

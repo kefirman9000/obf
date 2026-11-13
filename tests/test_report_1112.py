@@ -127,3 +127,21 @@ def test_farm_learns_wider_stops():
     t.rng.seed(2)
     stops = [t.lesson_risk({"sl": 10.0, "tp": 0.0})["sl"] for _ in range(100)]
     assert 10.0 in stops and any(x >= 15 for x in stops)
+
+
+def test_farm_lessons_reach_half_the_existing_bots():
+    from test_proving import farm, plain
+    t, _ = farm()
+    for _ in range(E.LESSON_MIN):
+        t.learn_lesson(dict(side="sell", why="its own safety stop (10%)", held=30, contract={"type": "call"}, sl=10), -12.0)
+        t.learn_lesson(dict(side="sell", why="its own profit target", held=30, contract={"type": "call"}, sl=30), 5.0)
+    t._adopt_budget = 10
+    even = plain(t)
+    odd = next(x for x in t.vars if x is not even and not E.is_scalp(x.name) and not E.is_kami(x))
+    even.uid, odd.uid = 4, 5
+    for b in (even, odd):
+        b.risk = E.clean_risk({"sl": 10.0})
+        b.traits = {"minhold": 3}
+    assert "safety stop" in (t.self_tune(even) or "") and even.risk["sl"] >= 15
+    assert t.self_tune(odd) is None and odd.risk["sl"] == 10.0  # the comparison side keeps its stop
+    assert t.self_tune(even) is None  # each lesson only once

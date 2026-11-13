@@ -3888,7 +3888,9 @@ class Tournament(FarmMixin):
         - its safety stop keeps firing within 3 candles of buying (6+ times, at a loss): it widens the stop by half
           (up to 60%),
         - its quick trades (held under 15 candles) lose while its longer ones do better: it starts holding at least
-          that long before its signals may sell.
+          that long before its signals may sell,
+        - otherwise it may take on one of the farm's trade lessons (stops, trails, hold, days to expiry): see
+          _adopt_lesson.
         Each change is written in the farm's news, and the bot's habit record starts over after a change, so it
         judges the new setting on its own trades. -> text of what changed, or None."""
         if is_scalp(v.name) or is_kami(v) or not self.o.get("self_tune", True):
@@ -3923,12 +3925,58 @@ class Tournament(FarmMixin):
             hb.pop("quick", None)
             hb.pop("long", None)
         if not did:
+            did = self._adopt_lesson(v, tr, hb)
+        if not did:
             return None
         v.traits = clean_traits(tr)
         v.habits = hb
         v.mut_kinds = list(getattr(v, "mut_kinds", None) or []) + ["self-tuned"]
         self.events.append(f"{v.label} {did}")
         return did
+
+    def _adopt_lesson(self, v, tr, hb):
+        """The farm's trade lessons reach bots already in it, not just new eggs: half the bots (by birth number) take
+        each lesson on once; the other half keep their setting, so the farm keeps seeing both ways and a lesson that
+        stops being true shows. On 11/13 bots with stops under 15% averaged -14.0% a trade, wider or none +1.1%, but
+        only new eggs were changing. Edits tr / v.risk in place. -> text of what changed, or None."""
+        if not self.o.get("lessons", True) or getattr(self, "_adopt_budget", 1) <= 0:
+            return None
+        lv = self.lesson_view()
+        seen = hb.setdefault("_les", [])
+        for k in ("stop", "trail", "minhold", "dte"):
+            if k not in lv or k in seen:
+                continue
+            floor, ev = lv[k]
+            if k == "stop":
+                applies = 0 < float(v.risk.get("sl", 0) or 0) < floor
+            elif k == "trail":
+                applies = 0 < float(tr.get("trail", 0) or 0) < floor
+            elif k == "minhold":
+                applies = not tr.get("minhold") and not tr.get("exit")
+            else:
+                applies = 0 < float(tr.get("odte", 0) or 0) < floor
+            if not applies:
+                continue
+            seen.append(k)
+            if int(getattr(v, "uid", 0) or 0) % 2:
+                continue  # this one keeps its setting: the other side of the comparison
+            self._adopt_budget = getattr(self, "_adopt_budget", 1) - 1
+            if k == "stop":
+                new_ = round(self.rng.uniform(floor, 40.0), 2)
+                v.risk = clean_risk(dict(v.risk, sl=new_))
+                return f"widened its safety stop to {new_:g}% (the farm's trades: {ev})"
+            if k == "trail":
+                if self.rng.random() < 0.5:
+                    tr.pop("trail")
+                    return f"dropped its trailing stop (the farm's trades: {ev})"
+                tr["trail"] = self.rng.uniform(floor, 30.0)
+                return f"widened its trailing stop to {tr['trail']:.0f}% (the farm's trades: {ev})"
+            if k == "minhold":
+                tr["minhold"] = max(2, -(-int(floor) // max(1, v.tf)))
+                return f"now holds at least {tr['minhold']} decisions (the farm's trades: {ev})"
+            tr["odte"] = self.rng.randint(int(floor), 21)
+            return f"now buys contracts about {tr['odte']} days from expiry (the farm's trades: {ev})"
+        return None
 
     def note_habit(self, v, t, pc):
         """Files one of the bot's own finished trades for self_tune: how it was sold and how long it was held.
@@ -5026,6 +5074,7 @@ class Tournament(FarmMixin):
         if self.drop_twins():
             self._rate()
         self.instinct_tick()
+        self._adopt_budget = ADOPT_PER_EVOLVE
         for v in list(self.vars):  # bots tune their own exits from their own trades
             try:
                 self.self_tune(v)
@@ -5924,6 +5973,7 @@ def _mine_run(g, closes, extra, a, z, cuts, start_cash, fee, pct, slip):
 
 
 TYPICAL_FLOOR = -15.0  # a bot whose typical (median) trade loses more than this % can't be proven or a legend
+ADOPT_PER_EVOLVE = 10  # bots that may take on a farm lesson each time the farm evolves (keeps the news readable)
 SELF_TUNE_MIN = 6     # a bot's own trades each side of a comparison before it changes its own habits
 SELF_TUNE_GAP = 5.0   # ...and how much better (points of average gain per trade) the other way must be
 LESSON_MIN = 40       # trades each side of a comparison needs before the farm draws a trade lesson from it
