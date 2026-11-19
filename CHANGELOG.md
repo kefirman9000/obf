@@ -10,6 +10,26 @@
 
 
 
+## 1.46.0
+From the 11/19 report:
+- **Implied volatility is kept past a weekend.** After a restart OBF only reused the market's implied volatility if
+  it was under 20 hours old, so a weekend restart started Monday on measured volatility until the first quote came in.
+  It's kept for 4 days now (past a long weekend). A contract a bot bought at implied volatility is also judged at that
+  volatility while the market's isn't known, so its time-decay and volatility-collapse exits don't fire on the switch
+  alone: on 11/16 at 9:30 an INTC call bought at 0.80 read 0.57, a 29% "collapse", and 61 bot sales went out at the
+  open priced that way. (Most of their losses were real: the stocks fell over the weekend.)
+- **Opening calm.** For 5 minutes after the 9:30 open, safety stops (the bots' and the account's) wait unless the loss
+  is deep (twice the stop, at most 60%), and time-decay and volatility exits wait, like profit targets and trailing
+  stops already did. Sales in the first 5 minutes had a median of -35%, the rest of the day -5%: they sold into the
+  overnight gap at the day's widest bid/ask gaps. Settings > Basics: "Opening calm" (minutes, 0 = off).
+- **Ticker rotation leaves out tickers the bots can't afford.** A ticker whose typical contract costs over 2.5x the
+  bots' trade size (where a bot can't buy even one near the money) is picked only as a last resort. On 11/19 NVDA,
+  SOXL and INTC contracts cost $296-708 on $100 trades, so the bots bought far-out ones.
+- **Farthest out of the money: 10% (was 15%).** Bot sales 12%+ out of the money had a median of -8% and won 25%
+  (475 trades); 3-7% out, +0.2% and 50%. Settings still at 15% move to 10% once; 0 (no limit) is kept.
+- **The far-out lesson reaches bots already in the farm**, like the stop, trailing-stop, hold and expiry lessons
+  in 1.45: half the bots (by birth number) take on the farm's farthest-out limit once.
+
 ## 1.45.0
 - **The farm's trade lessons now reach bots already in it**, not only new eggs. Half the bots (by birth number) take
   each lesson on once: wider safety stops, wider or no trailing stops, a minimum hold, buying further from expiry.

@@ -6,7 +6,7 @@ from test_proving import farm, plain
 
 def test_old_settings_move_to_the_new_defaults_once():
     s = E.merge_settings({"adapt_exits": True, "scalp_share": 25, "scalp_spread": 8.0})
-    assert s["adapt_exits"] is False and s["scalp_share"] == 10 and s["scalp_spread"] == 3.0 and s["defaults_rev"] == 2
+    assert s["adapt_exits"] is False and s["scalp_share"] == 10 and s["scalp_spread"] == 3.0 and s["defaults_rev"] == E.DEFAULT_SETTINGS["defaults_rev"]
     s2 = E.merge_settings(dict(s, adapt_exits=True, scalp_share=30))  # chosen after the move: kept
     assert s2["adapt_exits"] is True and s2["scalp_share"] == 30
     assert E.merge_settings({"scalp_share": 5})["scalp_share"] == 5

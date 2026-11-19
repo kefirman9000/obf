@@ -1561,6 +1561,22 @@ def opening_rush(ts, within=OPEN_SETTLE_MIN):
     return 0 <= m < within
 
 
+OPEN_CALM = [5]  # minutes after the open when safety stops (short of a deep loss) and time-decay/volatility exits wait
+
+
+def deep_stop(sl):
+    """The loss (%) that still sells during the opening calm, for a safety stop of sl%: twice the stop, at most 60%
+    (and never less than the stop itself)."""
+    return max(sl, min(2 * sl, 60.0))
+
+
+def opening_calm(ts):
+    """True while the opening calm lasts (Settings: 'open_calm' minutes after the 9:30 open; 0 = off). In the
+    11/19 report, sales in the first 5 minutes had a median of -35% (-5% the rest of the day): the bots and the
+    account sold into the overnight gap at the day's widest bid/ask gaps."""
+    return OPEN_CALM[0] > 0 and opening_rush(ts, OPEN_CALM[0])
+
+
 def open_spread_mult(ts):
     """How much wider option bid/ask gaps run right after the open than later in the day (estimated prices only)."""
     m = 390 - minutes_to_close(ts)
@@ -1668,7 +1684,8 @@ DEFAULT_SETTINGS = {
     "miner_minutes": 10.0,       # ...and spends at most this long on one stretch
     "legends": True,             # proven bots are kept in the Legends hall when they leave; new eggs learn from them
     "legend_share": 10,          # ...% of new eggs hatched from Legends
-    "max_otm": 15.0,             # farthest out of the money any bot or the account buys (%); bots learn their own limit under it
+    "max_otm": 10.0,             # farthest out of the money any bot or the account buys (%); bots learn their own limit under it
+    "open_calm": 5,              # minutes after the open when stops wait unless the loss is deep (0 = off)
     "trade_lessons": True,       # the farm learns from its own closed trades (calls vs puts, how far out, how it sold, how
                                  # long it held) and new eggs lean toward what worked
     "exam_bots": 6,              # bots tested in each background exam round (it also runs while Free roam is on)
@@ -1715,7 +1732,7 @@ STYLES = {  # risk presets: trade size, stop / target on the premium, daily limi
 }
 
 
-DEFAULT_SETTINGS["defaults_rev"] = 2  # bumped when a default changes on purpose for everyone (see merge_settings)
+DEFAULT_SETTINGS["defaults_rev"] = 3  # bumped when a default changes on purpose for everyone (see merge_settings)
 DEFAULT_SETTINGS["scalp_real_exams"] = 2  # scalpers trade the account only after this many winning exam days at real option prices
 DEFAULT_SETTINGS.update(LIMIT_DEFAULTS)  # account-wide safety limits (farmcore)
 
@@ -1735,6 +1752,11 @@ def merge_settings(saved):
         s["adapt_exits"] = False
         s["scalp_share"] = min(_numor(s.get("scalp_share"), 10), 10)
         s["scalp_spread"] = min(_numor(s.get("scalp_spread"), 3.0), 3.0)
+    if saved and int(saved.get("defaults_rev", 1) or 1) < 3:
+        # 1.46: in the 11/19 report contracts 12%+ out of the money had a median of -8% and won 25% (1,503 trades);
+        # 3-7% out: +0.2% and 50%. 0 (no limit) is kept: that was asked for on purpose
+        m_ = _numor(s.get("max_otm"), 10.0)
+        s["max_otm"] = min(m_, 10.0) if m_ > 0 else m_
     s["defaults_rev"] = DEFAULT_SETTINGS["defaults_rev"]
     s["size_mult"] = dict(s.get("size_mult") or {})
     s["extra_coins"] = [c for c in (s.get("extra_coins") or []) if isinstance(c, str) and valid_coin(c)]
@@ -1823,6 +1845,9 @@ CONTRACT = 100            # shares per option contract
 RATE = 0.04               # risk-free rate used for pricing
 YEAR = 365.0 * 86400
 IV_HINT = {}              # underlying -> implied volatility from the live option chain (used when known)
+IV_KEEP_S = 4 * 86400     # how long a saved implied volatility still prices contracts after a restart: past a long
+#                           weekend (Friday's close to Tuesday's open is 89.5 hours). It was 20 hours, so a restart over
+#                           the weekend priced Monday's open with measured volatility until the first quote came in
 _VOL_CACHE = {}
 SKEW_FIT = {}             # underlying -> [down, up, when]: the volatility smile measured on the live option chain
 SKEW_DEFAULT = (2.5, 0.8)  # a typical stock's smile, until its own chain is read
@@ -2062,7 +2087,7 @@ def sessions_left(exp, now=None):
 
 
 PREM_RANGE = [0.0, 0.0]  # contract price range bots may buy, $ per share; 0 = no limit on that side
-MAX_OTM = [15.0]         # farthest out of the money any bot (or the account) buys, %; 0 = no limit. Kamikazes ignore it
+MAX_OTM = [10.0]         # farthest out of the money any bot (or the account) buys, %; 0 = no limit. Kamikazes ignore it
 
 
 def set_prem_range(lo, hi):
@@ -2079,7 +2104,7 @@ def set_max_otm(x):
     try:
         MAX_OTM[0] = max(0.0, float(x or 0))
     except (TypeError, ValueError):
-        MAX_OTM[0] = 15.0
+        MAX_OTM[0] = 10.0
     return MAX_OTM[0]
 
 
@@ -2162,6 +2187,12 @@ class OptionSim(Sim):
         iv = IV_HINT.get(c)
         if iv:
             return iv
+        o = self.opt.get(c) if self.pos.get(c, 0) > 0 else None
+        if o and o.get("iv") and o.get("vol"):
+            # held, and bought at the market's implied volatility, which isn't known right now (after a restart, say):
+            # keep judging it at that volatility. Measured volatility runs lower, so its time-decay and volatility-
+            # collapse exits would fire on the switch alone (11/16: an INTC call bought at 0.80 read 0.57, a "collapse")
+            return o["vol"]
         return self.vol_src.get(c, 0.35)
 
     def mark(self, c, S):
@@ -2228,6 +2259,8 @@ class OptionSim(Sim):
             self.opt[c].update(K=real["K"], exp=real["exp"], symbol=real["symbol"])
             K, step = real["K"], strike_step(S)
         self.opt[c]["vol"] = round(self._vol(c), 4)  # priced with this: kept for when the market's own vol isn't known
+        if IV_HINT.get(c):
+            self.opt[c]["iv"] = True  # ...and it was the market's implied volatility (see _vol)
         prem = self.mark_one(c, S)
         if (PREM_RANGE[0] or PREM_RANGE[1]) and not prem_ok(prem / CONTRACT):
             # outside the price range: walk the strike (further out of the money = cheaper, closer in = dearer)
@@ -2392,7 +2425,11 @@ def tournament_opts(settings):
     global MIN_DTE
     fee, slip = cost_model(settings)
     set_prem_range(settings.get("prem_min", 0), settings.get("prem_max", 0))
-    set_max_otm(settings.get("max_otm", 15))
+    set_max_otm(settings.get("max_otm", 10))
+    try:
+        OPEN_CALM[0] = max(0, min(30, int(settings.get("open_calm", 5))))
+    except (TypeError, ValueError):
+        OPEN_CALM[0] = 5
     try:
         MIN_DTE = max(0, min(60, int(settings.get("min_dte", 7))))
     except (TypeError, ValueError):
@@ -3000,9 +3037,10 @@ def bot_step(v, closes, n, coins, extra=None):
                 reg_ = vol_regime(closes, extra, c)[0]
                 k_ *= tr["vixwide"] if reg_ == "spiking" else (1 + tr["vixwide"]) / 2 if reg_ == "rising" else 1.0
             settle = opt and opening_rush(sim.now)  # (the first prints of the day: no taking profits on them)
+            calm = opt and opening_calm(sim.now)  # (and only a deep loss sells on them)
             if why is not None:
                 pass
-            elif v.risk["sl"] and r <= -v.risk["sl"] * k_:
+            elif v.risk["sl"] and r <= -v.risk["sl"] * k_ and (not calm or r <= -deep_stop(v.risk["sl"] * k_)):
                 why = "stop"
             elif v.risk["tp"] and r >= v.risk["tp"] * k_ and not settle:
                 why = "target"
@@ -3010,7 +3048,7 @@ def bot_step(v, closes, n, coins, extra=None):
                 why = "trail"
             elif tr.get("maxhold") and n - v.since.get(c, n) >= tr["maxhold"] * v.tf:
                 why = "time"
-            elif opt and (tr.get("decay") or tr.get("ivdrop")):
+            elif opt and (tr.get("decay") or tr.get("ivdrop")) and not calm:
                 why = option_exit(sim, c, last[c], tr)
             if why:
                 sim.sell(c, last[c], n)
@@ -3943,11 +3981,13 @@ class Tournament(FarmMixin):
             return None
         lv = self.lesson_view()
         seen = hb.setdefault("_les", [])
-        for k in ("stop", "trail", "minhold", "dte"):
+        for k in ("stop", "trail", "minhold", "dte", "maxotm"):
             if k not in lv or k in seen:
                 continue
             floor, ev = lv[k]
-            if k == "stop":
+            if k == "maxotm":  # (11/19: 12%+ out of the money median -8%, 3-7% out +0.2%; only new eggs were learning it)
+                applies = float(tr.get("maxotm", 0) or 0) <= 0 or float(tr["maxotm"]) > floor * 1.2
+            elif k == "stop":
                 applies = 0 < float(v.risk.get("sl", 0) or 0) < floor
             elif k == "trail":
                 applies = 0 < float(tr.get("trail", 0) or 0) < floor
@@ -3971,6 +4011,9 @@ class Tournament(FarmMixin):
                     return f"dropped its trailing stop (the farm's trades: {ev})"
                 tr["trail"] = self.rng.uniform(floor, 30.0)
                 return f"widened its trailing stop to {tr['trail']:.0f}% (the farm's trades: {ev})"
+            if k == "maxotm":
+                tr["maxotm"] = floor * self.rng.uniform(0.8, 1.2)
+                return f"now buys within {tr['maxotm']:.0f}% of the money (the farm's trades: {ev})"
             if k == "minhold":
                 tr["minhold"] = max(2, -(-int(floor) // max(1, v.tf)))
                 return f"now holds at least {tr['minhold']} decisions (the farm's trades: {ev})"
@@ -6663,6 +6706,11 @@ def scout_score(d, trade_size=None, vol=None):
     K = round(S * 1.02 / strike_step(S)) * strike_step(S)
     cost = bs_price(S, K, 14 / 365, strike_vol(c, K, S, vol), "call") * CONTRACT
     afford = 1.0 if not trade_size or cost <= trade_size else max(0.15, trade_size / cost)
+    if trade_size and cost > 2.5 * trade_size:
+        # out of reach: a bot buys one contract only up to 2.5x its trade size, so here it can only buy far-out ones
+        # (11/19: NVDA $595, SOXL $708 and INTC $296 a contract on $100 trades, and the bots' far-out contracts, 12%+
+        # out of the money, had a median of -8% and won 25%, vs +0.2% and 50% for 3-7% out). Picked only as a last resort
+        afford = 0.01
     hs = half_spread(c, cost / CONTRACT) if cost > 0 else 0.5
     tight = max(0.3, 1 - 2 * hs)
     why = (f"moved {chg:.1f}% today, a contract is about ${cost:,.0f}"

@@ -157,7 +157,10 @@ SETTING_GROUPS = [
         ("prem_max", "Most expensive contract the bots may buy, in $ per share. Example: 3.00 = nothing over $300 a "
                      "contract (0 = no limit). Applies to practice, backtests, every farm and LIVE", float),
         ("max_otm", "Farthest out of the money any bot (or the account) buys, % of the stock price. Far-out contracts lost "
-                    "most often; each bot also learns its own, tighter limit. Kamikazes are exempt. Example: 15 (0 = no limit)", float),
+                    "most often; each bot also learns its own, tighter limit. Kamikazes are exempt. Example: 10 (0 = no limit)", float),
+        ("open_calm", "Opening calm: minutes after the 9:30 open when safety stops (bots' and the account's) wait "
+                      "unless the loss is deep (twice the stop, at most 60%), and time-decay and volatility exits wait. "
+                      "Bid/ask gaps are widest then and the first prints can be far off. Example: 5 (0 = off)", int),
         ("bot_allowance", "Allowance per bot: the most of your starting money that one bot's buy votes may have tied up "
                           "at once. Stops one bad dragon draining the account. Example: 25 with $1,000 = $250 per bot (0 = no limit)", float),
     ]),
@@ -823,7 +826,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         self.cfg = E.load_json(CONFIG_PATH, {})
         for c_, x_ in (self.cfg.get("iv_hint") or {}).items():  # the market's implied volatility, kept through a restart
             try:
-                if time.time() - float(x_[1]) < 20 * 3600 and float(x_[0]) > 0:
+                if time.time() - float(x_[1]) < E.IV_KEEP_S and float(x_[0]) > 0:
                     E.IV_HINT[c_] = float(x_[0])
             except (TypeError, ValueError, IndexError):
                 pass
@@ -5857,7 +5860,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         if iv > 0:
             book = dict(self.cfg.get("iv_hint") or {})
             book[c] = [round(iv, 5), time.time()]
-            self.cfg["iv_hint"] = {k: x for k, x in book.items() if time.time() - float(x[1]) < 3 * 86400}
+            self.cfg["iv_hint"] = {k: x for k, x in book.items() if time.time() - float(x[1]) < E.IV_KEEP_S}
             if time.time() - getattr(self, "_iv_saved", 0) > 300:
                 self._iv_saved = time.time()
                 try:
@@ -9849,7 +9852,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         return dict(min_sessions=max(1, int(self.settings.get("expiry_days", 2) or 2)),
                     max_spread_pct=float(self.settings.get("max_spread_pct", 0) or 0),
                     min_oi=int(self.settings.get("min_oi", 0) or 0),
-                    max_otm=float(self.settings.get("max_otm", 15) or 0))
+                    max_otm=float(self.settings.get("max_otm", 10) or 0))
 
     def expiry_guard(self):
         """Runs every minute while OBF is open, bot running or not: sells contracts inside the expiry window during
@@ -10822,7 +10825,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 elif trail > 0 and bid_val is not None and bid_val <= self.high[c] * (1 - trail):
                     self.sell(c, self.last.get(tick_of(c), 0), "trailing-stop")
                 continue
-            if stop > 0 and r <= -stop:
+            if stop > 0 and r <= -stop and (not E.opening_calm(time.time()) or r <= -E.deep_stop(stop * 100) / 100):
                 self.sell(c, self.last.get(tick_of(c), 0), "stop-loss")
             elif take > 0 and rg is not None and rg >= take:
                 self.sell(c, self.last.get(tick_of(c), 0), "take-profit")
