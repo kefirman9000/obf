@@ -10,6 +10,31 @@
 
 
 
+## 1.47.0
+New ways for the bots to learn, from the 11/19 report (1,503 bot trades won 33%, median -5.7%; every strategy's median
+was negative; 111 of 175 bots couldn't be judged yet; the miner and hindsight found nothing):
+- **Signal school.** A bot only learned from its own trades (a handful a week), in option P/L, where the bid/ask gap,
+  time decay and volatility hide whether its signal was right. Now every buy and sell signal the farm's kinds of bot
+  give is graded on what the stock did next (15, 60 and 240 minutes later), pooled by strategy, pace and side, and in
+  the stock's own usual move over that time ("swings", so NVDA and SOXL count alike). It grades the session's own
+  candles every 30 minutes (only new ones) and each fresh Free roam stretch, and keeps its book in learning-book.json.
+- **The cost to beat.** Before a bot opens a contract, the school checks its kind of signal against the move the
+  contract needs to pay back its bid/ask gap and decay over the bot's usual hold (a far-out contract needs a far bigger
+  move). Half the bots (by birth number) skip a signal when even an optimistic read of it (its average plus one
+  standard error) falls short; signals with under 30 graded don't block anything. The other half trade as before, so
+  the farm sees which way does better.
+- **The trade judge.** One model learns from every finished trade on the farm: call or put, how far out of the money,
+  days to expiry, time of day, strategy, pace, the volatility conditions and the signal's school grade. Each trade is
+  scored before it's learned from, so its skill (vs guessing the farm's win rate) is measured on trades it hadn't seen.
+  Once it has 300 trades and beats guessing, half the bots (a different half) skip trades it gives under 60% of the
+  farm's usual chance of winning.
+- **Blocked buys graded at what a contract costs.** Options bots graded a skipped buy against a stock's round trip
+  (about 0.2%), so a never-rule that blocked a call before a 0.1% rise "cost" money though the call would have lost.
+  They're now graded against the move the contract needed. The school's and judge's blocks are graded the same way.
+- Learning > **Signal school** shows each kind of signal's grade, what a contract needs on each ticker, and what the
+  judge has learned; the detailed report has both. Settings > Wildcard: "Signal school" and "Trade judge" (on); Free
+  roam's feature tests check each.
+
 ## 1.46.0
 From the 11/19 report:
 - **Implied volatility is kept past a weekend.** After a restart OBF only reused the market's implied volatility if

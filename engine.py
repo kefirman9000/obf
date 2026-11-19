@@ -1686,6 +1686,8 @@ DEFAULT_SETTINGS = {
     "legend_share": 10,          # ...% of new eggs hatched from Legends
     "max_otm": 10.0,             # farthest out of the money any bot or the account buys (%); bots learn their own limit under it
     "open_calm": 5,              # minutes after the open when stops wait unless the loss is deep (0 = off)
+    "signal_school": True,       # bots skip signals whose graded move can't pay for the contract (half the farm)
+    "trade_judge": True,         # one model learns from every finished trade and blocks likely losers (half the farm)
     "trade_lessons": True,       # the farm learns from its own closed trades (calls vs puts, how far out, how it sold, how
                                  # long it held) and new eggs lean toward what worked
     "exam_bots": 6,              # bots tested in each background exam round (it also runs while Free roam is on)
@@ -2469,7 +2471,14 @@ def tournament_opts(settings):
                 proven_trades=int(settings.get("proven_trades", 8) or 0),
                 standin_n=int(settings.get("standin_n", 3) or 0), standin_size=float(settings.get("standin_size", 0.5) or 0.5),
                 proven_kamikazes=bool(settings.get("proven_kamikazes", False)),
-                prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0], sspread=_set_scalp_spread(settings))
+                prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0], sspread=_set_scalp_spread(settings),
+                school=_set_gate("school", settings.get("signal_school", True)),
+                judge=_set_gate("judge", settings.get("trade_judge", True)))
+
+
+def _set_gate(k, on):
+    GATES[k] = bool(on)
+    return GATES[k]
 
 
 def real_exam_wins(v):
@@ -2775,6 +2784,360 @@ def luck_factor(v):
     return n / (n + k) if n else 0.0
 
 
+# ---------------- Signal school: every signal graded on the stock, and what it must beat ----------------
+# A bot learns from its own trades, a handful a week, and in option P/L, where the spread, time decay and volatility
+# hide whether the signal itself was right. The school grades every buy and sell signal the farm's kinds of bot give,
+# on every candle, by what the stock then did over the next 15, 60 and 240 minutes, pooled by strategy, pace and side.
+# Moves are measured in the stock's own swing over that time (so NVDA and SOXL can be pooled), and the cost-to-beat
+# gate checks a signal's typical move against the move its contract needs to pay back its bid/ask gap and decay.
+SCHOOL_HORIZONS = (15, 60, 240)  # minutes ahead each signal is graded at
+SCHOOL_MIN = 30                  # graded signals before a grade is used
+SCHOOL_FADE = 4000               # past this many, a grade's counts halve (recent signals count most)
+SCHOOL_SWING_BARS = 120          # candles behind each signal its ticker's usual swing is measured over
+SCHOOL = {}                      # "strategy|pace|side" -> {"h15": [n, sum z, sum z^2, hits], "o:h15": ..., ...}
+SCHOOL_SEEN = {}                 # ticker -> time of the newest candle whose signals have been graded (live runs)
+GATES = {"school": True, "judge": True}  # Settings > Learning: "Signal school" and "Trade judge"
+
+
+def pace_bucket(tf):
+    f_ = int(tf or 1)
+    return "1-2" if f_ <= 2 else "3-5" if f_ <= 5 else "10-15" if f_ <= 15 else "30+"
+
+
+def school_key(name, tf, side):
+    return f"{name}|{pace_bucket(tf)}|{'b' if side == 'buy' else 's'}"
+
+
+def tod_bucket(ts):
+    """'o' in the first hour after the open, 'l' in the last two hours, 'm' between (New York)."""
+    if not ts:
+        return "m"
+    left = minutes_to_close(ts)
+    return "o" if left > 330 else "l" if left <= 120 else "m"
+
+
+def bar_minutes_of(x):
+    """Candle length in minutes from a ticker's extra data (its bar times), 1 when unknown."""
+    t_ = (x or {}).get("t")
+    try:
+        k = len(t_)
+        if k >= 3:
+            gaps = sorted(t_[i] - t_[i - 1] for i in range(max(1, k - 10), k) if t_[i] > t_[i - 1])
+            if gaps:
+                return max(1.0, gaps[len(gaps) // 2] / 60)
+    except (TypeError, IndexError):
+        pass
+    return 1.0
+
+
+def swing_pct(p, bars, n=SCHOOL_SWING_BARS):
+    """The stock's usual move (%) over `bars` candles: its average candle-to-candle move over the last n candles,
+    scaled by the square root of time."""
+    k = len(p)
+    if k < 3:
+        return 0.0
+    m = min(n, k - 1)
+    tot = 0.0
+    for i in range(k - m, k):
+        a = p[i - 1]
+        if a:
+            tot += abs(p[i] / a - 1)
+    return tot / m * max(1.0, bars) ** 0.5 * 100
+
+
+def _school_add(book, key, h, z, mv):
+    s_ = book.setdefault(key, {}).setdefault(h, [0.0, 0.0, 0.0, 0.0])
+    s_[0] += 1
+    s_[1] += z
+    s_[2] += z * z
+    s_[3] += 1 if mv > 0 else 0
+
+
+def merge_school(part):
+    """Adds a study's grades into the shared book (older counts fade once a grade passes SCHOOL_FADE)."""
+    for key, hs in (part or {}).items():
+        dst = SCHOOL.setdefault(key, {})
+        for h, x in hs.items():
+            s_ = dst.setdefault(h, [0.0, 0.0, 0.0, 0.0])
+            if s_[0] + x[0] > SCHOOL_FADE:
+                s_[:] = [y / 2 for y in s_]
+            for i in range(4):
+                s_[i] += x[i]
+
+
+def school_grade(key, h, tod=None):
+    """-> (signals graded, average move in swings, its standard error, share that moved the right way) for one kind
+    of signal at one horizon; the time-of-day grade when it has enough signals, else all of them. None when unknown."""
+    hs = SCHOOL.get(key) or {}
+    for k in ((f"{tod}:h{h}", f"h{h}") if tod else (f"h{h}",)):
+        s_ = hs.get(k)
+        if s_ and s_[0] >= SCHOOL_MIN:
+            n_ = s_[0]
+            mean = s_[1] / n_
+            var = max(0.0, s_[2] / n_ - mean * mean)
+            return n_, mean, (var / n_) ** 0.5, s_[3] / n_
+    return None
+
+
+def school_study(closes, extra, genes, since=None, stop=None, progress=None):
+    """Grades every signal the given kinds of bot [(strategy, params, pace)] give on this history: what the stock did
+    over the next 15, 60 and 240 minutes, in its own swings. Only candles after since[ticker] (bar times) are graded,
+    and only ones with all the horizons ahead of them. -> dict(book={key: grades}, until={ticker: newest bar time
+    graded}, signals=count)."""
+    book, until, count = {}, {}, 0
+    seen_g = set()
+    gl = []
+    for name, params, tf in genes:
+        if name not in STRATS or name == "Dollar-cost averaging":
+            continue
+        sig_ = (name, json.dumps(params, sort_keys=True), int(tf or 1))
+        if sig_ not in seen_g:
+            seen_g.add(sig_)
+            gl.append((name, dict(params), max(1, int(tf or 1))))
+    coins = list(closes)
+    total = max(1, len(coins) * len(gl))
+    done = 0
+    for c in coins:
+        P = closes[c]
+        x = (extra or {}).get(c) or {}
+        times = x.get("t")
+        bm = bar_minutes_of(x)
+        hb = {h: max(1, int(round(h / bm))) for h in SCHOOL_HORIZONS}
+        far = max(hb.values())
+        L = len(P)
+        last = L - 1 - far  # the newest candle with every horizon ahead of it
+        if last <= SCHOOL_SWING_BARS:
+            done += len(gl)
+            continue
+        cum = [0.0] * L  # running total of candle-to-candle moves, for each candle's usual swing
+        for i in range(1, L):
+            a = P[i - 1]
+            cum[i] = cum[i - 1] + (abs(P[i] / a - 1) if a else 0.0)
+        lo = (since or {}).get(c)
+        start = max(WARM, SCHOOL_SWING_BARS + 1, LOOKBACK // 2)
+        if lo is not None and times:
+            while start <= last and times[start] <= lo:
+                start += 1
+        for name, params, tf in gl:
+            if stop and stop():
+                raise TrainingStopped()
+            hlv = STRATS[name].get("hlv")
+            for i in range(start, last + 1):
+                n = i + 1
+                if n % tf:
+                    continue
+                xi = {k: View(v_, n) for k, v_ in x.items()} if hlv and x else None
+                sig = strat_signal(name, View(P, n), n, params, tf, xi)
+                if sig not in ("buy", "sell"):
+                    continue
+                count += 1
+                base = (cum[i] - cum[i - SCHOOL_SWING_BARS]) / SCHOOL_SWING_BARS
+                if base <= 0 or not P[i]:
+                    continue
+                sign = 1 if sig == "buy" else -1
+                key = school_key(name, tf, sig)
+                tod = tod_bucket(times[i]) if times and i < len(times) else "m"
+                for h in SCHOOL_HORIZONS:
+                    mv = (P[i + hb[h]] / P[i] - 1) * 100 * sign
+                    z = max(-6.0, min(6.0, mv / (base * hb[h] ** 0.5 * 100)))
+                    _school_add(book, key, f"h{h}", z, mv)
+                    _school_add(book, key, f"{tod}:h{h}", z, mv)
+            done += 1
+            if progress:
+                progress(done, total)
+        if times and last < len(times):
+            until[c] = times[last]
+    return dict(book=book, until=until, signals=count)
+
+
+def breakeven_move(c, S, typ, otm_pct, dte_days, vol, hold_min):
+    """How far (%) the stock must move the right way within hold_min minutes for a contract otm_pct out of the money
+    and dte_days from expiry to pay back its bid/ask gap (bought at the ask, sold at the bid) and its time decay.
+    None when it can't be priced. Far-out contracts need far bigger moves: that's what they cost."""
+    if not S or S <= 0 or not vol or vol <= 0:
+        return None
+    step = strike_step(S)
+    otm = float(otm_pct or 0) / 100
+    K = round((S * (1 + otm) if typ == "call" else S * (1 - otm)) / step) * step
+    T0 = max(1, float(dte_days or 14)) / 365.0
+    T1 = max(0.0, T0 - hold_min / (60 * 24 * 365.0))
+    sv = strike_vol(c, K, S, vol)
+    p0 = bs_price(S, K, T0, sv, typ)
+    if p0 <= 0.005:
+        return None
+    hs = half_spread(c, p0)
+    if hs >= 0.45:
+        return None
+    need = p0 * (1 + hs) / (1 - hs)
+    sign = 1 if typ == "call" else -1
+    if bs_price(S, K, T1, sv, typ) >= need:
+        return 0.0
+    lo, hi = 0.0, 0.5
+    if bs_price(S * (1 + sign * hi), K, T1, sv, typ) < need:
+        return hi * 100
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        if bs_price(S * (1 + sign * mid), K, T1, sv, typ) >= need:
+            hi = mid
+        else:
+            lo = mid
+    return hi * 100
+
+
+def hold_minutes(v, bm=1.0):
+    """The minutes a bot usually keeps a contract, for grading its signals: its time limit when it has one, else an
+    hour; snapped to the nearest graded horizon."""
+    mh = (v.traits or {}).get("maxhold")
+    mins = float(mh) * max(1, v.tf) * bm if mh else 60.0
+    return min(SCHOOL_HORIZONS, key=lambda h: abs(h - mins))
+
+
+def school_check(v, c, s, closes, extra, sim):
+    """The cost-to-beat gate for a bot about to open a contract on signal s. -> (blocked, edge in swings or None).
+    Blocked when even an optimistic read of this kind of signal (its average move plus one standard error) is
+    smaller than the move the contract needs to pay for itself. Few graded signals: never blocked."""
+    x = (extra or {}).get(c) or {}
+    bm = bar_minutes_of(x)
+    h = hold_minutes(v, bm)
+    g = school_grade(school_key(v.name, v.tf, s), h, tod_bucket(getattr(sim, "now", None)))
+    if g is None:
+        return False, None
+    n_, mean, se, hit = g
+    if not GATES.get("school", True) or (int(getattr(v, "uid", 0) or 0) // 2) % 2:
+        return False, mean  # (half the bots, by birth number, keep trading without the gate: the comparison)
+    P = closes[c]
+    S = P[-1]
+    sw = swing_pct(P, h / bm)
+    typ = "call" if s == "buy" else "put"
+    g_ = v.traits or {}
+    be = breakeven_move(c, S, typ, g_.get("otm", 0), dte_for(g_), sim._vol(c) if hasattr(sim, "_vol") else 0.35, h)
+    if be is None or sw <= 0:
+        return False, mean
+    return (mean + se) * sw < be, mean
+
+
+GATE_NAMES = {"school": "Signal school (cost to beat)", "judge": "Trade judge"}
+
+
+# ---- the trade judge: one model learning from every finished trade in the farm ----
+JUDGE = {"w": {}, "n": 0, "wins": 0.0, "brier": [0.0, 0.0, 0.0]}  # weights, trades, wins, [scored, model, base rate]
+JUDGE_MIN = 300      # finished trades before the judge may block anything
+JUDGE_LR = 0.03
+JUDGE_L2 = 0.0005
+
+
+def judge_features(typ, otm, dte, ts, strat, tf, reg, edge):
+    """What the judge looks at for one trade, all known before buying: call or put, how far out of the money, days
+    to expiry, time of day, strategy, pace, the volatility conditions, and the school's grade for its signal."""
+    f = {"bias": 1.0, "side:" + str(typ): 1.0, "strat:" + str(strat): 1.0, "pace:" + pace_bucket(tf): 1.0,
+         "reg:" + str(reg or "unknown"): 1.0}
+    d = float(otm or 0)
+    f["otm:" + ("0-3" if d < 3 else "3-7" if d < 7 else "7-12" if d < 12 else "12+")] = 1.0
+    t_ = float(dte or 14)
+    f["dte:" + ("0-3" if t_ <= 3 else "4-10" if t_ <= 10 else "11+")] = 1.0
+    f["tod:" + tod_bucket(ts)] = 1.0
+    if edge is not None:
+        f["edge"] = max(-2.0, min(2.0, float(edge) * 5))
+    return f
+
+
+def judge_prob(f):
+    z = sum(JUDGE["w"].get(k, 0.0) * x for k, x in f.items())
+    z = max(-30.0, min(30.0, z))
+    return 1 / (1 + math.exp(-z))
+
+
+def judge_learn(f, won):
+    """One finished trade: scored first (its prediction against the farm's base rate, so the judge's skill is measured
+    on trades it hadn't learned from), then learned from."""
+    y = 1.0 if won else 0.0
+    p = judge_prob(f)
+    base = (JUDGE["wins"] + 1) / (JUDGE["n"] + 2)
+    b = JUDGE["brier"]
+    if b[0] >= 600:
+        b[:] = [x / 2 for x in b]
+    b[0] += 1
+    b[1] += (p - y) ** 2
+    b[2] += (base - y) ** 2
+    err = y - p
+    w = JUDGE["w"]
+    for k, x in f.items():
+        w[k] = w.get(k, 0.0) + JUDGE_LR * (err * x - JUDGE_L2 * w.get(k, 0.0))
+    JUDGE["n"] += 1
+    JUDGE["wins"] += y
+
+
+def judge_skill():
+    """How much better the judge's predictions are than always guessing the farm's win rate (1 - its Brier score /
+    the base rate's, on trades it hadn't seen yet): above 0 means it knows something. None until it has scored 100."""
+    b = JUDGE["brier"]
+    if b[0] < 100 or b[2] <= 0:
+        return None
+    return 1 - b[1] / b[2]
+
+
+def judge_check(v, c, s, sim, reg, edge):
+    """The trade judge's say on a bot about to open a contract: blocked when the judge has learned enough, beats
+    guessing, and gives this trade under 60% of the farm's usual chance of winning. -> (blocked, probability or None)."""
+    if JUDGE["n"] < JUDGE_MIN or (judge_skill() or 0) <= 0.01:
+        return False, None
+    g_ = v.traits or {}
+    f = judge_features("call" if s == "buy" else "put", g_.get("otm", 0), dte_for(g_), getattr(sim, "now", None), v.name,
+                       v.tf, reg, edge)
+    p = judge_prob(f)
+    if not GATES.get("judge", True) or (int(getattr(v, "uid", 0) or 0) // 4) % 2:
+        return False, p
+    base = JUDGE["wins"] / max(1, JUDGE["n"])
+    return p < 0.6 * base, p
+
+
+def trade_features(t):
+    """The judge's features for a finished trade, from what was recorded when it was bought."""
+    ct = t.get("contract") or {}
+    return judge_features(ct.get("type"), ct.get("otm0", 0), ct.get("dte0", 14), ct.get("t0"), t.get("strat"),
+                          t.get("tf") or ct.get("tf0") or 1, ct.get("reg0"), ct.get("edge0"))
+
+
+def school_rows(h=60, min_n=10):
+    """The Signal school's grades at one horizon, best first: [(strategy, pace, 'buy'/'sell', signals, average move in
+    swings, standard error, share right)]."""
+    rows = []
+    for key, hs in SCHOOL.items():
+        try:
+            name, pace, side = key.split("|")
+        except ValueError:
+            continue
+        s_ = hs.get(f"h{h}")
+        if not s_ or s_[0] < min_n:
+            continue
+        n_ = s_[0]
+        mean = s_[1] / n_
+        se = (max(0.0, s_[2] / n_ - mean * mean) / n_) ** 0.5
+        rows.append((name, pace, "buy" if side == "b" else "sell", int(n_), mean, se, s_[3] / n_))
+    rows.sort(key=lambda r: -r[4])
+    return rows
+
+
+def cost_to_beat(c, S, closes_c, vol, h=60, otm=5.0, dte=14, bm=1.0):
+    """For one ticker: (move % a call otm% out and dte days out needs within h minutes, the stock's usual move over h
+    minutes %, that need in swings). None when it can't be priced."""
+    be = breakeven_move(c, S, "call", otm, dte, vol, h)
+    sw = swing_pct(closes_c, h / bm)
+    if be is None or sw <= 0:
+        return None
+    return be, sw, be / sw
+
+
+def option_breakeven_for(v, c, S, hold_min, typ="call"):
+    """The stock move (%) one of this bot's contracts would need over hold_min minutes (for grading what its blocked
+    buys would have done); None for stock bots or when it can't be priced."""
+    sim = v.sim
+    if not isinstance(sim, OptionSim) or not S:
+        return None
+    g_ = v.traits or {}
+    return breakeven_move(c, S, typ, g_.get("otm", 0), dte_for(g_), sim._vol(c), hold_min)
+
+
 def _grade_vetoes(v, closes, n):
     """Settles blocked trades whose waiting time is up: how much did skipping them save (or cost)?"""
     keep = []
@@ -2785,10 +3148,20 @@ def _grade_vetoes(v, closes, n):
         move = (closes[c][-1] / px - 1) * 100
         # a skipped buy saved money if the price fell (plus the fees it didn't pay); a skipped sell, if it rose
         saved = (-move + v.rt_cost * 100) if side == "buy" else move
+        if side in ("buy", "put") and isinstance(v.sim, OptionSim):
+            # an options bot's skipped buy saved money unless the stock moved far enough to pay for the contract: its
+            # bid/ask gap and decay need a far bigger move than a stock's fees (on 11/19 a 2% stock round trip
+            # stood in for contracts that needed several % to break even)
+            be = option_breakeven_for(v, c, px, 10 * max(1, v.tf), "call" if side == "buy" else "put")
+            if be is not None:
+                saved = (be - move) if side == "buy" else (be + move)
+            elif side == "put":
+                saved = move
         if k == "coin":  # a skipped coin: if it would have won, its bad record fades
             cp = v.coin_pl.setdefault(c, [0, 0.0])
             cp[1] = cp[1] * 0.9 + max(0.0, -saved)  # bad records also fade slowly, so it re-tries the coin one day
-        st = (v.layer_stats if (k in ("plus", "minus", "confirm", "coin", "htf", "lead", "vix") or k.startswith("ctx:"))
+        st = (v.layer_stats if (k in ("plus", "minus", "confirm", "coin", "htf", "lead", "vix", "school", "judge")
+                                or k.startswith("ctx:"))
               else v.veto_stats).setdefault(k, [0.0, 0.0])
         st[0] += 1
         st[1] += saved
@@ -3189,6 +3562,22 @@ def bot_step(v, closes, n, coins, extra=None):
                     if not any(w[0] == "coin" and w[1] == c for w in v.veto_wait):
                         v.veto_wait.append(("coin", c, "buy", last[c], n + 10 * v.tf))
                     s = None
+            if s and opt and sim.pos.get(c, 0) <= 0 and not tr.get("flatby") and not tr.get("kami") \
+                    and (s == "buy" or int(tr.get("omode", 3) or 3) != 1):
+                # about to open a contract: the Signal school's cost-to-beat gate, then the trade judge (each graded in
+                # hindsight like a never-rule, so the farm sees what they save or cost)
+                reg_ = vol_regime(closes, extra, c)[0]
+                blocked, edge_ = school_check(v, c, s, closes, extra, sim)
+                kind_ = "school" if blocked else None
+                if not blocked:
+                    blocked, _ = judge_check(v, c, s, sim, reg_, edge_)
+                    kind_ = "judge" if blocked else None
+                if blocked:
+                    if not any(w[0] == kind_ and w[1] == c for w in v.veto_wait):
+                        v.veto_wait.append((kind_, c, "buy" if s == "buy" else "put", last[c], n + 10 * v.tf))
+                    s = None
+                else:
+                    v.__dict__.setdefault("entry_ctx", {})[c] = (reg_, None if edge_ is None else round(edge_, 4))
             v.sig[c] = s
             if s:
                 v.why[c] = reason or f"{v.name} said {s}"
@@ -3213,6 +3602,9 @@ def bot_step(v, closes, n, coins, extra=None):
             if t["side"] != "buy" and c in v.since:
                 t["held"] = n - v.since[c]
             if t["side"] == "buy":
+                ctx_ = (getattr(v, "entry_ctx", None) or {}).pop(c, None)
+                if opt and ctx_ and sim.opt.get(c):  # what the judge will learn this trade from when it's sold
+                    sim.opt[c].update(reg0=ctx_[0], edge0=ctx_[1], tf0=v.tf)
                 if v.review and c not in v.entry_flags:  # which never-rules WOULD have blocked this buy (for the review)
                     v.entry_flags[c] = [k for k, spec in VETOES.items() if spec["side"] in ("buy", "open") and k not in v.vetoes
                                         and _veto(v, k, (spec["lo"] + spec["hi"]) / 2, c, closes, n, extra, coins)]
@@ -3351,6 +3743,7 @@ class Variant:
         self.island = 0       # which sub-farm it lives on
         self.review = True    # note which never-rules would have stopped its losing buys (post-trade review)
         self.entry_flags = {} # coin -> never-rules that would have blocked the open position's first buy
+        self.entry_ctx = {}   # coin -> (volatility conditions, school grade) when it decided to buy (for the judge)
         self.own_review = {}  # its own losses: never-rule -> [its losing buys it would have blocked, winning buys]
         self.swing_ref, self.adapt_k = {}, {}  # adaptive stops: usual swing per coin, current stop scale
         self.mut_kinds = []   # what changed from its parent (mutation memory)
@@ -4690,6 +5083,9 @@ class Tournament(FarmMixin):
                         self.learn_lesson(dict(t, strat=v.name, **habit_), pc_)
                     if not self.replaying:
                         self.note_habit(v, t, pc_)
+                    if not self.replaying and isinstance(v.sim, OptionSim) and not is_scalp(v.name) and not is_kami(v) \
+                            and (t.get("contract") or {}).get("t0"):
+                        judge_learn(trade_features(dict(t, strat=v.name, tf=v.tf)), pc_ > 0)
                 if t.get("flags") and not self.replaying:
                     for k in t["flags"]:
                         self.review.setdefault(k, [0, 0])[0 if t["pl"] <= 0 else 1] += 1
@@ -5625,6 +6021,7 @@ def _bt_bot(g, coins, start_cash, fee, pct, slip, picky=True):
     b.rt_cost = 2 * (fee + slip)
     b.fee_guard = b.rt_cost
     b.picky = picky
+    b.uid = int(gg("uid", 0) or 0)  # (which half of the comparisons it's on: the school and judge gates)
     return b
 
 
@@ -6305,7 +6702,9 @@ def farm_knowledge(t):
     # studies (extra reasons to buy or not, bigger trend, market leader, context tickers, volatility gate)
     names = {"plus": "Buy studies (extra reasons to buy)", "minus": "No-buy studies (reasons not to buy)",
              "confirm": "Confirmation", "htf": "Bigger-trend study", "lead": "Follow the market leader",
-             "vix": "Volatility gate (scalpers)", "coin": "Skipping tickers it's bad at"}
+             "vix": "Volatility gate (scalpers)", "coin": "Skipping tickers it's bad at",
+             "school": "Signal school: skipping signals too small to pay for the contract",
+             "judge": "Trade judge: skipping trades it expects to lose"}
     lagg = {}
     for v in t.vars:
         for k, st in (v.layer_stats or {}).items():
