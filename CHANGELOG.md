@@ -10,6 +10,15 @@
 
 
 
+## 1.47.1
+- **Fix: a bot that tuned itself kept its old identity until a restart.** Since 1.43 bots change their own exits (and,
+  since 1.45, take on the farm's trade lessons), but the identity worked out from their genes was cached at birth, so
+  duplicate checks, lineage and the Hall of Fame matched them by genes they no longer had (learning from losses and
+  loosening already reset it).
+- **Practice farms leave the trade judge as it was.** A feature test's two runs (with and without a switch) now see the
+  same judge, and Training camp, Free roam and the Slow farm's practice trades don't retrain the judge your farm trades
+  with. (1.47.0 wasn't released: a test caught both.)
+
 ## 1.47.0
 New ways for the bots to learn, from the 11/19 report (1,503 bot trades won 33%, median -5.7%; every strategy's median
 was negative; 111 of 175 bots couldn't be judged yet; the miner and hindsight found nothing):

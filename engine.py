@@ -4360,6 +4360,7 @@ class Tournament(FarmMixin):
         if not did:
             return None
         v.traits = clean_traits(tr)
+        v.__dict__.pop("_key", None)  # its genes changed: its identity (cached at birth) must be worked out again
         v.habits = hb
         v.mut_kinds = list(getattr(v, "mut_kinds", None) or []) + ["self-tuned"]
         self.events.append(f"{v.label} {did}")
@@ -6188,7 +6189,19 @@ def fresh_scoreboard(t):
         v._key = None
 
 
-def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes=None, start_cash=1000.0, fee=0.006,
+def train_farm(*args, **kw):
+    """A practice farm on past prices (see _train_farm). It starts from the trade judge as it is and leaves it as it
+    was: what a practice farm's trades teach stays in that run, so two runs from the same seed (a feature test's pair)
+    see the same judge, and practice never retrains the judge your farm trades with."""
+    saved = json.loads(json.dumps(JUDGE))
+    try:
+        return _train_farm(*args, **kw)
+    finally:
+        JUDGE.clear()
+        JUDGE.update(saved)
+
+
+def _train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes=None, start_cash=1000.0, fee=0.006,
                pct=0.1, evolve=24, params=None, retire_steps=0, progress=None, stop=None, seed=None, on_trade=None):
     """Training camp: a whole farm lives through a stretch of history, `passes` times over, breeding and learning as it
     goes (bots keep their genes and lessons between passes, with fresh money each time). The last exam_frac of the

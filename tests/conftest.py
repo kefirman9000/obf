@@ -22,4 +22,14 @@ def _repeatable(monkeypatch):
     counter = iter(range(10 ** 6))
     monkeypatch.setattr(engine.random, "Random", lambda *a: real(*a) if a else real(1000 + next(counter)))
     random.seed(12345)
+    # the Signal school's and the trade judge's books are shared by every farm in a process: each test starts empty,
+    # so what one test's farm taught can't change how another's trades (and the order tests run in can't matter)
+    saved = (dict(engine.SCHOOL), dict(engine.SCHOOL_SEEN), dict(engine.JUDGE), dict(engine.GATES))
+    engine.SCHOOL.clear()
+    engine.SCHOOL_SEEN.clear()
+    engine.JUDGE.clear()
+    engine.JUDGE.update(w={}, n=0, wins=0.0, brier=[0.0, 0.0, 0.0])
     yield
+    for d, x in zip((engine.SCHOOL, engine.SCHOOL_SEEN, engine.JUDGE, engine.GATES), saved):
+        d.clear()
+        d.update(x)

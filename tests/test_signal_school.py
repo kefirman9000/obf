@@ -209,3 +209,21 @@ def test_the_learning_book_survives_a_restart_and_shows_in_the_report(tmp_path, 
              trade_judge=dict(trades=1, won=1.0, skill=None))
     text = M.App._report_summary(d)
     assert "Signal school" in text and "RSI (1-2) buy: 40 signals, +0.100" in text and "Trade judge" in text
+
+
+def test_a_self_tuned_bot_gets_a_new_identity():
+    from test_proving import farm, plain
+    t, _ = farm()
+    t.lessons = {}
+    for _ in range(E.LESSON_MIN):
+        t.learn_lesson(dict(side="sell", why="its own profit target", held=5, contract={"type": "call"}), -8.0)
+        t.learn_lesson(dict(side="sell", why="its own profit target", held=40, contract={"type": "call"}), 4.0)
+    t._adopt_budget = 10
+    v = plain(t)
+    v.uid = 4
+    v.risk = E.clean_risk({"sl": 30.0})
+    v.traits = {}
+    v.__dict__.pop("_key", None)
+    before = v.key()
+    assert "holds at least" in (t.self_tune(v) or "")
+    assert v.key() != before and dict(v.key()[4]).get("minhold")  # (it kept its old identity until a restart)
