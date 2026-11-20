@@ -71,7 +71,7 @@ def test_unaffordable_tickers_rank_last():
 
 def test_old_settings_move_to_the_tighter_far_out_limit_once():
     s = E.merge_settings({"max_otm": 15.0, "defaults_rev": 2})
-    assert s["max_otm"] == 10.0 and s["defaults_rev"] == 3
+    assert s["max_otm"] == 10.0 and s["defaults_rev"] == E.DEFAULT_SETTINGS["defaults_rev"]
     assert E.merge_settings({"max_otm": 0, "defaults_rev": 2})["max_otm"] == 0  # no limit, on purpose: kept
     assert E.merge_settings(dict(s, max_otm=20.0))["max_otm"] == 20.0  # chosen after the move: kept
     assert E.DEFAULT_SETTINGS["max_otm"] == 10.0 and E.DEFAULT_SETTINGS["open_calm"] == 5

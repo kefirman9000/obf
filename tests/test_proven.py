@@ -41,6 +41,7 @@ def test_a_bot_with_a_real_record_is_proven_and_others_are_not():
 
 def test_only_proven_winners_vote():
     t = farm()
+    t.o["standin_n"] = 0  # (stand-ins, the best few winners trading while nobody is proven, have their own tests)
     for v in t.vars:
         v.sig = {c: "buy" for c in t.coins}
     t.active = [v for v in t.vars if not E.is_kami(v)][:3]

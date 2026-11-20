@@ -10,17 +10,31 @@
 
 
 
-## 1.47.2
-From the 11/19 evening report:
+## 1.48.0
+From the 11/19 reports (1,503 bot trades; every bot lost to holding in its exams on unseen prices):
+- **The coin-flip check.** Six bots now run beside every farm and open contracts at random, but on the farm's own
+  contracts and exits: each copies one farm bot's pace, stop, target, trailing stop, hold limits and contract choice,
+  and leaves its entries to a coin. They're outside the farm: never ranked, bred, proven, examined or trading the
+  account, and their trades teach nothing (no lessons, no judge). The farm's finished trades are compared with theirs:
+  if the farm can't beat coin flips, its signals aren't what's losing money; its contracts and exits are. Shown at the
+  top of Learning > Signal school, in the activity log every 3 hours, and in the report. Every 600 decisions a
+  coin-flip bot is re-hatched from a fresh farm bot, so they follow the farm's habits. Settings > Wildcard:
+  "Coin-flip check" (on).
+- **Minimum hold.** Bots keep a contract at least 60 minutes before their signals, trailing stop, time limit or
+  decay/volatility exits may sell it. A profit target, a deep loss (twice the stop, at most 60%), expiry and going
+  flat at the close still sell. In the report, sales within 15 minutes won 20% and those held 1-4 hours 42%; trailing
+  stops won 11% (median -12.8%), mostly selling on the bid/ask gap's noise. Scalpers and kamikazes are exempt.
+  Settings > Basics: "Minimum hold" (minutes, 0 = off).
+- **Fewer bots, longer lives.** 175 bots ran and only 37 could be judged (100 had never traded): bots were rotated out
+  after 12 hours of candles, under two trading days, before they had a record. Farms over 40 bots move to 40 once (the
+  weakest and unjudged go first; proven bots and veterans are kept), and bots get 48 hours of candles before being
+  rotated out (Calm 96, Balanced 48, Wild 24). Both can be raised again in Settings.
 - **Fix: the Signal school was far too sure of itself.** It counted every signal, but a signal on one candle and the
   next (or from two bots of the same kind on the same candle) are graded on nearly the same move, so its error bars
   were about 4x too narrow. On a pure random walk, where no signal can know anything, it reported "edges" of up to 9
-  standard errors (RSI buys +0.14 swings). Now, per kind of signal and horizon, a signal only counts once the last
-  one's window has passed; on the same random walks the grades now spread as chance would. Books saved by 1.47.0/1.47.1
-  are thrown out and regraded (the trade judge keeps what it learned); the cost-to-beat gate blocks less until the
-  grades come back, since honest error bars give each signal more benefit of the doubt.
-- **No "no new candle" warning while the market is closed.** The report's checks flagged every ticker as stale after
-  4 pm.
+  standard errors. Now, per kind of signal and horizon, a signal only counts once the last one's window has passed.
+  Books saved by 1.47 are thrown out and regraded (the trade judge keeps what it learned).
+- **No "no new candle" warning while the market is closed.** The report's checks flagged every ticker after 4 pm.
 
 ## 1.47.1
 - **Fix: a bot that tuned itself kept its old identity until a restart.** Since 1.43 bots change their own exits (and,
