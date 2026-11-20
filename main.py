@@ -5508,6 +5508,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         for x in sells:
             by_strat.setdefault(STRAT_LABELS.get(x.get("strategy"), x.get("strategy")), []).append(x["pl_pct"])
         feed = {}
+        mkt_open = bool((getattr(self, "market", None) or {}).get("is_open", True))
         for c in list(self.session_coins or []):
             ts = list((self.hx.get(c) or {}).get("t") or [])
             if len(ts) < 3:
@@ -5521,7 +5522,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                     and E.minutes_to_close(a) > 0 and datetime.fromtimestamp(a).date() == datetime.fromtimestamp(b).date()]
             feed[c] = dict(bars=len(ts), candle_s=step, first=datetime.fromtimestamp(ts[0]).isoformat(timespec="minutes"),
                            last=datetime.fromtimestamp(ts[-1]).isoformat(timespec="minutes"),
-                           last_age_s=round(time.time() - ts[-1]), gaps_today=gaps[-30:], implied_vol=E.IV_HINT.get(c),
+                           last_age_s=round(time.time() - ts[-1]), market_open=mkt_open, gaps_today=gaps[-30:],
+                           implied_vol=E.IV_HINT.get(c),
                            pricing_vol=round(E.pricing_vol(self.hist.get(c) or [1], ts), 4))
         afford = {}
         size = self.start_cash * float(self.settings.get("trade_pct", 10)) / 100
@@ -5593,7 +5595,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 g = x["gaps_today"]
                 out.append(f"  ! {c}: {len(g)} gap(s) in today's prices while the market was open, the longest "
                            f"{max(y[2] for y in g):.0f} min (e.g. {g[-1][0]} to {g[-1][1]}).")
-            if x.get("last_age_s", 0) > 600:
+            if x.get("last_age_s", 0) > 600 and x.get("market_open", True):  # (no candles while it's closed)
                 out.append(f"  ! {c}: no new candle for {x['last_age_s'] // 60} min.")
         if d.get("errors_log"):
             out.append(f"- errors.log: {sum(1 for l in d['errors_log'] if l.startswith('---'))} recent entries.")
@@ -16445,9 +16447,11 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         d = E.load_json(self.learning_path(), {}) or {}
         try:
             E.SCHOOL.clear()
-            E.SCHOOL.update({k: {h: [float(y) for y in x][:4] for h, x in hs.items()} for k, hs in (d.get("school") or {}).items()})
             E.SCHOOL_SEEN.clear()
-            E.SCHOOL_SEEN.update({k: float(x) for k, x in (d.get("seen") or {}).items()})
+            if int(d.get("school_rev", 1) or 1) >= E.SCHOOL_REV:  # (older books counted overlapping signals: regraded)
+                E.SCHOOL.update({k: {h: [float(y) for y in x][:4] for h, x in hs.items()}
+                                 for k, hs in (d.get("school") or {}).items()})
+                E.SCHOOL_SEEN.update({k: float(x) for k, x in (d.get("seen") or {}).items()})
             j = d.get("judge") or {}
             if j.get("w"):
                 E.JUDGE.update(w={k: float(x) for k, x in j["w"].items()}, n=int(j.get("n", 0)), wins=float(j.get("wins", 0)),
@@ -16460,7 +16464,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             return
         try:
             data = dict(school={k: {h: list(x) for h, x in dict(hs).items()} for k, hs in dict(E.SCHOOL).items()},
-                        seen=dict(E.SCHOOL_SEEN), judge=dict(w=dict(E.JUDGE["w"]), n=E.JUDGE["n"], wins=E.JUDGE["wins"],
+                        school_rev=E.SCHOOL_REV, seen=dict(E.SCHOOL_SEEN), judge=dict(w=dict(E.JUDGE["w"]), n=E.JUDGE["n"], wins=E.JUDGE["wins"],
                                                              brier=list(E.JUDGE["brier"])))
         except RuntimeError:  # (the farm changed it mid-copy: the next save gets it)
             return

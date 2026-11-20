@@ -2796,6 +2796,7 @@ SCHOOL_FADE = 4000               # past this many, a grade's counts halve (recen
 SCHOOL_SWING_BARS = 120          # candles behind each signal its ticker's usual swing is measured over
 SCHOOL = {}                      # "strategy|pace|side" -> {"h15": [n, sum z, sum z^2, hits], "o:h15": ..., ...}
 SCHOOL_SEEN = {}                 # ticker -> time of the newest candle whose signals have been graded (live runs)
+SCHOOL_REV = 2                   # learning-book.json's grading rule (2: overlapping signals counted once, 1.47.2)
 GATES = {"school": True, "judge": True}  # Settings > Learning: "Signal school" and "Trade judge"
 
 
@@ -2918,6 +2919,7 @@ def school_study(closes, extra, genes, since=None, stop=None, progress=None):
         if lo is not None and times:
             while start <= last and times[start] <= lo:
                 start += 1
+        events = []  # (candle, kind of signal, +1 buy / -1 sell), from every bot kind, graded below in time order
         for name, params, tf in gl:
             if stop and stop():
                 raise TrainingStopped()
@@ -2931,20 +2933,30 @@ def school_study(closes, extra, genes, since=None, stop=None, progress=None):
                 if sig not in ("buy", "sell"):
                     continue
                 count += 1
-                base = (cum[i] - cum[i - SCHOOL_SWING_BARS]) / SCHOOL_SWING_BARS
-                if base <= 0 or not P[i]:
-                    continue
-                sign = 1 if sig == "buy" else -1
-                key = school_key(name, tf, sig)
-                tod = tod_bucket(times[i]) if times and i < len(times) else "m"
-                for h in SCHOOL_HORIZONS:
-                    mv = (P[i + hb[h]] / P[i] - 1) * 100 * sign
-                    z = max(-6.0, min(6.0, mv / (base * hb[h] ** 0.5 * 100)))
-                    _school_add(book, key, f"h{h}", z, mv)
-                    _school_add(book, key, f"{tod}:h{h}", z, mv)
+                events.append((i, school_key(name, tf, sig), 1 if sig == "buy" else -1))
             done += 1
             if progress:
                 progress(done, total)
+        # Only signals whose look-ahead windows don't overlap are graded: per kind of signal and horizon, the next one
+        # counts once the last one's window has passed. Signals a minute apart (or from two bots of the same kind on
+        # the same candle) see the same move, so counting each made the grades look up to 4x surer than they were: on
+        # a random walk, "edges" of 9 standard errors.
+        events.sort(key=lambda e: e[0])
+        nxt = {}
+        for i, key, sign in events:
+            base = (cum[i] - cum[i - SCHOOL_SWING_BARS]) / SCHOOL_SWING_BARS
+            if base <= 0 or not P[i]:
+                continue
+            tod = tod_bucket(times[i]) if times and i < len(times) else "m"
+            nk = nxt.setdefault(key, {})
+            for h in SCHOOL_HORIZONS:
+                if i < nk.get(h, 0):
+                    continue
+                nk[h] = i + hb[h]
+                mv = (P[i + hb[h]] / P[i] - 1) * 100 * sign
+                z = max(-6.0, min(6.0, mv / (base * hb[h] ** 0.5 * 100)))
+                _school_add(book, key, f"h{h}", z, mv)
+                _school_add(book, key, f"{tod}:h{h}", z, mv)
         if times and last < len(times):
             until[c] = times[last]
     return dict(book=book, until=until, signals=count)

@@ -10,6 +10,18 @@
 
 
 
+## 1.47.2
+From the 11/19 evening report:
+- **Fix: the Signal school was far too sure of itself.** It counted every signal, but a signal on one candle and the
+  next (or from two bots of the same kind on the same candle) are graded on nearly the same move, so its error bars
+  were about 4x too narrow. On a pure random walk, where no signal can know anything, it reported "edges" of up to 9
+  standard errors (RSI buys +0.14 swings). Now, per kind of signal and horizon, a signal only counts once the last
+  one's window has passed; on the same random walks the grades now spread as chance would. Books saved by 1.47.0/1.47.1
+  are thrown out and regraded (the trade judge keeps what it learned); the cost-to-beat gate blocks less until the
+  grades come back, since honest error bars give each signal more benefit of the doubt.
+- **No "no new candle" warning while the market is closed.** The report's checks flagged every ticker as stale after
+  4 pm.
+
 ## 1.47.1
 - **Fix: a bot that tuned itself kept its old identity until a restart.** Since 1.43 bots change their own exits (and,
   since 1.45, take on the farm's trade lessons), but the identity worked out from their genes was cached at birth, so
