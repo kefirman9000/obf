@@ -1562,6 +1562,18 @@ def opening_rush(ts, within=OPEN_SETTLE_MIN):
 
 
 OPEN_CALM = [5]  # minutes after the open when safety stops (short of a deep loss) and time-decay/volatility exits wait
+MIN_HOLD = [60]  # minutes a contract is held before anything but a deep loss, a profit target or the close sells it
+
+
+def too_young(sim, c, tr):
+    """True while a bot's contract is younger than the minimum hold (Settings > Basics: 'Minimum hold', minutes; 0 =
+    off). In the 11/19 report, sales within 15 minutes won 20% and those held 1-4 hours 42%: the bid/ask gap eats
+    quick round trips, and trailing stops (11% won) mostly sold on the gap's noise. Scalpers and kamikazes are exempt
+    (quick trades are their breed)."""
+    if MIN_HOLD[0] <= 0 or tr.get("flatby") or tr.get("kami"):
+        return False
+    t0, now = (getattr(sim, "opt", {}).get(c) or {}).get("t0"), getattr(sim, "now", None)
+    return bool(t0 and now and now - t0 < MIN_HOLD[0] * 60)
 
 
 def deep_stop(sl):
@@ -1600,7 +1612,7 @@ DEFAULT_SETTINGS = {
     "add_every": 3,              # decisions between add-on buys while a winner is holding
     "slow_every": 6,             # decisions between trades that only shaky strategies want
     "max_bots": 30,              # most strategies competing at once (14 to 200)
-    "retire_hours": 12.0,        # replace a strategy that has not been winning for this long (0 = never)
+    "retire_hours": 48.0,        # replace a strategy that has not been winning for this long (0 = never)
     "fail_drop": 3.0,            # % drop from a strategy's recent peak that stops it at once (0 = off)
     "beat_hold": True,           # a strategy only counts as Winning if it also beats just holding
     "crossbreed": True,          # new strategies can mix the settings of two winners
@@ -1686,6 +1698,8 @@ DEFAULT_SETTINGS = {
     "legend_share": 10,          # ...% of new eggs hatched from Legends
     "max_otm": 10.0,             # farthest out of the money any bot or the account buys (%); bots learn their own limit under it
     "open_calm": 5,              # minutes after the open when stops wait unless the loss is deep (0 = off)
+    "min_hold": 60,              # minutes a bot holds a contract before its signals, trailing stop or time limit may sell
+    "controls": True,            # coin-flip control bots run beside the farm (outside it), to see if its picks beat chance
     "signal_school": True,       # bots skip signals whose graded move can't pay for the contract (half the farm)
     "trade_judge": True,         # one model learns from every finished trade and blocks likely losers (half the farm)
     "trade_lessons": True,       # the farm learns from its own closed trades (calls vs puts, how far out, how it sold, how
@@ -1734,9 +1748,12 @@ STYLES = {  # risk presets: trade size, stop / target on the premium, daily limi
 }
 
 
-DEFAULT_SETTINGS["defaults_rev"] = 3  # bumped when a default changes on purpose for everyone (see merge_settings)
+DEFAULT_SETTINGS["defaults_rev"] = 4  # bumped when a default changes on purpose for everyone (see merge_settings)
 DEFAULT_SETTINGS["scalp_real_exams"] = 2  # scalpers trade the account only after this many winning exam days at real option prices
 DEFAULT_SETTINGS.update(LIMIT_DEFAULTS)  # account-wide safety limits (farmcore)
+
+
+FARM_SIZE_MOVE = 40  # 1.48 moved bigger farms down to this once (Settings > Farm size can raise it again)
 
 
 def merge_settings(saved):
@@ -1759,6 +1776,13 @@ def merge_settings(saved):
         # 3-7% out: +0.2% and 50%. 0 (no limit) is kept: that was asked for on purpose
         m_ = _numor(s.get("max_otm"), 10.0)
         s["max_otm"] = min(m_, 10.0) if m_ > 0 else m_
+    if saved and int(saved.get("defaults_rev", 1) or 1) < 4:
+        # 1.48: fewer bots, longer lives. In the 11/19 report 175 bots ran and only 37 could be judged (100 had never
+        # traded): bots were rotated out after 12 hours of candles (under two trading days) before they had a record.
+        # Your farm size and retire time can be raised again in Settings; "never" (0) is kept
+        s["max_bots"] = int(min(_numor(s.get("max_bots"), 30), FARM_SIZE_MOVE))
+        r_ = _numor(s.get("retire_hours"), 48.0)
+        s["retire_hours"] = max(r_, 48.0) if r_ > 0 else r_
     s["defaults_rev"] = DEFAULT_SETTINGS["defaults_rev"]
     s["size_mult"] = dict(s.get("size_mult") or {})
     s["extra_coins"] = [c for c in (s.get("extra_coins") or []) if isinstance(c, str) and valid_coin(c)]
@@ -2433,6 +2457,10 @@ def tournament_opts(settings):
     except (TypeError, ValueError):
         OPEN_CALM[0] = 5
     try:
+        MIN_HOLD[0] = max(0, min(390, int(settings.get("min_hold", 60))))
+    except (TypeError, ValueError):
+        MIN_HOLD[0] = 60
+    try:
         MIN_DTE = max(0, min(60, int(settings.get("min_dte", 7))))
     except (TypeError, ValueError):
         MIN_DTE = 7
@@ -2453,7 +2481,8 @@ def tournament_opts(settings):
                 long_holds=bool(settings.get("long_holds", True)),
                 scalp_share=scalp_share(settings), hindsight=bool(settings.get("hindsight", True)),
                 miner=bool(settings.get("strategy_miner", True)),
-                maxotm=MAX_OTM[0], lessons=bool(settings.get("trade_lessons", True)),
+                maxotm=MAX_OTM[0], minhold_min=MIN_HOLD[0], lessons=bool(settings.get("trade_lessons", True)),
+                controls=bool(settings.get("controls", True)),
                 legends=bool(settings.get("legends", True)),
                 legend_share=min(0.4, max(0.0, float(settings.get("legend_share", 10) or 0) / 100)),
                 kami_share=(min(0.3, max(0.0, float(settings.get("kami_share", 10) or 0) / 100))
@@ -2796,6 +2825,7 @@ SCHOOL_FADE = 4000               # past this many, a grade's counts halve (recen
 SCHOOL_SWING_BARS = 120          # candles behind each signal its ticker's usual swing is measured over
 SCHOOL = {}                      # "strategy|pace|side" -> {"h15": [n, sum z, sum z^2, hits], "o:h15": ..., ...}
 SCHOOL_SEEN = {}                 # ticker -> time of the newest candle whose signals have been graded (live runs)
+SCHOOL_REV = 2                   # learning-book.json's grading rule (2: overlapping signals counted once, 1.47.2)
 GATES = {"school": True, "judge": True}  # Settings > Learning: "Signal school" and "Trade judge"
 
 
@@ -2918,6 +2948,7 @@ def school_study(closes, extra, genes, since=None, stop=None, progress=None):
         if lo is not None and times:
             while start <= last and times[start] <= lo:
                 start += 1
+        events = []  # (candle, kind of signal, +1 buy / -1 sell), from every bot kind, graded below in time order
         for name, params, tf in gl:
             if stop and stop():
                 raise TrainingStopped()
@@ -2931,20 +2962,30 @@ def school_study(closes, extra, genes, since=None, stop=None, progress=None):
                 if sig not in ("buy", "sell"):
                     continue
                 count += 1
-                base = (cum[i] - cum[i - SCHOOL_SWING_BARS]) / SCHOOL_SWING_BARS
-                if base <= 0 or not P[i]:
-                    continue
-                sign = 1 if sig == "buy" else -1
-                key = school_key(name, tf, sig)
-                tod = tod_bucket(times[i]) if times and i < len(times) else "m"
-                for h in SCHOOL_HORIZONS:
-                    mv = (P[i + hb[h]] / P[i] - 1) * 100 * sign
-                    z = max(-6.0, min(6.0, mv / (base * hb[h] ** 0.5 * 100)))
-                    _school_add(book, key, f"h{h}", z, mv)
-                    _school_add(book, key, f"{tod}:h{h}", z, mv)
+                events.append((i, school_key(name, tf, sig), 1 if sig == "buy" else -1))
             done += 1
             if progress:
                 progress(done, total)
+        # Only signals whose look-ahead windows don't overlap are graded: per kind of signal and horizon, the next one
+        # counts once the last one's window has passed. Signals a minute apart (or from two bots of the same kind on
+        # the same candle) see the same move, so counting each made the grades look up to 4x surer than they were: on
+        # a random walk, "edges" of 9 standard errors.
+        events.sort(key=lambda e: e[0])
+        nxt = {}
+        for i, key, sign in events:
+            base = (cum[i] - cum[i - SCHOOL_SWING_BARS]) / SCHOOL_SWING_BARS
+            if base <= 0 or not P[i]:
+                continue
+            tod = tod_bucket(times[i]) if times and i < len(times) else "m"
+            nk = nxt.setdefault(key, {})
+            for h in SCHOOL_HORIZONS:
+                if i < nk.get(h, 0):
+                    continue
+                nk[h] = i + hb[h]
+                mv = (P[i + hb[h]] / P[i] - 1) * 100 * sign
+                z = max(-6.0, min(6.0, mv / (base * hb[h] ** 0.5 * 100)))
+                _school_add(book, key, f"h{h}", z, mv)
+                _school_add(book, key, f"{tod}:h{h}", z, mv)
         if times and last < len(times):
             until[c] = times[last]
     return dict(book=book, until=until, signals=count)
@@ -3411,17 +3452,19 @@ def bot_step(v, closes, n, coins, extra=None):
                 k_ *= tr["vixwide"] if reg_ == "spiking" else (1 + tr["vixwide"]) / 2 if reg_ == "rising" else 1.0
             settle = opt and opening_rush(sim.now)  # (the first prints of the day: no taking profits on them)
             calm = opt and opening_calm(sim.now)  # (and only a deep loss sells on them)
+            young = opt and too_young(sim, c, tr)  # (inside the minimum hold: the same, but targets still sell)
             if why is not None:
                 pass
-            elif v.risk["sl"] and r <= -v.risk["sl"] * k_ and (not calm or r <= -deep_stop(v.risk["sl"] * k_)):
+            elif v.risk["sl"] and r <= -v.risk["sl"] * k_ and (not (calm or young) or r <= -deep_stop(v.risk["sl"] * k_)):
                 why = "stop"
             elif v.risk["tp"] and r >= v.risk["tp"] * k_ and not settle:
                 why = "target"
-            elif why is None and tr.get("trail") and mk <= v.hi[c] * (1 - tr["trail"] * k_ / 100) and not settle:
+            elif why is None and tr.get("trail") and mk <= v.hi[c] * (1 - tr["trail"] * k_ / 100) and not settle \
+                    and not young:
                 why = "trail"
-            elif tr.get("maxhold") and n - v.since.get(c, n) >= tr["maxhold"] * v.tf:
+            elif tr.get("maxhold") and n - v.since.get(c, n) >= tr["maxhold"] * v.tf and not young:
                 why = "time"
-            elif opt and (tr.get("decay") or tr.get("ivdrop")) and not calm:
+            elif opt and (tr.get("decay") or tr.get("ivdrop")) and not calm and not young:
                 why = option_exit(sim, c, last[c], tr)
             if why:
                 sim.sell(c, last[c], n)
@@ -3437,8 +3480,12 @@ def bot_step(v, closes, n, coins, extra=None):
             if n % v.tf:  # between this bot's own decisions: no signal, no trade
                 v.sig[c] = None
                 continue
-            s = strat_signal(v.name, closes[c], n, v.params, v.tf, (extra or {}).get(c))
-            reason = f"{v.name} said {s}" if s else ""
+            if tr.get("flip"):  # a coin-flip control bot: random entries, the farm's own contracts and exits
+                s = flip_signal(v, c, opt)
+                reason = "a coin flip (control bot)" if s else ""
+            else:
+                s = strat_signal(v.name, closes[c], n, v.params, v.tf, (extra or {}).get(c))
+                reason = f"{v.name} said {s}" if s else ""
             conf = 1.0
             L = v.layers
             if L:
@@ -3532,6 +3579,9 @@ def bot_step(v, closes, n, coins, extra=None):
                 s = None  # flat before the close: nothing new this late (it would have to be sold right away)
             elif s == "sell" and tr.get("minhold") and n - v.since.get(c, n) < tr["minhold"] * v.tf:
                 s = None  # this bot holds for a while before its strategy may sell (its stops still work)
+            elif opt and s and sim.pos.get(c, 0) > 0 and too_young(sim, c, tr) \
+                    and (s == "sell") == ((sim.opt.get(c) or {}).get("type") == "call"):
+                s = None  # inside the farm's minimum hold: its signals don't close the contract yet
             elif s == "sell" and v.fee_guard and sim.pos.get(c, 0) > 0 and not opt:
                 gain = last[c] / (sim.cost[c] / sim.pos[c]) - 1
                 if 0 <= gain < v.fee_guard:
@@ -3562,7 +3612,7 @@ def bot_step(v, closes, n, coins, extra=None):
                     if not any(w[0] == "coin" and w[1] == c for w in v.veto_wait):
                         v.veto_wait.append(("coin", c, "buy", last[c], n + 10 * v.tf))
                     s = None
-            if s and opt and sim.pos.get(c, 0) <= 0 and not tr.get("flatby") and not tr.get("kami") \
+            if s and opt and sim.pos.get(c, 0) <= 0 and not tr.get("flatby") and not tr.get("kami") and not tr.get("flip") \
                     and (s == "buy" or int(tr.get("omode", 3) or 3) != 1):
                 # about to open a contract: the Signal school's cost-to-beat gate, then the trade judge (each graded in
                 # hindsight like a never-rule, so the farm sees what they save or cost)
@@ -3721,6 +3771,72 @@ def _news_day(ts):
     return hit
 
 
+# ---- coin-flip control bots: does the farm's picking beat chance? ----
+# A handful of bots run beside every farm (outside it: never ranked, bred, proven, examined or trading the account) that
+# open contracts at random, but on the farm's own contracts and exits: each copies one farm bot's pace, stops, target,
+# trailing stop, hold limits and contract choice (how far out, days to expiry, calls/puts), and leaves its entries to a
+# coin. If the farm's trades do no better than theirs, its signals know nothing, and its losses come from the
+# contracts and exits; if they do better, the signals are worth working on.
+CONTROL_N = 6          # coin-flip bots per farm
+CONTROL_OPEN = 1 / 30  # chance a coin-flip bot opens a contract on a ticker at each of its decisions while flat there
+CONTROL_CLOSE = 1 / 45  # chance its "signal" says close at each decision while holding (its exits work as well)
+CONTROL_LIFE = 600     # decisions before a coin-flip bot is re-hatched from a fresh farm bot (it follows the farm)
+CONTROL_KEEP = 600     # recent finished trades kept on each side of the comparison
+CONTROL_MIN = 30       # finished trades on each side before the comparison says anything
+FLIP_COPY = ("trail", "maxhold", "minhold", "exit", "adapt", "omode", "odte", "otm", "night", "maxotm", "oexit", "decay",
+             "ivdrop", "vixwide")  # the habits a coin-flip bot copies: contracts and exits, no entry filters
+
+
+def flip_signal(v, c, opt):
+    """A coin-flip control bot's 'signal' on one ticker: sometimes close what it holds, sometimes open a call or a put
+    (as its copied calls/puts habit allows)."""
+    r = v.__dict__.get("flip_rng")
+    if r is None:
+        r = v.flip_rng = random.Random(1_000_003 * int(getattr(v, "uid", 0) or 0) + 17)
+    sim = v.sim
+    if sim.pos.get(c, 0) > 0:
+        if r.random() >= CONTROL_CLOSE:
+            return None
+        return "buy" if opt and (sim.opt.get(c) or {}).get("type") == "put" else "sell"
+    if r.random() >= CONTROL_OPEN:
+        return None
+    mode = int(v.traits.get("omode", 3) or 3) if opt else 1
+    return "buy" if mode == 1 else "sell" if mode == 2 else r.choice(("buy", "sell"))
+
+
+def control_verdict(book):
+    """The farm's finished trades against the coin-flip bots' (P/L % each). -> dict(farm=..., flip=..., diff, se, verdict,
+    text), each side dict(n, mean, median, won)."""
+    def side(xs):
+        xs = list(xs or [])
+        if not xs:
+            return dict(n=0, mean=None, median=None, won=None, var=0.0)
+        m = sum(xs) / len(xs)
+        ys = sorted(xs)
+        med = ys[len(ys) // 2] if len(ys) % 2 else (ys[len(ys) // 2 - 1] + ys[len(ys) // 2]) / 2
+        var = sum((x - m) ** 2 for x in xs) / max(1, len(xs) - 1)
+        return dict(n=len(xs), mean=round(m, 2), median=round(med, 2), won=round(sum(1 for x in xs if x > 0) / len(xs), 3),
+                    var=var)
+    f, k = side((book or {}).get("farm")), side((book or {}).get("flip"))
+    out = dict(farm={x: y for x, y in f.items() if x != "var"}, flip={x: y for x, y in k.items() if x != "var"},
+               diff=None, se=None, verdict="too few")
+    if f["n"] < CONTROL_MIN or k["n"] < CONTROL_MIN:
+        out["text"] = (f"Coin-flip check: not enough trades yet ({f['n']} farm, {k['n']} coin-flip; "
+                       f"{CONTROL_MIN} each needed).")
+        return out
+    diff = f["mean"] - k["mean"]
+    se = (f["var"] / f["n"] + k["var"] / k["n"]) ** 0.5
+    out.update(diff=round(diff, 2), se=round(se, 2),
+               verdict="beats" if diff > 2 * se else "loses to" if diff < -2 * se else "no clear difference")
+    lead = {"beats": "the farm's picks beat coin flips", "loses to": "the farm's picks did worse than coin flips",
+            "no clear difference": "no clear difference between the farm's picks and coin flips"}[out["verdict"]]
+    out["text"] = (f"Coin-flip check: {lead} ({diff:+.1f}% a trade, give or take {se:.1f}). Farm: {f['n']} trades, "
+                   f"average {f['mean']:+.1f}%, median {f['median']:+.1f}%, {f['won'] * 100:.0f}% won. Coin flips (same "
+                   f"contracts and exits): {k['n']} trades, average {k['mean']:+.1f}%, median {k['median']:+.1f}%, "
+                   f"{k['won'] * 100:.0f}% won.")
+    return out
+
+
 class Variant:
     def __init__(self, name, params, sim, maxlen, tf=1, risk=None, traits=None, vetoes=None, layers=None):
         self.name, self.params, self.sim = name, params, sim
@@ -3850,6 +3966,10 @@ class Tournament(FarmMixin):
             set_prem_range(*self.o["prem"])
         if self.o.get("maxotm") is not None:  # ...and the farthest-out ceiling
             set_max_otm(self.o["maxotm"])
+        if self.o.get("minhold_min") is not None:  # ...and the minimum hold
+            MIN_HOLD[0] = int(self.o["minhold_min"])
+        self.controls = []  # coin-flip control bots (outside the farm: never ranked, bred, proven or trading the account)
+        self.control_book = {"farm": deque(maxlen=CONTROL_KEEP), "flip": deque(maxlen=CONTROL_KEEP)}
         if self.o.get("cfee") is not None:
             CONTRACT_FEE[0] = float(self.o["cfee"])
         if self.o.get("sspread"):  # worker processes get the scalpers' spread limit this way
@@ -3938,6 +4058,42 @@ class Tournament(FarmMixin):
         v.rt_cost = 2 * (self.fee + self.o.get("slip", 0.0))
         v.fee_guard = 2 * (self.fee + self.o.get("slip", 0.0)) if self.o.get("fee_aware", True) else 0.0
         return v
+
+    # ---- coin-flip control bots (see CONTROL_N) ----
+    def control_balance(self, closes=None):
+        """Keeps CONTROL_N coin-flip bots beside an options farm, each copying a random ordinary farm bot's contracts
+        and exits; an old one (past CONTROL_LIFE decisions, and flat) is re-hatched so they follow the farm's habits."""
+        if not hasattr(self, "controls"):
+            self.controls = []
+        if not self.o.get("controls", True) or not OPTIONS:
+            self.controls = []
+            return
+        self.controls = [v for v in self.controls
+                         if self.n - getattr(v, "ctl_born", self.n) < CONTROL_LIFE or any(q > 0 for q in v.sim.pos.values())]
+        pool = [v for v in self.vars if not is_kami(v) and not is_scalp(v.name) and v.name in STRATS]
+        while pool and len(self.controls) < CONTROL_N:
+            g = self.rng.choice(pool)
+            tr = {k: g.traits[k] for k in FLIP_COPY if k in (g.traits or {})}
+            c_ = self._new(g.name, dict(g.params), g.tf, dict(g.risk or {}), tr, None, None)
+            c_.traits["flip"] = 1  # (not a trait any bot can evolve: set after the genes are cleaned)
+            c_.uid = -(len(self.controls) + 1 + 10 * self.n)  # (never a farm bot's number)
+            c_.ctl_born, c_.ctl_from = self.n, g.uid
+            c_.vetoes, c_.layers = {}, {}
+            self.controls.append(c_)
+
+    def _control_step(self, v, closes, n, coins, extra):
+        """One decision of one coin-flip bot; its finished trades go into the comparison (and nowhere else)."""
+        for c, t in bot_step(v, closes, n, coins, extra):
+            v.log.append((n, c, t["side"], closes[c][-1]))
+            if t["side"] == "sell" and t.get("pl") is not None and t["usd"] - t["pl"] > 0:
+                self.control_book["flip"].append(round(t["pl"] / (t["usd"] - t["pl"]) * 100, 2))
+
+    def _run_controls(self, closes):
+        for v in list(getattr(self, "controls", []) or []):
+            self._control_step(v, closes, self.n, self.coins, self.xfull)
+
+    def control_check(self):
+        return control_verdict(getattr(self, "control_book", None))
 
     # ---- the kamikaze breed: daring bets, and the farm's rule testers ----
     def kami_target(self):
@@ -5051,6 +5207,11 @@ class Tournament(FarmMixin):
                 self._book(v, made, last, n, extra)
                 if is_scalp(v.name) and any(t_["side"] == "sell" for _, t_ in made):
                     v.trade_eq.append((n, v.sim.equity(last)))
+        if half % 2 == 0 or parts <= 1:  # the coin-flip bots think as often as the farm's bots do
+            for v in list(getattr(self, "controls", []) or []):
+                cs = [c for c in self.coins if not (v.log and any(x[0] == n and x[1] == c for x in list(v.log)[-4:]))]
+                if cs:
+                    self._control_step(v, closes, n, cs, extra)
 
     def _book(self, v, made, last, n, x):
         """Keeps the books on a bot's trades: counts, wins and losses, its best and worst, the lessons from its losses."""
@@ -5084,6 +5245,8 @@ class Tournament(FarmMixin):
                         self.learn_lesson(dict(t, strat=v.name, **habit_), pc_)
                     if not self.replaying:
                         self.note_habit(v, t, pc_)
+                    if isinstance(v.sim, OptionSim) and not is_scalp(v.name) and not is_kami(v):
+                        self.control_book["farm"].append(round(pc_, 2))  # (against the coin-flip bots')
                     if not self.replaying and isinstance(v.sim, OptionSim) and not is_scalp(v.name) and not is_kami(v) \
                             and (t.get("contract") or {}).get("t0"):
                         judge_learn(trade_features(dict(t, strat=v.name, tf=v.tf)), pc_ > 0)
@@ -5131,6 +5294,7 @@ class Tournament(FarmMixin):
             self.add_cool[k] = max(0, self.add_cool.get(k, 0) - 1)
         for v in self.vars:
             self._run(v, closes, self.n, self.mood)
+        self._run_controls(closes)
         self._rate()
         for v in self.vars:
             if self.info[id(v)]["status"] == "active":
@@ -5544,6 +5708,7 @@ class Tournament(FarmMixin):
             self._spawn_or_random(closes)
         self.scalp_balance(closes)
         self.kami_balance(closes)
+        self.control_balance(closes)
         self.evolves += 1
         k_isl = int(self.o.get("islands", 1) or 1)
         if k_isl > 1 and self.evolves % 8 == 0:
@@ -5846,6 +6011,7 @@ class Tournament(FarmMixin):
                     legends=getattr(self, "legends", []), lessons=getattr(self, "lessons", {}),
                     instincts={k: list(x) for k, x in self.instincts.items()}, instinct_best=dict(self.instinct_best),
                     trial_book=getattr(self, "trial_book", {}),
+                    control_book={k: list(x) for k, x in getattr(self, "control_book", {}).items()},
                     hold_curve=list(getattr(self, "hold_curve", []))[-(self.W * 10 + 2):], bots=bots,
                     lineage={str(k): v for k, v in lineage.items()})
 
@@ -5948,6 +6114,9 @@ class Tournament(FarmMixin):
                           for k, x in (st.get("instincts") or {}).items() if isinstance(x, (list, tuple)) and len(x) >= 2}
         self.instinct_best = {k: g for k, g in (st.get("instinct_best") or {}).items() if isinstance(g, dict)}
         self.trial_book = {k: list(x) for k, x in (st.get("trial_book") or {}).items()}
+        cb = st.get("control_book") or {}
+        self.control_book = {k: deque([float(y) for y in (cb.get(k) or [])][-CONTROL_KEEP:], maxlen=CONTROL_KEEP)
+                             for k in ("farm", "flip")}
         hc = st.get("hold_curve") or [1.0]
         self.hold_curve = deque(hc, maxlen=self.W * 10 + 2)
         self.scoreboard_reset = False

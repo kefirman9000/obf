@@ -161,6 +161,10 @@ SETTING_GROUPS = [
         ("open_calm", "Opening calm: minutes after the 9:30 open when safety stops (bots' and the account's) wait "
                       "unless the loss is deep (twice the stop, at most 60%), and time-decay and volatility exits wait. "
                       "Bid/ask gaps are widest then and the first prints can be far off. Example: 5 (0 = off)", int),
+        ("min_hold", "Minimum hold: minutes every bot keeps a contract before its signals, trailing stop, time limit or "
+                     "decay exits may sell it. A profit target, a deep loss (twice its stop, at most 60%), expiry and "
+                     "going flat at the close still sell. Quick round trips lost to the bid/ask gap. Scalpers and "
+                     "kamikazes are exempt. Example: 60 (0 = off)", int),
         ("bot_allowance", "Allowance per bot: the most of your starting money that one bot's buy votes may have tied up "
                           "at once. Stops one bad dragon draining the account. Example: 25 with $1,000 = $250 per bot (0 = no limit)", float),
     ]),
@@ -180,6 +184,9 @@ SETTING_GROUPS = [
                         "days to expiry, time of day, strategy, pace, volatility, the signal's school grade). Once it has "
                         "300 trades and predicts better than guessing, half the bots skip trades it gives under 60% of "
                         "the farm's usual chance of winning", bool),
+        ("controls", "Coin-flip check: a few bots beside the farm open contracts at random, on the farm's own "
+                     "contracts and exits, so you can see whether the farm's picks beat chance (Learning > Signal "
+                     "school, and the report). They never trade the account or join the farm", bool),
         ("keep_variety", "Keep backup strategies: when one strategy fills over half the farm, half the new eggs try other "
                          "strategies, and the last two of any strategy are dropped last", bool),
         ("min_dte", "Minimum days to expiry: bots that hold overnight never buy contracts closer to expiry than this "
@@ -5376,6 +5383,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 breeds=dict(collections.Counter(STRAT_LABELS.get(v.name, v.name) for v in vs)),
                 exams=dict(collections.Counter(E.exam_verdict(v, t.serial)[0] for v in vs if not E.is_kami(v))),
                 exam_bar=round(E.exam_bar(t.serial), 2),
+                coin_flip=t.control_check() if hasattr(t, "control_check") else None,
                 hindsight={k: dict(tries=round(e.get("tries", 0), 2), wins=round(e.get("wins", 0), 2), forward=e.get("fwd"),
                                    best=[b.get("score") for b in e.get("best", [])]) for k, e in (getattr(t, "hindsight", {}) or {}).items()},
                 hindsight_share=t.hindsight_share(), trial_book=getattr(t, "trial_book", {}),
@@ -5508,6 +5516,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         for x in sells:
             by_strat.setdefault(STRAT_LABELS.get(x.get("strategy"), x.get("strategy")), []).append(x["pl_pct"])
         feed = {}
+        mkt_open = bool((getattr(self, "market", None) or {}).get("is_open", True))
         for c in list(self.session_coins or []):
             ts = list((self.hx.get(c) or {}).get("t") or [])
             if len(ts) < 3:
@@ -5521,7 +5530,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                     and E.minutes_to_close(a) > 0 and datetime.fromtimestamp(a).date() == datetime.fromtimestamp(b).date()]
             feed[c] = dict(bars=len(ts), candle_s=step, first=datetime.fromtimestamp(ts[0]).isoformat(timespec="minutes"),
                            last=datetime.fromtimestamp(ts[-1]).isoformat(timespec="minutes"),
-                           last_age_s=round(time.time() - ts[-1]), gaps_today=gaps[-30:], implied_vol=E.IV_HINT.get(c),
+                           last_age_s=round(time.time() - ts[-1]), market_open=mkt_open, gaps_today=gaps[-30:],
+                           implied_vol=E.IV_HINT.get(c),
                            pricing_vol=round(E.pricing_vol(self.hist.get(c) or [1], ts), 4))
         afford = {}
         size = self.start_cash * float(self.settings.get("trade_pct", 10)) / 100
@@ -5543,6 +5553,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             sc = [t_.score(v) for v in t_.vars]
             farms[name] = dict(bots=len(t_.vars), scored=sum(1 for x in sc if x is not None),
                                no_trades_yet=sum(1 for v in t_.vars if not v.ntrades),
+                               coin_flip=t_.control_check() if hasattr(t_, "control_check") else None,
                                score_pct=dist([x * 100 for x in sc if x is not None]),
                                instincts={k: dict(record_pct=round(r[0] * 100, 2), reviews=r[1])
                                           for k, r in (getattr(t_, "instincts", {}) or {}).items()},
@@ -5584,6 +5595,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             out.append(f"- {name}: {f['bots']} bots, {f['scored']} have a score, {f['no_trades_yet']} haven't traded yet.")
             if f["bots"] and f["scored"] < 0.25 * f["bots"]:
                 out.append(f"  ! Under a quarter of {name}'s bots can be judged, so the farm learns slowly.")
+            cf = f.get("coin_flip") or {}
+            if cf.get("text"):
+                out.append(("  ! " if cf.get("verdict") in ("loses to", "no clear difference") else "  ") + cf["text"])
         for c, x in (d.get("contract_costs") or {}).items():
             if not x["affordable"]:
                 out.append(f"  ! {c}: a typical contract costs ${x['contract_2pct_otm_14d']:,.0f}, more than the bots' "
@@ -5593,7 +5607,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 g = x["gaps_today"]
                 out.append(f"  ! {c}: {len(g)} gap(s) in today's prices while the market was open, the longest "
                            f"{max(y[2] for y in g):.0f} min (e.g. {g[-1][0]} to {g[-1][1]}).")
-            if x.get("last_age_s", 0) > 600:
+            if x.get("last_age_s", 0) > 600 and x.get("market_open", True):  # (no candles while it's closed)
                 out.append(f"  ! {c}: no new candle for {x['last_age_s'] // 60} min.")
         if d.get("errors_log"):
             out.append(f"- errors.log: {sum(1 for l in d['errors_log'] if l.startswith('---'))} recent entries.")
@@ -5606,7 +5620,10 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         out = ["--- account ---", json.dumps(d["account"], default=str)]
         for name, f in d["farms"].items():
             out += [f"--- {name} ---", f"{f['bots']} bots ({f['tried']} tried), status {f['status']}, exams {f['exams']} "
-                                       f"(bar {f['exam_bar']}), conditions now {f['conditions']}", "top bots:"]
+                                       f"(bar {f['exam_bar']}), conditions now {f['conditions']}"]
+            if f.get("coin_flip"):
+                out.append(f["coin_flip"]["text"])
+            out.append("top bots:")
             out += [f"  {b['nickname']} {b['strategy']} {b['status']} score {b['score_pct']}% exam {b['exam'][0]} "
                     f"trades {b['lifetime']['trades']} winrate {b['lifetime']['winrate']}" for b in f["top_bots"][:10]]
         fr = d["free_roam"]
@@ -10451,11 +10468,11 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
     # ---------------- farm presets ----------------
     PRESETS = {
-        "Calm": dict(max_bots=24, evolve_every=36, winner_boost=1.5, fail_drop=2.0, retire_hours=24.0, classic_rate=15,
+        "Calm": dict(max_bots=24, evolve_every=36, winner_boost=1.5, fail_drop=2.0, retire_hours=96.0, classic_rate=15,
                      long_holds=True),
-        "Balanced": dict(max_bots=30, evolve_every=24, winner_boost=2.5, fail_drop=3.0, retire_hours=12.0, classic_rate=25,
+        "Balanced": dict(max_bots=30, evolve_every=24, winner_boost=2.5, fail_drop=3.0, retire_hours=48.0, classic_rate=25,
                          long_holds=True),
-        "Wild": dict(max_bots=80, evolve_every=12, winner_boost=3.0, fail_drop=4.0, retire_hours=6.0, classic_rate=35,
+        "Wild": dict(max_bots=80, evolve_every=12, winner_boost=3.0, fail_drop=4.0, retire_hours=24.0, classic_rate=35,
                      long_holds=True),
     }
     PRESET_TIPS = {"Calm": "fewer bots, slower evolution, small trade sizes for winners, patient",
@@ -16445,9 +16462,11 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         d = E.load_json(self.learning_path(), {}) or {}
         try:
             E.SCHOOL.clear()
-            E.SCHOOL.update({k: {h: [float(y) for y in x][:4] for h, x in hs.items()} for k, hs in (d.get("school") or {}).items()})
             E.SCHOOL_SEEN.clear()
-            E.SCHOOL_SEEN.update({k: float(x) for k, x in (d.get("seen") or {}).items()})
+            if int(d.get("school_rev", 1) or 1) >= E.SCHOOL_REV:  # (older books counted overlapping signals: regraded)
+                E.SCHOOL.update({k: {h: [float(y) for y in x][:4] for h, x in hs.items()}
+                                 for k, hs in (d.get("school") or {}).items()})
+                E.SCHOOL_SEEN.update({k: float(x) for k, x in (d.get("seen") or {}).items()})
             j = d.get("judge") or {}
             if j.get("w"):
                 E.JUDGE.update(w={k: float(x) for k, x in j["w"].items()}, n=int(j.get("n", 0)), wins=float(j.get("wins", 0)),
@@ -16460,7 +16479,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             return
         try:
             data = dict(school={k: {h: list(x) for h, x in dict(hs).items()} for k, hs in dict(E.SCHOOL).items()},
-                        seen=dict(E.SCHOOL_SEEN), judge=dict(w=dict(E.JUDGE["w"]), n=E.JUDGE["n"], wins=E.JUDGE["wins"],
+                        school_rev=E.SCHOOL_REV, seen=dict(E.SCHOOL_SEEN), judge=dict(w=dict(E.JUDGE["w"]), n=E.JUDGE["n"], wins=E.JUDGE["wins"],
                                                              brier=list(E.JUDGE["brier"])))
         except RuntimeError:  # (the farm changed it mid-copy: the next save gets it)
             return
@@ -16502,6 +16521,16 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                                      daemon=True).start()
         except Exception:
             self._record_error("signal school")
+        try:  # every 3 hours: does the farm beat its coin-flip bots?
+            t = self.tourn
+            if t is not None and hasattr(t, "control_check") and time.time() - getattr(self, "_flip_note", 0) >= 3 * 3600:
+                cf = t.control_check()
+                if cf["verdict"] != "too few":
+                    self._flip_note = time.time()
+                    self.write(cf["text"] + " (Learning > Signal school)",
+                               "good" if cf["verdict"] == "beats" else "warn" if cf["verdict"] == "loses to" else "info")
+        except Exception:
+            self._record_error("coin-flip check")
         if not self.closing():
             self.root.after(300000, self.school_tick)
 
@@ -16535,6 +16564,12 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         txt.tag_configure("bad", foreground=RED)
         txt.tag_configure("dim", foreground=MUTED)
         put = lambda s_, tag=None: txt.insert("end", s_, tag)
+        if self.tourn is not None and hasattr(self.tourn, "control_check"):
+            cf = self.tourn.control_check()
+            put("COIN-FLIP CHECK\n", "h")
+            put(cf["text"] + "\n", "good" if cf["verdict"] == "beats" else "bad" if cf["verdict"] == "loses to" else None)
+            put("A few bots beside the farm open contracts at random, but with the farm's own contracts and exits. If the "
+                "farm can't beat them, its signals aren't what's losing money: its contracts and exits are.\n\n", "dim")
         put("SIGNAL SCHOOL\n", "h")
         put("Every buy and sell signal is graded on what the stock did next, measured in the stock's own usual move over "
             "that time (its 'swings'): +0.10 means signals of that kind were followed by a move a tenth of a usual swing "
