@@ -1699,6 +1699,7 @@ DEFAULT_SETTINGS = {
     "max_otm": 10.0,             # farthest out of the money any bot or the account buys (%); bots learn their own limit under it
     "open_calm": 5,              # minutes after the open when stops wait unless the loss is deep (0 = off)
     "min_hold": 60,              # minutes a bot holds a contract before its signals, trailing stop or time limit may sell
+    "overlord": True,            # one model learns from every kind of bot's signals (watch and report only, for now)
     "controls": True,            # coin-flip control bots run beside the farm (outside it), to see if its picks beat chance
     "signal_school": True,       # bots skip signals whose graded move can't pay for the contract (half the farm)
     "trade_judge": True,         # one model learns from every finished trade and blocks likely losers (half the farm)
@@ -2909,12 +2910,13 @@ def school_grade(key, h, tod=None):
     return None
 
 
-def school_study(closes, extra, genes, since=None, stop=None, progress=None):
+def school_study(closes, extra, genes, since=None, stop=None, progress=None, overlord=True):
     """Grades every signal the given kinds of bot [(strategy, params, pace)] give on this history: what the stock did
     over the next 15, 60 and 240 minutes, in its own swings. Only candles after since[ticker] (bar times) are graded,
     and only ones with all the horizons ahead of them. -> dict(book={key: grades}, until={ticker: newest bar time
-    graded}, signals=count)."""
+    graded}, signals=count, overlord=[examples for the overlord, oldest first] (see overlord_examples))."""
     book, until, count = {}, {}, 0
+    ol_ex = []
     seen_g = set()
     gl = []
     for name, params, tf in genes:
@@ -2949,7 +2951,8 @@ def school_study(closes, extra, genes, since=None, stop=None, progress=None):
             while start <= last and times[start] <= lo:
                 start += 1
         events = []  # (candle, kind of signal, +1 buy / -1 sell), from every bot kind, graded below in time order
-        for name, params, tf in gl:
+        gsig = [[] for _ in gl]  # each bot kind's own signals [(candle, +1/-1)], for the overlord
+        for gi, (name, params, tf) in enumerate(gl):
             if stop and stop():
                 raise TrainingStopped()
             hlv = STRATS[name].get("hlv")
@@ -2963,6 +2966,7 @@ def school_study(closes, extra, genes, since=None, stop=None, progress=None):
                     continue
                 count += 1
                 events.append((i, school_key(name, tf, sig), 1 if sig == "buy" else -1))
+                gsig[gi].append((i, 1 if sig == "buy" else -1))
             done += 1
             if progress:
                 progress(done, total)
@@ -2986,9 +2990,238 @@ def school_study(closes, extra, genes, since=None, stop=None, progress=None):
                 z = max(-6.0, min(6.0, mv / (base * hb[h] ** 0.5 * 100)))
                 _school_add(book, key, f"h{h}", z, mv)
                 _school_add(book, key, f"{tod}:h{h}", z, mv)
+        if overlord:
+            ol_ex += overlord_examples(c, P, times, cum, bm, gl, gsig, start, last)
         if times and last < len(times):
             until[c] = times[last]
-    return dict(book=book, until=until, signals=count)
+    ol_ex.sort(key=lambda e: e[0])
+    return dict(book=book, until=until, signals=count, overlord=ol_ex)
+
+
+# ---------------- the overlord: one model that watches every kind of bot ----------------
+# The account only ever heard from a few proven bots (or, with none proven, stand-ins on a lucky streak); what the other
+# bots were saying was thrown away. The overlord watches all of them: every 15 minutes, on every ticker, how each kind
+# of bot (strategy and pace) is leaning, how many different strategies agree, the time of day, how wild the stock is
+# and which way it has been going. It learns to predict whether a call (or a put) bought then would have paid for
+# itself an hour later: the stock moving past what a contract 2% out of the money and 14 days out needs to pay back its
+# bid/ask gap and decay (the Signal school's cost to beat), on the session's own candles and every Free roam stretch.
+# Each example is scored before it's learned from, so its skill (against always guessing the usual rate) is measured
+# on data it hadn't seen. It only watches and reports for now: nothing it says trades.
+OL_H = 60          # minutes ahead each example is graded at
+OL_STRIDE = 15     # minutes between examples (so 4 examples share each hour: its count of independent ones is a quarter)
+OL_RECENT = 15     # a bot kind's signal counts as "saying" buy/sell for this many minutes (or its own pace if longer)
+OL_OTM, OL_DTE = 2.0, 14  # the contract the overlord's examples are graded for
+OL_LR, OL_L2 = 0.02, 0.0005
+OL_MIN_EFF = 200   # independent hours graded before its skill is reported
+OL_FADE = 40000    # past this many scored, its skill counts halve (recent examples count most)
+OVERLORD = {}      # "b" (calls) / "s" (puts) -> {"w": weights, "n": examples, "wins": paid, "brier": [scored, model, base]}
+
+
+def _ol_kind(name, tf):
+    return f"{name}|{pace_bucket(tf)}"
+
+
+def overlord_features(leans, tod, swing_ratio, trend_z):
+    """What the overlord looks at for one ticker at one moment: each bot kind's lean (-1 all say sell .. +1 all say
+    buy), how many different strategies lean each way, time of day, how wild the stock is against its usual and which
+    way it has been going (in its own swings)."""
+    f = {"bias": 1.0}
+    up, down = set(), set()
+    for k, x in leans.items():
+        if x:
+            f["lean:" + k] = round(x, 3)
+            (up if x > 0 else down).add(k.split("|")[0])
+    f["agree:buy"] = min(1.0, len(up) / 8)
+    f["agree:sell"] = min(1.0, len(down) / 8)
+    f["tod:" + tod] = 1.0
+    f["swing:" + ("calm" if swing_ratio < 0.7 else "wild" if swing_ratio > 1.4 else "normal")] = 1.0
+    f["trend:" + ("up" if trend_z > 1 else "down" if trend_z < -1 else "flat")] = 1.0
+    return f
+
+
+def _ol_context(P, cum, i, hb):
+    """(swing ratio: the last 20 candles' usual move against the last 120's, trend: the last hour's move in swings)."""
+    b120 = (cum[i] - cum[i - SCHOOL_SWING_BARS]) / SCHOOL_SWING_BARS
+    b20 = (cum[i] - cum[i - 20]) / 20
+    back = min(hb, i)
+    tz = (P[i] / P[i - back] - 1) / (b120 * back ** 0.5) if b120 > 0 and P[i - back] else 0.0
+    return (b20 / b120 if b120 > 0 else 1.0), tz
+
+
+def _ol_leans(gl, signs):
+    tot, cnt = {}, {}
+    for (name, _, tf), sg in zip(gl, signs):
+        k = _ol_kind(name, tf)
+        cnt[k] = cnt.get(k, 0) + 1
+        tot[k] = tot.get(k, 0) + sg
+    return {k: tot[k] / cnt[k] for k in cnt}
+
+
+def _ol_recent(gl, gsig, i, bm):
+    """Each bot kind's latest signal if it came within OL_RECENT minutes (or its own pace) up to candle i, else 0."""
+    out = []
+    for (name, _, tf), ev in zip(gl, gsig):
+        win = max(int(round(OL_RECENT / bm)), tf)
+        j = bisect.bisect_right(ev, (i, 2)) - 1
+        out.append(ev[j][1] if j >= 0 and ev[j][0] > i - win else 0)
+    return out
+
+
+def overlord_need(c, P, times, upto):
+    """The moves (%) a call and a put 2% out, 14 days out, need within an hour to pay for themselves (None: unknown)."""
+    S = P[upto]
+    vol = pricing_vol(P[:upto + 1], times[:upto + 1] if times else None)
+    return (breakeven_move(c, S, "call", OL_OTM, OL_DTE, vol, OL_H), breakeven_move(c, S, "put", OL_OTM, OL_DTE, vol, OL_H))
+
+
+def overlord_examples(c, P, times, cum, bm, gl, gsig, start, last):
+    """The overlord's examples on one ticker, every OL_STRIDE minutes from candle start to last (each has its hour
+    ahead): [(bar time or candle, ticker, features, call paid, put paid)]. Features only use candles up to the example."""
+    hb = max(1, int(round(OL_H / bm)))
+    st_ = max(1, int(round(OL_STRIDE / bm)))
+    lo = max(start, SCHOOL_SWING_BARS + 1, 21)
+    hi = min(last, len(P) - 1 - hb)
+    if hi < lo or not gl:
+        return []
+    need_b, need_s = overlord_need(c, P, times, lo)
+    if need_b is None or need_s is None:
+        return []
+    out = []
+    for i in range(lo, hi + 1):
+        if times and i < len(times):
+            if int(times[i] // 60) % max(1, int(round(OL_STRIDE))) and bm < OL_STRIDE:
+                continue  # (on a fixed clock grid, so live runs and replays pick the same moments)
+        elif i % st_:
+            continue
+        if not P[i]:
+            continue
+        sr, tz = _ol_context(P, cum, i, hb)
+        tod = tod_bucket(times[i]) if times and i < len(times) else "m"
+        f = overlord_features(_ol_leans(gl, _ol_recent(gl, gsig, i, bm)), tod, sr, tz)
+        mv = (P[i + hb] / P[i] - 1) * 100
+        out.append((times[i] if times and i < len(times) else i, c, f, mv >= need_b, -mv >= need_s))
+    return out
+
+
+def _ol_model(side):
+    return OVERLORD.setdefault(side, {"w": {}, "n": 0, "wins": 0.0, "brier": [0.0, 0.0, 0.0]})
+
+
+def overlord_prob(side, f):
+    w = _ol_model(side)["w"]
+    z = max(-30.0, min(30.0, sum(w.get(k, 0.0) * x for k, x in f.items())))
+    return 1 / (1 + math.exp(-z))
+
+
+def overlord_learn(f, paid_call, paid_put):
+    """One example: scored first (against the usual rate, so its skill is measured on data it hadn't seen), then
+    learned from."""
+    for side, y in (("b", paid_call), ("s", paid_put)):
+        m = _ol_model(side)
+        y = 1.0 if y else 0.0
+        p = overlord_prob(side, f)
+        base = (m["wins"] + 1) / (m["n"] + 2)
+        b = m["brier"]
+        if b[0] >= OL_FADE:
+            b[:] = [x / 2 for x in b]
+        b[0] += 1
+        b[1] += (p - y) ** 2
+        b[2] += (base - y) ** 2
+        err = y - p
+        w = m["w"]
+        for k, x in f.items():
+            w[k] = w.get(k, 0.0) + OL_LR * (err * x - OL_L2 * w.get(k, 0.0))
+        m["n"] += 1
+        m["wins"] += y
+
+
+def merge_overlord(examples):
+    """Learns from a study's examples, oldest first. -> how many."""
+    for e in examples or []:
+        overlord_learn(e[2], e[3], e[4])
+    return len(examples or [])
+
+
+def overlord_skill(side):
+    """1 - its Brier score / always guessing the usual rate's, on examples it hadn't learned from: above 0 means it
+    knows something. None until it has graded OL_MIN_EFF independent hours."""
+    b = _ol_model(side)["brier"]
+    if b[0] * OL_STRIDE / OL_H < OL_MIN_EFF or b[2] <= 0:
+        return None
+    return 1 - b[1] / b[2]
+
+
+def overlord_status():
+    """For the page and the report: per side, examples, independent hours, how often contracts paid, skill, and the
+    bot kinds it listens to most (its biggest weights)."""
+    out = {}
+    for side, label in (("b", "calls"), ("s", "puts")):
+        m = _ol_model(side)
+        lw = sorted(((k[5:], x) for k, x in m["w"].items() if k.startswith("lean:")), key=lambda kx: -abs(kx[1]))
+        out[label] = dict(examples=int(m["n"]), hours=int(m["brier"][0] * OL_STRIDE / OL_H),
+                          paid=round(m["wins"] / m["n"], 3) if m["n"] else None,
+                          skill=None if overlord_skill(side) is None else round(overlord_skill(side), 4),
+                          listens=[(k, round(x, 3)) for k, x in lw[:6]],
+                          context={k: round(x, 3) for k, x in m["w"].items() if not k.startswith("lean:")})
+    sk = [x["skill"] for x in out.values() if x["skill"] is not None]
+    if not sk:
+        hrs = min(x["hours"] for x in out.values())
+        out["verdict"] = f"Still learning: {hrs} of {OL_MIN_EFF} independent hours graded before its skill counts."
+    elif max(sk) > 0.02:
+        out["verdict"] = (f"It knows something: its calls are {out['calls']['skill'] * 100:+.1f}% and its puts "
+                          f"{out['puts']['skill'] * 100:+.1f}% better than guessing the usual rate.")
+    else:
+        out["verdict"] = ("No skill yet: watching every bot, it predicts contracts paying off no better than guessing "
+                          "the usual rate. Combining the farm's signals doesn't find an edge so far.")
+    return out
+
+
+def overlord_now(closes, extra, genes):
+    """The overlord's read on each ticker right now: {ticker: dict(call=chance a call pays, put=..., usual_call,
+    usual_put, lean)}, from the last candles only."""
+    gl = []
+    seen = set()
+    for name, params, tf in genes:
+        k = (name, json.dumps(params, sort_keys=True), int(tf or 1))
+        if name in STRATS and name != "Dollar-cost averaging" and k not in seen:
+            seen.add(k)
+            gl.append((name, dict(params), max(1, int(tf or 1))))
+    out = {}
+    for c, P in closes.items():
+        x = (extra or {}).get(c) or {}
+        times = x.get("t")
+        bm = bar_minutes_of(x)
+        L = len(P)
+        i = L - 1
+        hb = max(1, int(round(OL_H / bm)))
+        if i <= max(WARM, SCHOOL_SWING_BARS + 1, LOOKBACK // 2) or not gl:
+            continue
+        cum = [0.0] * L
+        for j in range(max(1, i - SCHOOL_SWING_BARS - 1), L):
+            a = P[j - 1]
+            cum[j] = cum[j - 1] + (abs(P[j] / a - 1) if a else 0.0)
+        gsig = []
+        for name, params, tf in gl:
+            hlv = STRATS[name].get("hlv")
+            win = max(int(round(OL_RECENT / bm)), tf)
+            ev = []
+            for j in range(i - win + 1, i + 1):
+                n = j + 1
+                if n % tf:
+                    continue
+                xi = {k: View(v_, n) for k, v_ in x.items()} if hlv and x else None
+                sg = strat_signal(name, View(P, n), n, params, tf, xi)
+                if sg in ("buy", "sell"):
+                    ev.append((j, 1 if sg == "buy" else -1))
+            gsig.append(ev)
+        sr, tz = _ol_context(P, cum, i, hb)
+        f = overlord_features(_ol_leans(gl, _ol_recent(gl, gsig, i, bm)), tod_bucket(times[i]) if times else "m", sr, tz)
+        mb, ms = _ol_model("b"), _ol_model("s")
+        out[c] = dict(call=round(overlord_prob("b", f), 3), put=round(overlord_prob("s", f), 3),
+                      usual_call=round(mb["wins"] / mb["n"], 3) if mb["n"] else None,
+                      usual_put=round(ms["wins"] / ms["n"], 3) if ms["n"] else None,
+                      lean=round(sum(x for k, x in f.items() if k.startswith("lean:")), 2))
+    return out
 
 
 def breakeven_move(c, S, typ, otm_pct, dte_days, vol, hold_min):

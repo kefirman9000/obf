@@ -10,6 +10,20 @@
 
 
 
+## 1.49.0
+- **The overlord.** The account only ever heard from a few proven bots (with none proven, from stand-ins on a lucky
+  streak); what the rest of the farm was saying was thrown away. The overlord is one model that watches every kind of
+  bot: every 15 minutes, on every ticker, how each kind (strategy and pace) is leaning, how many different strategies
+  agree, the time of day, how wild the stock is and which way it has been going. It learns whether a call or a put
+  bought then would have paid for itself an hour later (2% out of the money, 14 days out, after the bid/ask gap and
+  decay: the Signal school's cost to beat). It learns with the Signal school, on the session's own candles and on
+  every Free roam stretch, and each example is scored before it's learned from, so its skill (against always
+  guessing the usual rate) is measured on data it hadn't seen; examples share each hour four ways, so it counts a
+  quarter of them as independent and only reports a skill after 200 independent hours. On random prices it finds no
+  skill; on prices that trend in runs it finds them (+40%) and learns which kinds of bot see them. **It only watches
+  and reports for now**: nothing it says trades. Learning > **Overlord** shows its skill, the kinds of bot it listens
+  to most and its read on each ticker right now; the report has it too. Settings > Wildcard: "Overlord" (on).
+
 ## 1.48.0
 From the 11/19 reports (1,503 bot trades; every bot lost to holding in its exams on unseen prices):
 - **The coin-flip check.** Six bots now run beside every farm and open contracts at random, but on the farm's own

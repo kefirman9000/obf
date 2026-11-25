@@ -180,6 +180,10 @@ SETTING_GROUPS = [
                           "stock did next (15, 60 and 240 minutes), on the session's own candles and in Free roam. Half "
                           "the bots skip a signal when even an optimistic read of its kind can't pay for the contract "
                           "(its bid/ask gap and decay); the other half keep trading as before, for comparison", bool),
+        ("overlord", "Overlord: one model watches every kind of bot (how each is leaning, how many agree, the time of day "
+                     "and how the stock is moving) and learns whether a call or a put would have paid an hour later. It "
+                     "learns along with the Signal school (which must be on) and only reports for now (Learning > "
+                     "Overlord); it doesn't trade", bool),
         ("trade_judge", "Trade judge: one model learns from every finished trade on the farm (call or put, how far out, "
                         "days to expiry, time of day, strategy, pace, volatility, the signal's school grade). Once it has "
                         "300 trades and predicts better than guessing, half the bots skip trades it gives under 60% of "
@@ -4494,14 +4498,14 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
     # ---------------- combined windows (hubs): related tools as tabs of one window ----------------
     HUB_SPEC = {
         "learning": ("Learning", ("Backtest a bot", "Hall of Fame test", "Training camp", "Free roam", "Farm knowledge",
-                                 "Signal school"), (1180, 900)),
+                                 "Signal school", "Overlord"), (1180, 900)),
         "insights": ("Insights", ("Market context", "Economic calendar", "Weekly report", "Farm replay"), (1000, 720)),
         "system": ("System", ("Security", "Disk use", "Diagnostics"), (820, 700)),
         "family": ("Family", ("Family tree", "Bloodlines"), (1120, 680)),
         "help": ("Help", ("How this works", "Words", "Shortcuts"), (820, 640)),
     }
     HUB_REBUILD = {"Market context", "Weekly report", "Security", "Diagnostics", "Hall of Fame test", "Family tree",
-                   "Bloodlines", "Farm replay", "Farm knowledge", "Signal school"}  # light tabs that show fresh data each time they're opened
+                   "Bloodlines", "Farm replay", "Farm knowledge", "Signal school", "Overlord"}  # light tabs that show fresh data each time they're opened
 
     def _hub_builders(self):
         return {"Backtest a bot": lambda f, v=None: self.open_backtest(v, parent=f),
@@ -4510,6 +4514,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 "Free roam": lambda f: self.open_roam(parent=f),
                 "Farm knowledge": lambda f: self.open_knowledge(parent=f),
                 "Signal school": lambda f: self.open_school(parent=f),
+                "Overlord": lambda f: self.open_overlord(parent=f),
                 "Market context": lambda f: self.open_context(parent=f),
                 "Economic calendar": lambda f: self.open_calendar(parent=f),
                 "Weekly report": lambda f: self.show_report(parent=f),
@@ -5425,6 +5430,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             signal_school=dict(families=len(E.SCHOOL), seen=dict(E.SCHOOL_SEEN),
                                h60=[dict(strategy=r[0], pace=r[1], side=r[2], signals=r[3], swings=round(r[4], 3),
                                          se=round(r[5], 3), right=round(r[6], 3)) for r in E.school_rows(60)]),
+            overlord=dict(E.overlord_status(), now=self._overlord_now_safe()),
             trade_judge=dict(trades=E.JUDGE["n"], won=round(E.JUDGE["wins"] / max(1, E.JUDGE["n"]), 3), skill=E.judge_skill(),
                              weights=dict(sorted(((k, round(x, 3)) for k, x in dict(E.JUDGE["w"]).items()),
                                                  key=lambda kv: -abs(kv[1]))[:40])),
@@ -5635,6 +5641,17 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         out += [f"  {r['strategy']} ({r['pace']}) {r['side']}: {r['signals']} signals, {r['swings']:+.3f} +/- {r['se']:.3f}, "
                 f"{r['right'] * 100:.0f}% right" for r in rows[:8] + (rows[-5:] if len(rows) > 13 else rows[8:])]
         out += ["--- Trade judge ---", f"{tj.get('trades', 0)} trades learned, {tj.get('won', 0) * 100:.0f}% won, skill {tj.get('skill')}"]
+        ol = d.get("overlord") or {}
+        if ol:
+            out += ["--- Overlord (watches every kind of bot; doesn't trade yet) ---", ol.get("verdict", "")]
+            for side in ("calls", "puts"):
+                x = ol.get(side) or {}
+                out.append(f"  {side}: {x.get('examples', 0)} examples ({x.get('hours', 0)} independent hours), paid "
+                           f"{(x.get('paid') or 0) * 100:.0f}% of the time, skill {x.get('skill')}; listens most to "
+                           + ", ".join(f"{k} {w:+.2f}" for k, w in (x.get("listens") or [])[:4]))
+            for c, r in (ol.get("now") or {}).items():
+                out.append(f"  now {c}: call {r['call'] * 100:.0f}% (usual {(r['usual_call'] or 0) * 100:.0f}%), "
+                           f"put {r['put'] * 100:.0f}% (usual {(r['usual_put'] or 0) * 100:.0f}%)")
         return "\n".join(out)
 
     def show_diagnostics(self, parent=None):
@@ -7817,6 +7834,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             cur.update(text="Signal school: grading the farm's signals on this stretch")
             try:
                 sres = self.cores.call(E.school_study, closes, extra, self.school_genes(t),
+                                       overlord=bool(self.settings.get("overlord", True)),
                                        stop=lambda: self.tourn is not t or not self.cfg.get("roam_on"))
                 where = f"{self._when(info['start'], True)} to {self._when(info['end'], True)}"
                 self.q.put(("call", lambda: self._school_apply(sres, where, False)))
@@ -16467,6 +16485,12 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 E.SCHOOL.update({k: {h: [float(y) for y in x][:4] for h, x in hs.items()}
                                  for k, hs in (d.get("school") or {}).items()})
                 E.SCHOOL_SEEN.update({k: float(x) for k, x in (d.get("seen") or {}).items()})
+            E.OVERLORD.clear()
+            for side, m in (d.get("overlord") or {}).items():
+                if side in ("b", "s") and isinstance(m, dict):
+                    E.OVERLORD[side] = dict(w={k: float(x) for k, x in (m.get("w") or {}).items()}, n=int(m.get("n", 0)),
+                                            wins=float(m.get("wins", 0)),
+                                            brier=[float(x) for x in (m.get("brier") or [0, 0, 0])][:3])
             j = d.get("judge") or {}
             if j.get("w"):
                 E.JUDGE.update(w={k: float(x) for k, x in j["w"].items()}, n=int(j.get("n", 0)), wins=float(j.get("wins", 0)),
@@ -16479,7 +16503,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             return
         try:
             data = dict(school={k: {h: list(x) for h, x in dict(hs).items()} for k, hs in dict(E.SCHOOL).items()},
-                        school_rev=E.SCHOOL_REV, seen=dict(E.SCHOOL_SEEN), judge=dict(w=dict(E.JUDGE["w"]), n=E.JUDGE["n"], wins=E.JUDGE["wins"],
+                        school_rev=E.SCHOOL_REV, seen=dict(E.SCHOOL_SEEN),
+                        overlord={k: dict(w=dict(m["w"]), n=m["n"], wins=m["wins"], brier=list(m["brier"]))
+                                  for k, m in dict(E.OVERLORD).items()}, judge=dict(w=dict(E.JUDGE["w"]), n=E.JUDGE["n"], wins=E.JUDGE["wins"],
                                                              brier=list(E.JUDGE["brier"])))
         except RuntimeError:  # (the farm changed it mid-copy: the next save gets it)
             return
@@ -16536,7 +16562,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
     def _school_run(self, closes, extra, genes, since, where):
         try:
-            res = self.cores.call(E.school_study, closes, extra, genes, since=since)
+            res = self.cores.call(E.school_study, closes, extra, genes, since=since,
+                                  overlord=bool(self.settings.get("overlord", True)))
         except Exception:
             E.note_error("school_study")
             res = None
@@ -16547,12 +16574,78 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
     def _school_apply(self, res, where, live):
         E.merge_school(res["book"])
+        if (getattr(self, "settings", None) or {}).get("overlord", True):
+            E.merge_overlord(res.get("overlord"))
         if live:
             E.SCHOOL_SEEN.update(res["until"])
         self._learn_saved = 0
         self.save_learning_book()
         if res["signals"]:
             self.write(f"Signal school graded {res['signals']:,} signals on {where} (Learning > Signal school).", "info")
+
+    def _overlord_now_safe(self):
+        """The overlord's read on the session's tickers right now ({} when it can't say)."""
+        try:
+            t = self.tourn
+            if t is None or not self.session_coins or not self.settings.get("overlord", True):
+                return {}
+            closes = {c: list(self.hist.get(c) or [])[-700:] for c in self.session_coins}
+            extra = {c: {k: list(x)[-700:] for k, x in (self.hx.get(c) or {}).items()} for c in self.session_coins}
+            if not all(len(x) > 400 for x in closes.values()):
+                return {}
+            return E.overlord_now(closes, extra, self.school_genes(t))
+        except Exception:
+            E.note_error("overlord_now")
+            return {}
+
+    def open_overlord(self, parent=None):
+        """Learning > Overlord: one model watching every kind of bot, what it has learned, and its read right now."""
+        if parent is None:
+            return self.open_hub("learning", "Overlord")
+        txt = tk.Text(parent, wrap="word", padx=10, pady=8, bg=CARD, fg=TEXT, relief="flat", font=("Consolas", 10))
+        txt.tag_configure("h", font=("", 11, "bold"))
+        txt.tag_configure("good", foreground=GREEN)
+        txt.tag_configure("bad", foreground=RED)
+        txt.tag_configure("dim", foreground=MUTED)
+        put = lambda s_, tag=None: txt.insert("end", s_, tag)
+        st = E.overlord_status()
+        put("THE OVERLORD\n", "h")
+        put("One model that watches every kind of bot on the farm. Every 15 minutes, on every ticker, it sees how each "
+            "kind (strategy and pace) is leaning, how many different strategies agree, the time of day, how wild the "
+            "stock is and which way it has been going, and learns whether a call or a put bought then would have paid "
+            "for itself an hour later (2% out of the money, 14 days out, after its bid/ask gap and decay). Each example "
+            "is scored before it's learned from, so its skill is measured on data it hadn't seen. It learns on the "
+            "session's candles and every Free roam stretch (with the Signal school). It doesn't trade yet.\n\n", "dim")
+        sk = [st[s_]["skill"] for s_ in ("calls", "puts") if st[s_]["skill"] is not None]
+        put(st["verdict"] + "\n\n", "good" if sk and max(sk) > 0.02 else "bad" if sk else None)
+        for side in ("calls", "puts"):
+            x = st[side]
+            put(f"{side.upper()}\n", "h")
+            put(f"  {x['examples']:,} examples ({x['hours']:,} independent hours); a contract paid "
+                f"{(x['paid'] or 0) * 100:.0f}% of the time; skill: "
+                + ("not yet" if x["skill"] is None else f"{x['skill'] * 100:+.1f}% vs guessing") + "\n")
+            if x["listens"]:
+                put("  listens most to: " + ", ".join(
+                    f"{STRAT_LABELS.get(k.split('|')[0], k.split('|')[0])} (every {k.split('|')[1]}) "
+                    f"{'+' if w > 0 else '-'}" for k, w in x["listens"][:5]) + "\n", "dim")
+                put("  (+ = when that kind says buy, " + ("calls" if side == "calls" else "puts")
+                    + " paid more often; - = less often)\n", "dim")
+        now = self._overlord_now_safe()
+        put("\nITS READ RIGHT NOW\n", "h")
+        if not now:
+            put("  nothing yet (it needs a running farm and 400+ candles)\n", "dim")
+        for c, r in now.items():
+            uc, up = r["usual_call"] or 0, r["usual_put"] or 0
+            put(f"  {c}: a call {r['call'] * 100:.0f}% likely to pay (usually {uc * 100:.0f}%), a put "
+                f"{r['put'] * 100:.0f}% (usually {up * 100:.0f}%)")
+            if sk and max(sk) > 0.02 and (r["call"] >= 1.5 * uc or r["put"] >= 1.5 * up):
+                put("  <- it would lean " + ("calls" if r["call"] / max(uc, 1e-9) >= r["put"] / max(up, 1e-9) else "puts"),
+                    "good")
+            put("\n")
+        if not sk:
+            put("  (until it has skill these are only its guesses, not calls)\n", "dim")
+        txt.config(state="disabled")
+        txt.pack(fill="both", expand=True)
 
     def open_school(self, parent=None):
         """Learning > Signal school: how each kind of signal did on the stock, and what a contract needs to pay for itself."""
