@@ -10,6 +10,23 @@
 
 
 
+## 1.50.0
+- **The Overlord has its own tab.** It sits in Learning next to Overview, and a gold strip at the top of Home shows
+  what it's doing and opens it in one click. The tab shows its verdict (learning / no skill yet / knows something),
+  how far it has learned (hours toward the 200 its skill needs), its skill on calls and puts, a chart of its skill
+  as it learns, its read on each ticker right now (the chance a contract bought now pays for itself in an hour,
+  against how often that usually happens), which kinds of bot it listens to and what else it weighs (time of day,
+  how wild the stock is, which way it's going, how many strategies agree). A Learning switch is right there.
+- **Save, export and import overlords.** Save the current one under a name (with a note), keep as many as you like
+  (Saved overlords: use one, export it, delete it), export one to a file and import someone else's. An overlord
+  only knows kinds of bot, not tickers or particular bots, so one trained on one farm works on another. Loading,
+  importing or starting a new one always saves the current one first, and files that aren't overlords (or are
+  damaged) are refused without touching yours. It keeps its record (its skill as it learned) wherever it goes.
+- **Fix: bots joining the farm were dropped again minutes later.** A bot that joins with a replayed history
+  (training-camp graduates, hindsight, legend and mined eggs) looked a full window "old" the moment it arrived; if
+  the replay didn't score it, the next bot to join dropped it to make room. In the 11/26 report 47 of 60 camp
+  graduates went that way, most at the very next camp. They now get a full window of live decisions first.
+
 ## 1.49.0
 - **The overlord.** The account only ever heard from a few proven bots (with none proven, from stand-ins on a lucky
   streak); what the rest of the farm was saying was thrown away. The overlord is one model that watches every kind of

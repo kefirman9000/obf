@@ -3015,6 +3015,12 @@ OL_LR, OL_L2 = 0.02, 0.0005
 OL_MIN_EFF = 200   # independent hours graded before its skill is reported
 OL_FADE = 40000    # past this many scored, its skill counts halve (recent examples count most)
 OVERLORD = {}      # "b" (calls) / "s" (puts) -> {"w": weights, "n": examples, "wins": paid, "brier": [scored, model, base]}
+OVERLORD_HIST = []  # its record as it learns: [time, independent hours, call skill, put skill] (raw, even before it counts)
+OVERLORD_META = {}  # name, when it was born, where it came from (new / loaded / imported), notes
+OL_HIST_STEP = 5   # independent hours between points in its record
+OL_HIST_MAX = 600
+OL_FORMAT = "obf-overlord"  # saved and exported overlords
+OL_MAX_WEIGHTS = 5000
 
 
 def _ol_kind(name, tf):
@@ -3136,10 +3142,88 @@ def overlord_learn(f, paid_call, paid_put):
 
 
 def merge_overlord(examples):
-    """Learns from a study's examples, oldest first. -> how many."""
+    """Learns from a study's examples, oldest first, and adds a point to its record every OL_HIST_STEP independent
+    hours. -> how many."""
+    if not OVERLORD_META.get("born"):
+        OVERLORD_META.update(born=time.time(), origin=OVERLORD_META.get("origin") or "new")
     for e in examples or []:
         overlord_learn(e[2], e[3], e[4])
+    if examples:
+        hrs = int(_ol_model("b")["brier"][0] * OL_STRIDE / OL_H)
+        if not OVERLORD_HIST or hrs - OVERLORD_HIST[-1][1] >= OL_HIST_STEP:
+            OVERLORD_HIST.append([round(time.time()), hrs, _ol_raw_skill("b"), _ol_raw_skill("s")])
+            del OVERLORD_HIST[:-OL_HIST_MAX]
     return len(examples or [])
+
+
+def _ol_raw_skill(side):
+    b = _ol_model(side)["brier"]
+    return round(1 - b[1] / b[2], 4) if b[2] > 0 else None
+
+
+def overlord_pack(name="", note=""):
+    """The whole overlord as plain data, for saving or sharing: what it learned, its scorecard and its record."""
+    return dict(kind=OL_FORMAT, version=1, name=str(name or OVERLORD_META.get("name") or "Overlord"), note=str(note or ""),
+                saved_at=round(time.time()), meta=dict(OVERLORD_META),
+                models={k: dict(w=dict(m["w"]), n=m["n"], wins=m["wins"], brier=list(m["brier"]))
+                        for k, m in OVERLORD.items() if k in ("b", "s")},
+                hist=[list(x) for x in OVERLORD_HIST],
+                summary={k: dict(hours=x["hours"], skill=x["skill"], paid=x["paid"])
+                         for k, x in overlord_status().items() if k in ("calls", "puts")})
+
+
+def _ol_num(x):
+    x = float(x)
+    if not math.isfinite(x):
+        raise ValueError("not a number")
+    return x
+
+
+def overlord_unpack(d):
+    """Checks a saved or imported overlord. -> (models, hist, meta). Raises ValueError when it isn't one."""
+    if not isinstance(d, dict) or d.get("kind") != OL_FORMAT:
+        raise ValueError("this isn't an OBF overlord file")
+    if int(d.get("version", 0) or 0) > 1:
+        raise ValueError("this overlord was saved by a newer OBF: update first")
+    ms = d.get("models")
+    if not isinstance(ms, dict) or not all(isinstance(ms.get(k), dict) for k in ("b", "s")):
+        raise ValueError("this overlord file has no calls and puts models")
+    out = {}
+    try:
+        for k in ("b", "s"):
+            m = ms[k]
+            w = m.get("w") or {}
+            if not isinstance(w, dict) or len(w) > OL_MAX_WEIGHTS:
+                raise ValueError("its weights are damaged")
+            br = [_ol_num(x) for x in (m.get("brier") or [0, 0, 0])][:3]
+            out[k] = dict(w={str(f): max(-50.0, min(50.0, _ol_num(x))) for f, x in w.items()}, n=max(0, int(m.get("n", 0) or 0)),
+                          wins=max(0.0, _ol_num(m.get("wins", 0) or 0)), brier=br + [0.0] * (3 - len(br)))
+        hist = [[_ol_num(y) if y is not None else None for y in row][:4] for row in (d.get("hist") or [])
+                if isinstance(row, (list, tuple)) and len(row) >= 4][-OL_HIST_MAX:]
+    except (TypeError, AttributeError) as e:
+        raise ValueError(f"this overlord file is damaged ({e})")
+    meta = {k: v for k, v in (d.get("meta") or {}).items() if isinstance(k, str) and isinstance(v, (str, int, float))}
+    if d.get("name"):
+        meta["name"] = str(d["name"])[:60]
+    return out, hist, meta
+
+
+def overlord_install(d, origin="loaded"):
+    """Replaces the overlord with a saved one (see overlord_unpack). -> its name."""
+    models, hist, meta = overlord_unpack(d)
+    OVERLORD.clear()
+    OVERLORD.update(models)
+    OVERLORD_HIST[:] = hist
+    OVERLORD_META.clear()
+    OVERLORD_META.update(meta, origin=origin, installed=round(time.time()))
+    return OVERLORD_META.get("name") or "Overlord"
+
+
+def overlord_reset():
+    OVERLORD.clear()
+    OVERLORD_HIST.clear()
+    OVERLORD_META.clear()
+    OVERLORD_META.update(born=time.time(), origin="new")
 
 
 def overlord_skill(side):
@@ -4119,6 +4203,7 @@ class Variant:
         self.royal = False       # descends from a bot you saved (Library / Hall of Fame / team): hatches from a royal egg
         self.classic = ""        # name of the famous strategy it is (silver egg), or "" 
         self.live_n = 0          # decisions made on prices that came in after the bot was created
+        self.live_gate = False   # joined a running farm with a replayed history (see Tournament.young)
         self.live_eq0 = None     # its equity when it started trading live (after any replay)
         self.log = deque(maxlen=300)  # (decision number, coin, side, price) of this bot's own trades, for charts
         self.best_tr = self.worst_tr = None  # its best and worst finished trade, % of what it paid
@@ -5541,6 +5626,17 @@ class Tournament(FarmMixin):
             self.evolve(closes)
 
 
+    def young(self, v):
+        """Too new to judge, so never dropped to make room: within its first window of decisions, counting only
+        decisions on prices that came in after it joined. A bot that joins with a replayed history (training-camp
+        graduates, hindsight, legend and mined eggs) was a full window "old" the moment it arrived; if the replay
+        didn't score it, the next egg dropped it. In the 11/26 report 47 of 60 camp graduates went that way, most of
+        them at the very next camp, minutes later."""
+        if self.score(v) is not None:
+            return False
+        w = self.window_for(v.tf)
+        return v.age < w or (bool(getattr(v, "live_gate", False)) and int(getattr(v, "live_n", 0) or 0) < w)
+
     def score(self, v):
         te = scalp_record(v)
         if te:  # a scalper: its gain over its last trades, however long it waited between them
@@ -6121,6 +6217,7 @@ class Tournament(FarmMixin):
         v.size_mult = min(max(float(size), 0.25), 3.0)
         if closes:
             self.replay(v, closes)
+            v.live_gate = True  # (joined with a replayed history: judged only after a window of live decisions)
         self.vars.append(v)
         self.events.append(f"{note} {v.label}")
         self._rate()
@@ -6220,7 +6317,7 @@ class Tournament(FarmMixin):
     # ---- saving and restoring the whole farm, so it carries on where it left off ----
     _VFIELDS = ("name", "params", "tf", "risk", "traits", "size_mult", "uid", "parents", "gen", "origin", "royal",
                 "classic", "inducted", "strikes", "born_px", "age", "ntrades", "wins", "losses", "win_steps", "streak",
-                "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
+                "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_gate", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
                 "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src", "legend_src", "trade_pcts", "best_pl", "windfalls", "habits")
