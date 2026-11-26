@@ -61,6 +61,9 @@ from datetime import date, datetime, timedelta, timezone
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import engine as E
+import farmcore as _farmcore  # noqa: E402
+_farmcore.NAV_SECTIONS = tuple((n, tuple(t) + ("Overlord",), w) if n == "Learning" else (n, t, w)
+                               for n, t, w in _farmcore.NAV_SECTIONS)  # the Overlord tab lives in Learning, next to Overview
 from farmcore import NAV_SETTINGS, STANDIN_SETTINGS, CoreRunner, FarmAppMixin, NavMixin, FillCheckMixin, LIMIT_SETTINGS, FILL_SETTINGS, EARN_SETTINGS, earnings_loop  # safety limits and the farm doctor, shared by the apps
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
@@ -2066,8 +2069,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
-        t0, t1, t7, t8, tm, tt, tb, ts, tf_, tsu, tal = (ttk.Frame(nb) for _ in range(11))
+        t0, t1, t7, t8, tm, tt, tb, ts, tf_, tsu, tal, tol = (ttk.Frame(nb) for _ in range(12))
         nb.add(tf_, text="  \u2630 Overview  ")
+        nb.add(tol, text="  \u265b Overlord  ")
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t7, text="  \u25c7 Slow farm  ")
         nb.add(t8, text="  Options  ")
@@ -2102,6 +2106,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         self.build_botpos_tab(tb)
         self.build_alpaca_tab(tal)
         self.build_features_tab(tf_)
+        self.build_overlord_tab(tol)
         self.build_success_tab(tsu)
         sn_ = ttk.Notebook(ts)  # Scalpers = the live scalp lab + the market scan
         sn_.pack(fill="both", expand=True, pady=(4, 0))
@@ -13092,6 +13097,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             self.refresh_alpaca(quiet=True)
         elif "Overview" in tab:
             self.refresh_features()
+        elif "Overlord" in tab:
+            self.refresh_overlord()
         elif "Scalp scan" in tab:
             self.refresh_scan()
         elif tab == "Scalp lab":
@@ -13303,6 +13310,9 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             ("\u2605", "Shadow Live", "Follows only your Hall of Fame bots with pretend money in real time, so you see how "
                                     "your champions would do on their own.",
              shadow_status, s_("shadow_live"), lambda: (self.show_tab("Bot Farm"), self._grid_set_filter("Hall of Fame"))),
+            ("\u265b", "Overlord", "One model that watches every kind of bot and learns whether a call or a put would "
+                                  "pay an hour later. Save it, export it, import someone else's. It doesn't trade yet.",
+             lambda: E.overlord_status()["verdict"], s_("overlord"), lambda: self.show_tab("Overlord")),
             ("\U0001f4d6", "Farm knowledge", "Everything the farm has learned, with the evidence: save it as a book and teach "
                                            "it to another farm.",
              know_status, None, lambda: self.open_knowledge()),
@@ -16486,11 +16496,15 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                                  for k, hs in (d.get("school") or {}).items()})
                 E.SCHOOL_SEEN.update({k: float(x) for k, x in (d.get("seen") or {}).items()})
             E.OVERLORD.clear()
-            for side, m in (d.get("overlord") or {}).items():
-                if side in ("b", "s") and isinstance(m, dict):
-                    E.OVERLORD[side] = dict(w={k: float(x) for k, x in (m.get("w") or {}).items()}, n=int(m.get("n", 0)),
-                                            wins=float(m.get("wins", 0)),
-                                            brier=[float(x) for x in (m.get("brier") or [0, 0, 0])][:3])
+            E.OVERLORD_HIST.clear()
+            E.OVERLORD_META.clear()
+            ol = d.get("overlord") or {}
+            if isinstance(ol.get("b"), dict) and isinstance(ol.get("s"), dict):
+                try:
+                    E.overlord_install(dict(kind=E.OL_FORMAT, version=1, models=ol, hist=d.get("overlord_hist") or [],
+                                            meta=d.get("overlord_meta") or {}), origin=(d.get("overlord_meta") or {}).get("origin", "new"))
+                except ValueError:
+                    E.note_error("load overlord")
             j = d.get("judge") or {}
             if j.get("w"):
                 E.JUDGE.update(w={k: float(x) for k, x in j["w"].items()}, n=int(j.get("n", 0)), wins=float(j.get("wins", 0)),
@@ -16505,7 +16519,8 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             data = dict(school={k: {h: list(x) for h, x in dict(hs).items()} for k, hs in dict(E.SCHOOL).items()},
                         school_rev=E.SCHOOL_REV, seen=dict(E.SCHOOL_SEEN),
                         overlord={k: dict(w=dict(m["w"]), n=m["n"], wins=m["wins"], brier=list(m["brier"]))
-                                  for k, m in dict(E.OVERLORD).items()}, judge=dict(w=dict(E.JUDGE["w"]), n=E.JUDGE["n"], wins=E.JUDGE["wins"],
+                                  for k, m in dict(E.OVERLORD).items()},
+                        overlord_hist=[list(x) for x in E.OVERLORD_HIST], overlord_meta=dict(E.OVERLORD_META), judge=dict(w=dict(E.JUDGE["w"]), n=E.JUDGE["n"], wins=E.JUDGE["wins"],
                                                              brier=list(E.JUDGE["brier"])))
         except RuntimeError:  # (the farm changed it mid-copy: the next save gets it)
             return
@@ -16583,8 +16598,540 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         if res["signals"]:
             self.write(f"Signal school graded {res['signals']:,} signals on {where} (Learning > Signal school).", "info")
 
-    def _overlord_now_safe(self):
-        """The overlord's read on the session's tickers right now ({} when it can't say)."""
+    # ---------------- the Overlord: its own tab, its saved brains, and a banner on Home ----------------
+    OL_GOLD, OL_CALL, OL_PUT = "#d4a017", "#3b82f6", "#f59e0b"
+
+    def ol_dir(self):
+        d = os.path.join(E.HOME_DIR, "overlords")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def ol_saved(self):
+        """Saved overlords, newest first: [(path, data)] (unreadable files are left out)."""
+        out = []
+        for fn in os.listdir(self.ol_dir()):
+            if fn.endswith(".json"):
+                p = os.path.join(self.ol_dir(), fn)
+                d = E.load_json(p)
+                if isinstance(d, dict) and d.get("kind") == E.OL_FORMAT:
+                    out.append((p, d))
+        stamp = lambda p_: int((re.search(r"-(\d+)\.json$", p_) or [0, 0])[1])  # (ties: the file's own timestamp)
+        out.sort(key=lambda pd: (-float(pd[1].get("saved_at") or 0), -stamp(pd[0])))
+        return out
+
+    def _ol_hours(self):
+        return E.overlord_status()["calls"]["hours"]
+
+    def _ol_write(self, data):
+        """Saves an overlord into the saved list. -> its path."""
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", data.get("name") or "overlord").strip("-")[:40] or "overlord"
+        ms = self._ol_stamp = max(int(time.time() * 1000), getattr(self, "_ol_stamp", 0) + 1)  # (newest sorts first)
+        p = os.path.join(self.ol_dir(), f"{slug}-{ms}.json")
+        E.save_json(p, data)
+        return p
+
+    def _ol_backup(self, why):
+        """Keeps a copy of the current overlord before it's replaced (when it has learned anything)."""
+        if E.OVERLORD.get("b", {}).get("n"):
+            self._ol_write(E.overlord_pack(f"Backup before {why} {datetime.now():%b %d %H:%M}",
+                                           "kept automatically before it was replaced"))
+
+    def _ol_changed(self, msg):
+        self._learn_saved = 0
+        self.save_learning_book()
+        self._ol_now_cache = None
+        self.write(msg, "good")
+        self.refresh_overlord(force=True)
+
+    def ol_save_as(self, parent=None):
+        if not E.OVERLORD.get("b", {}).get("n"):
+            return messagebox.showinfo("Overlord", "Your overlord hasn't learned anything yet, so there's nothing to save.",
+                                       parent=parent or self.root)
+        name = simpledialog.askstring("Save the overlord", "Name it:", parent=parent or self.root,
+                                      initialvalue=E.OVERLORD_META.get("name") or f"Overlord {datetime.now():%b %d}")
+        if not name:
+            return
+        note = simpledialog.askstring("Save the overlord", "A note (optional):", parent=parent or self.root) or ""
+        E.OVERLORD_META["name"] = name.strip()[:60]
+        self._ol_write(E.overlord_pack(name.strip()[:60], note))
+        self._learn_saved = 0
+        self.save_learning_book()
+        self.write(f"♛ Saved the overlord as '{name.strip()[:60]}' ({self._ol_hours():,} hours learned). "
+                   "Overlord > Saved overlords.", "good")
+        self.refresh_overlord(force=True)
+
+    def ol_load(self, data, origin="loaded", parent=None):
+        try:
+            E.overlord_unpack(data)
+        except ValueError as e:
+            return messagebox.showerror("Overlord", str(e), parent=parent or self.root)
+        hrs = int(((data.get("summary") or {}).get("calls") or {}).get("hours") or 0)
+        if not messagebox.askyesno("Overlord", f"Replace your overlord ({self._ol_hours():,} hours learned) with "
+                                               f"'{data.get('name') or 'Overlord'}' ({hrs:,} hours)?\n\nYours is saved "
+                                               "first (Saved overlords), so you can bring it back.", parent=parent or self.root):
+            return
+        self._ol_backup("loading another")
+        name = E.overlord_install(data, origin=origin)
+        self._ol_changed(f"♛ The overlord is now '{name}'. It keeps learning from here.")
+
+    def ol_export(self, data=None, parent=None):
+        data = data or E.overlord_pack()
+        if not data["models"].get("b", {}).get("n"):
+            return messagebox.showinfo("Overlord", "Your overlord hasn't learned anything yet, so there's nothing to export.",
+                                       parent=parent or self.root)
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", data.get("name") or "overlord").strip("-") or "overlord"
+        p = filedialog.asksaveasfilename(title="Export the overlord", defaultextension=".json", parent=parent or self.root,
+                                         initialfile=f"{slug}.obf-overlord.json",
+                                         filetypes=[("OBF overlord", "*.json"), ("All files", "*.*")])
+        if not p:
+            return
+        try:
+            E.save_json(p, data)
+        except OSError as e:
+            return messagebox.showerror("Overlord", f"Couldn't write the file: {e}", parent=parent or self.root)
+        self.write(f"♛ Exported the overlord '{data.get('name')}' to {p}. Another OBF can import it "
+                   "(Overlord > Import).", "good")
+
+    def ol_import(self, parent=None):
+        p = filedialog.askopenfilename(title="Import an overlord", parent=parent or self.root,
+                                       filetypes=[("OBF overlord", "*.json"), ("All files", "*.*")])
+        if not p:
+            return
+        d = E.load_json(p)
+        try:
+            E.overlord_unpack(d)
+        except ValueError as e:
+            return messagebox.showerror("Overlord", f"Couldn't import {os.path.basename(p)}: {e}", parent=parent or self.root)
+        d = dict(d, note=(d.get("note") or "") + f" (imported from {os.path.basename(p)})")
+        self._ol_write(d)
+        self.write(f"♛ Imported the overlord '{d.get('name')}' into Saved overlords.", "good")
+        self.refresh_overlord(force=True)
+        if messagebox.askyesno("Overlord", f"'{d.get('name')}' is in your saved overlords. Use it now?",
+                               parent=parent or self.root):
+            self.ol_load(d, origin=f"imported from {os.path.basename(p)}", parent=parent)
+
+    def ol_reset(self, parent=None):
+        if not messagebox.askyesno("Overlord", "Start a new overlord from nothing? The current one is saved first "
+                                               "(Saved overlords).", parent=parent or self.root):
+            return
+        self._ol_backup("starting over")
+        E.overlord_reset()
+        self._ol_changed("♛ A new overlord was born. It starts learning with the next Signal school pass.")
+
+    def ol_library(self):
+        """Saved overlords: load one, export it, or delete it."""
+        w = tk.Toplevel(self.root)
+        w.title("Saved overlords")
+        w.geometry("860x420")
+        w.configure(bg=BG)
+        tk.Label(w, text="♛ Saved overlords", bg=BG, fg=TEXT, font=("", 14, "bold")).pack(anchor="w", padx=12, pady=(10, 0))
+        tk.Label(w, text="Each one is a whole overlord: what it learned, its scorecard and its record. Loading one replaces "
+                         "the current overlord (which is saved first).", bg=BG, fg=MUTED, wraplength=820,
+                 justify="left").pack(anchor="w", padx=12, pady=(2, 6))
+        box = tk.Frame(w, bg=BG)
+        box.pack(fill="both", expand=True, padx=12)
+        tree = self.make_tree(box, ("name", "saved", "hours", "calls", "puts", "note"), (200, 120, 70, 80, 80, 280),
+                              ("Name", "Saved", "Hours", "Calls skill", "Puts skill", "Note"))
+        rows = {}
+
+        def fill():
+            tree.delete(*tree.get_children())
+            rows.clear()
+            for p, d in self.ol_saved():
+                sm = d.get("summary") or {}
+                sk = lambda k: "-" if (sm.get(k) or {}).get("skill") is None else f"{sm[k]['skill'] * 100:+.1f}%"
+                iid = tree.insert("", "end", values=(d.get("name") or "Overlord",
+                                                     datetime.fromtimestamp(float(d.get("saved_at") or 0)).strftime("%b %d %H:%M"),
+                                                     f"{int((sm.get('calls') or {}).get('hours') or 0):,}", sk("calls"),
+                                                     sk("puts"), d.get("note") or ""))
+                rows[iid] = (p, d)
+        fill()
+
+        def pick():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Saved overlords", "Choose one first.", parent=w)
+                return None
+            return rows[sel[0]]
+
+        def load():
+            x = pick()
+            if x:
+                self.ol_load(x[1], parent=w)
+                fill()
+
+        def export():
+            x = pick()
+            if x:
+                self.ol_export(x[1], parent=w)
+
+        def delete():
+            x = pick()
+            if x and messagebox.askyesno("Saved overlords", f"Delete '{x[1].get('name')}'?", parent=w):
+                try:
+                    os.remove(x[0])
+                except OSError:
+                    pass
+                fill()
+                self.refresh_overlord(force=True)
+        bar = tk.Frame(w, bg=BG)
+        bar.pack(fill="x", padx=12, pady=10)
+        for txt_, fn in (("Use this one", load), ("Export...", export), ("Delete", delete),
+                         ("Import a file...", lambda: (self.ol_import(parent=w), fill()))):
+            ttk.Button(bar, text=txt_, command=fn).pack(side="left", padx=(0, 6))
+        ttk.Button(bar, text="Close", command=w.destroy).pack(side="right")
+        tree.bind("<Double-1>", lambda e: load())
+
+    def build_overlord_tab(self, tab):
+        """The Overlord tab: its verdict, how far it has learned, its skill as it learns, its read on each ticker, the
+        kinds of bot it listens to, and its saved brains."""
+        outer = tk.Frame(tab, bg=BG)
+        outer.pack(fill="both", expand=True)
+        cv = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(cv, bg=BG, padx=6, pady=6)
+        win = cv.create_window(0, 0, window=body, anchor="nw")
+        body.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        cv.bind("<Enter>", lambda e: cv.bind_all("<MouseWheel>", lambda ev: cv.yview_scroll(-int(ev.delta / 120) or
+                                                                                            (-1 if ev.delta > 0 else 1), "units")))
+        cv.bind("<Leave>", lambda e: cv.unbind_all("<MouseWheel>"))
+        ui = self._ol = {}
+        top = tk.Frame(body, bg=BG)
+        top.pack(fill="x")
+        for i, wt in enumerate((5, 3, 3)):
+            top.grid_columnconfigure(i, weight=wt, uniform="oltop")
+        # verdict
+        f, c = self.card(top, None)
+        f.grid(row=0, column=0, sticky="nsew")
+        hd = tk.Frame(c, bg=CARD)
+        hd.pack(fill="x")
+        tk.Label(hd, text="♛ THE OVERLORD", bg=CARD, fg=self.OL_GOLD, font=("", 16, "bold")).pack(side="left")
+        ui["name"] = tk.Label(hd, text="", bg=CARD, fg=MUTED, font=("", 9))
+        ui["name"].pack(side="left", padx=(10, 0), pady=(6, 0))
+        ui["big"] = tk.Label(c, text="", bg=CARD, fg=TEXT, font=("", 13, "bold"), anchor="w")
+        ui["big"].pack(fill="x", pady=(6, 0))
+        ui["verdict"] = tk.Label(c, text="", bg=CARD, fg=TEXT, anchor="w", justify="left", wraplength=520)
+        ui["verdict"].pack(fill="x", pady=(2, 0))
+        ui["watch"] = tk.Label(c, text="", bg=CARD, fg=MUTED, anchor="w", justify="left", wraplength=520, font=("", 8))
+        ui["watch"].pack(fill="x", pady=(6, 0))
+        # progress
+        f, c = self.card(top, "HOW FAR IT HAS LEARNED")
+        f.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        ui["hours"] = tk.Label(c, text="", bg=CARD, fg=TEXT, font=("", 15, "bold"), anchor="w")
+        ui["hours"].pack(fill="x")
+        ui["bar"] = ttk.Progressbar(c, maximum=E.OL_MIN_EFF, mode="determinate")
+        ui["bar"].pack(fill="x", pady=(4, 2))
+        ui["hours_note"] = tk.Label(c, text="", bg=CARD, fg=MUTED, anchor="w", justify="left", wraplength=260, font=("", 8))
+        ui["hours_note"].pack(fill="x")
+        ui["on"] = tk.BooleanVar(value=bool(self.settings.get("overlord", True)))
+        ttk.Checkbutton(c, text="Learning", variable=ui["on"],
+                        command=lambda: (self._set_flag("settings", "overlord", ui["on"].get()),
+                                         self.refresh_overlord(force=True))).pack(anchor="w", pady=(6, 0))
+        # skill
+        f, c = self.card(top, "ITS SKILL (VS GUESSING THE USUAL RATE)")
+        f.grid(row=0, column=2, sticky="nsew", padx=(10, 0))
+        for side, col in (("calls", self.OL_CALL), ("puts", self.OL_PUT)):
+            r = tk.Frame(c, bg=CARD)
+            r.pack(fill="x", pady=(2, 0))
+            tk.Label(r, text=side.title(), bg=CARD, fg=col, font=("", 10, "bold"), width=6, anchor="w").pack(side="left")
+            ui["sk_" + side] = tk.Label(r, text="", bg=CARD, fg=TEXT, font=("", 15, "bold"), anchor="w")
+            ui["sk_" + side].pack(side="left")
+            ui["paid_" + side] = tk.Label(c, text="", bg=CARD, fg=MUTED, anchor="w", font=("", 8))
+            ui["paid_" + side].pack(fill="x")
+        tk.Label(c, text="Above +2% means it knows something; around 0, it doesn't.", bg=CARD, fg=MUTED, anchor="w",
+                 justify="left", wraplength=260, font=("", 8)).pack(fill="x", pady=(6, 0))
+        mid = tk.Frame(body, bg=BG)
+        mid.pack(fill="x", pady=(10, 0))
+        mid.grid_columnconfigure(0, weight=1, uniform="olmid")
+        mid.grid_columnconfigure(1, weight=1, uniform="olmid")
+        f, c = self.card(mid, "ITS READ RIGHT NOW: HOW LIKELY A CONTRACT BOUGHT NOW PAYS FOR ITSELF IN AN HOUR")
+        f.grid(row=0, column=0, sticky="nsew")
+        ui["read"] = tk.Canvas(c, bg=CARD, highlightthickness=0, height=170)
+        ui["read"].pack(fill="both", expand=True)
+        ui["read_note"] = tk.Label(c, text="", bg=CARD, fg=MUTED, anchor="w", justify="left", wraplength=520, font=("", 8))
+        ui["read_note"].pack(fill="x")
+        f, c = self.card(mid, "ITS SKILL AS IT LEARNS")
+        f.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        ui["chart"] = tk.Canvas(c, bg=CARD, highlightthickness=0, height=190)
+        ui["chart"].pack(fill="both", expand=True)
+        low = tk.Frame(body, bg=BG)
+        low.pack(fill="x", pady=(10, 0))
+        low.grid_columnconfigure(0, weight=3, uniform="ollow")
+        low.grid_columnconfigure(1, weight=2, uniform="ollow")
+        f, c = self.card(low, "WHO IT LISTENS TO (WHEN THIS KIND OF BOT SAYS BUY...)")
+        f.grid(row=0, column=0, sticky="nsew")
+        ui["who"] = tk.Canvas(c, bg=CARD, highlightthickness=0, height=260)
+        ui["who"].pack(fill="both", expand=True)
+        f, c = self.card(low, "WHAT ELSE IT WEIGHS")
+        f.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        ui["ctx"] = tk.Canvas(c, bg=CARD, highlightthickness=0, height=260)
+        ui["ctx"].pack(fill="both", expand=True)
+        f, c = self.card(body, "SAVED OVERLORDS")
+        f.pack(fill="x", pady=(10, 0))
+        bar = tk.Frame(c, bg=CARD)
+        bar.pack(fill="x")
+        for txt_, fn in (("Save as...", self.ol_save_as), ("Saved overlords...", self.ol_library),
+                         ("Export to a file...", self.ol_export), ("Import a file...", self.ol_import),
+                         ("Start a new one...", self.ol_reset), ("Refresh", lambda: self.refresh_overlord(force=True))):
+            ttk.Button(bar, text=txt_, command=fn).pack(side="left", padx=(0, 6))
+        ui["saved"] = tk.Label(c, text="", bg=CARD, fg=MUTED, anchor="w", justify="left", wraplength=1000, font=("", 8))
+        ui["saved"].pack(fill="x", pady=(6, 0))
+        for k in ("read", "chart", "who", "ctx"):
+            ui[k].bind("<Configure>", lambda e: self.root.after_idle(lambda: self.refresh_overlord(redraw_only=True)))
+        self.root.after(1500, self.refresh_overlord)
+
+    def _ol_genes(self):
+        t = self.tourn
+        return self.school_genes(t) if t is not None else []
+
+    def refresh_overlord(self, force=False, redraw_only=False):
+        ui = getattr(self, "_ol", None)
+        if not ui:
+            return
+        try:
+            st = E.overlord_status()
+            if not redraw_only:
+                self._ol_fill_text(ui, st)
+            self._ol_draw_read(ui["read"], self._overlord_now_safe(force=force), st)
+            self._ol_draw_chart(ui["chart"])
+            self._ol_draw_who(ui["who"])
+            self._ol_draw_ctx(ui["ctx"])
+        except tk.TclError:
+            pass
+        except Exception:
+            self._record_error("the Overlord tab")
+
+    def _ol_fill_text(self, ui, st):
+        on = bool(self.settings.get("overlord", True))
+        ui["on"].set(on)
+        sk = [st[s_]["skill"] for s_ in ("calls", "puts") if st[s_]["skill"] is not None]
+        hrs = st["calls"]["hours"]
+        if not on:
+            big, col = "SWITCHED OFF", MUTED
+        elif not sk:
+            big, col = "LEARNING", self.OL_GOLD
+        elif max(sk) > 0.02:
+            big, col = "KNOWS SOMETHING", GREEN
+        else:
+            big, col = "NO SKILL YET", RED
+        ui["big"].config(text=big, fg=col)
+        ui["verdict"].config(text=st["verdict"] + ("" if on else " Learning is switched off (tick Learning to resume)."))
+        meta = E.OVERLORD_META
+        ui["name"].config(text=" · ".join(x for x in (meta.get("name") or "", (meta.get("origin") or "") if meta.get("origin") != "new" else "",
+                                                      f"born {datetime.fromtimestamp(float(meta['born'])):%b %d}" if meta.get("born") else "") if x))
+        genes = self._ol_genes()
+        kinds = {E._ol_kind(n, tf) for n, _, tf in genes}
+        need = ""
+        if not self.settings.get("signal_school", True):
+            need = " It learns with the Signal school, which is switched off: switch it on (Settings > Wildcard)."
+        elif self.cfg.get("essentials"):
+            need = " Essentials only is on, so it isn't learning: press Essentials only again to let it."
+        ui["watch"].config(text=f"Watching {len(kinds)} kinds of bot ({len(genes)} settings) on "
+                                f"{len(self.session_coins or [])} tickers, every 15 minutes. It learns on the session's own "
+                                "candles and every Free roam stretch. It doesn't trade yet." + need)
+        ui["hours"].config(text=f"{hrs:,} of {E.OL_MIN_EFF} hours" if hrs < E.OL_MIN_EFF else f"{hrs:,} hours")
+        ui["bar"].config(value=min(hrs, E.OL_MIN_EFF))
+        ui["hours_note"].config(text=(f"{st['calls']['examples']:,} examples graded (4 share each hour, so a quarter count as "
+                                      "independent). " + ("Its skill counts from 200 hours: Free roam gets it there fastest."
+                                                          if hrs < E.OL_MIN_EFF else "Its skill counts now.")))
+        for side in ("calls", "puts"):
+            x = st[side]
+            raw = E._ol_raw_skill("b" if side == "calls" else "s")
+            if x["skill"] is not None:
+                ui["sk_" + side].config(text=f"{x['skill'] * 100:+.1f}%", fg=GREEN if x["skill"] > 0.02 else RED if x["skill"] < 0 else TEXT)
+            else:
+                ui["sk_" + side].config(text="not yet" if raw is None else f"({raw * 100:+.1f}%)", fg=MUTED)
+            ui["paid_" + side].config(text=(f"a {side[:-1]} paid {x['paid'] * 100:.0f}% of the time" if x["paid"] is not None
+                                            else "nothing graded yet") + ("" if x["skill"] is not None else
+                                                                          "  (in brackets: too early to count)"))
+        sv = self.ol_saved()
+        ui["saved"].config(text=(f"{len(sv)} saved: " + ", ".join(f"{d.get('name')} ({datetime.fromtimestamp(float(d.get('saved_at') or 0)):%b %d})"
+                                                                   for _, d in sv[:6]) + (" ..." if len(sv) > 6 else "")
+                                 if sv else "None saved yet. Save one to keep it, share it as a file, or bring it back later. "
+                                            "Loading, importing or starting over always saves the current one first."))
+
+    def _ol_draw_read(self, cv, now, st):
+        cv.delete("all")
+        W = max(300, cv.winfo_width())
+        sk = [st[s_]["skill"] for s_ in ("calls", "puts") if st[s_]["skill"] is not None]
+        knows = bool(sk) and max(sk) > 0.02
+        if not now:
+            cv.create_text(10, 20, anchor="w", fill=MUTED, text="Nothing yet: it needs a running farm and 400+ candles.")
+            self._ol["read_note"].config(text="")
+            return
+        x0, bw = 70, (W - 70 - 150) / 2
+        cv.create_text(x0, 10, anchor="w", text="CALL", fill=self.OL_CALL, font=("", 8, "bold"))
+        cv.create_text(x0 + bw + 10, 10, anchor="w", text="PUT", fill=self.OL_PUT, font=("", 8, "bold"))
+        y = 30
+        for c, r in now.items():
+            cv.create_text(6, y + 8, anchor="w", text=c, fill=TEXT, font=("", 10, "bold"))
+            for j, (p, usual, col) in enumerate(((r["call"], r["usual_call"] or 0, self.OL_CALL),
+                                                 (r["put"], r["usual_put"] or 0, self.OL_PUT))):
+                bx = x0 + j * (bw + 10)
+                cv.create_rectangle(bx, y, bx + bw - 10, y + 16, fill=LINE, outline="")
+                cv.create_rectangle(bx, y, bx + (bw - 10) * max(0.0, min(1.0, p)), y + 16, fill=col, outline="")
+                ux = bx + (bw - 10) * max(0.0, min(1.0, usual))
+                cv.create_line(ux, y - 3, ux, y + 19, fill=TEXT, width=2)
+                cv.create_text(bx + 4, y + 8, anchor="w", text=f"{p * 100:.0f}%", fill="#ffffff", font=("", 8, "bold"))
+            lean = ""
+            uc, up = r["usual_call"] or 0, r["usual_put"] or 0
+            if r["call"] >= 1.5 * uc and r["call"] / max(uc, 1e-9) >= r["put"] / max(up, 1e-9):
+                lean = "leans calls"
+            elif r["put"] >= 1.5 * up:
+                lean = "leans puts"
+            cv.create_text(W - 140, y + 8, anchor="w", text=(lean or "no lean") + ("" if knows else " (a guess)"),
+                           fill=(GREEN if lean and knows else MUTED), font=("", 9, "bold" if lean and knows else "normal"))
+            y += 30
+        cv.configure(height=max(80, y + 4))
+        self._ol["read_note"].config(text="Bar = its chance that a contract (2% out of the money, 14 days out) bought now "
+                                          "pays back its bid/ask gap and decay within the hour; the dark tick is how often "
+                                          "that usually happens. " + ("" if knows else "Until it has skill these are only "
+                                                                                       "guesses, and nothing it says trades."))
+
+    def _ol_draw_chart(self, cv):
+        cv.delete("all")
+        W, H = max(300, cv.winfo_width()), max(150, cv.winfo_height())
+        pts = [p for p in E.OVERLORD_HIST if p[2] is not None or p[3] is not None]
+        if len(pts) < 2:
+            cv.create_text(10, 20, anchor="w", fill=MUTED, text="Its record starts after its first few hours of examples.")
+            return
+        L, R, T, B = 46, 10, 12, H - 24
+        xs = [p[1] for p in pts]
+        ys = [v for p in pts for v in (p[2], p[3]) if v is not None]
+        lo, hi = min(-0.05, min(ys)), max(0.05, max(ys))
+        x0 = min(xs)
+        x1 = max(max(xs), x0 + 1)
+        fx = lambda h: L + (W - L - R) * (h - x0) / max(1e-9, x1 - x0)
+        fy = lambda v: B - (B - T) * (v - lo) / max(1e-9, hi - lo)
+        for v, dash, lab in ((0.0, None, "0"), (0.02, (3, 3), "+2%")):
+            cv.create_line(L, fy(v), W - R, fy(v), fill=MUTED if v == 0 else GREEN, dash=dash)
+            if v == 0 or abs(fy(0.02) - fy(0.0)) >= 10:  # (labels too close together would overlap)
+                cv.create_text(L - 4, fy(v), anchor="e", text=lab, fill=MUTED, font=("", 7))
+        cv.create_text(L - 4, fy(hi), anchor="e", text=f"{hi * 100:+.0f}%", fill=MUTED, font=("", 7))
+        cv.create_text(L - 4, fy(lo), anchor="e", text=f"{lo * 100:+.0f}%", fill=MUTED, font=("", 7))
+        if x0 < E.OL_MIN_EFF <= x1:
+            cv.create_line(fx(E.OL_MIN_EFF), T, fx(E.OL_MIN_EFF), B, fill=self.OL_GOLD, dash=(2, 3))
+            cv.create_text(fx(E.OL_MIN_EFF) + 3, T + 2, anchor="nw", text="counts from here", fill=self.OL_GOLD, font=("", 7))
+        for k, col in ((2, self.OL_CALL), (3, self.OL_PUT)):
+            line = [c_ for p in pts if p[k] is not None for c_ in (fx(p[1]), fy(p[k]))]
+            if len(line) >= 4:
+                cv.create_line(*line, fill=col, width=2)
+        cv.create_text(L, H - 10, anchor="w", text=f"{int(x0):,} h", fill=MUTED, font=("", 7))
+        cv.create_text(W - R, H - 10, anchor="e", text=f"{int(x1):,} independent hours", fill=MUTED, font=("", 7))
+        cv.create_text(W / 2 - 40, H - 10, anchor="e", text="— calls", fill=self.OL_CALL, font=("", 8, "bold"))
+        cv.create_text(W / 2 - 30, H - 10, anchor="w", text="— puts", fill=self.OL_PUT, font=("", 8, "bold"))
+
+    def _ol_bars(self, cv, rows, title_l, title_r, empty):
+        """Rows of two diverging bars (calls, puts) around a centre line: [(label, call weight, put weight)]."""
+        cv.delete("all")
+        W = max(300, cv.winfo_width())
+        if not rows:
+            cv.create_text(10, 20, anchor="w", fill=MUTED, text=empty)
+            return
+        lw = min(210, int(W * 0.42))
+        bw = (W - lw - 20) / 2
+        m = max(1e-6, max(abs(x) for _, a, b in rows for x in (a, b)))
+        cv.create_text(lw + bw / 2, 8, text=title_l, fill=self.OL_CALL, font=("", 8, "bold"))
+        cv.create_text(lw + 10 + bw * 1.5, 8, text=title_r, fill=self.OL_PUT, font=("", 8, "bold"))
+        y = 24
+        for lab, a, b in rows:
+            cv.create_text(4, y + 7, anchor="w", text=lab, fill=TEXT, font=("", 8))
+            for j, (v, col) in enumerate(((a, self.OL_CALL), (b, self.OL_PUT))):
+                cx = lw + j * (bw + 10) + bw / 2
+                cv.create_line(cx, y - 2, cx, y + 16, fill=LINE)
+                ln = (bw / 2 - 4) * v / m
+                cv.create_rectangle(min(cx, cx + ln), y + 2, max(cx, cx + ln), y + 12, fill=col if v > 0 else MUTED, outline="")
+            y += 20
+        cv.configure(height=max(60, y + 4))
+
+    def _ol_draw_who(self, cv):
+        wb, ws = E._ol_model("b")["w"], E._ol_model("s")["w"]
+        keys = sorted({k for k in list(wb) + list(ws) if k.startswith("lean:")},
+                      key=lambda k: -(abs(wb.get(k, 0)) + abs(ws.get(k, 0))))[:12]
+        rows = []
+        for k in keys:
+            name, pace = k[5:].split("|") if "|" in k[5:] else (k[5:], "")
+            rows.append((f"{STRAT_LABELS.get(name, name)} (every {pace})", wb.get(k, 0.0), ws.get(k, 0.0)))
+        self._ol_bars(cv, rows, "calls pay more ->", "puts pay more ->",
+                      "Nothing learned yet. Bars to the right: when that kind of bot says buy, calls (or puts) paid more often.")
+
+    def _ol_draw_ctx(self, cv):
+        wb, ws = E._ol_model("b")["w"], E._ol_model("s")["w"]
+        names = {"agree:buy": "many strategies say buy", "agree:sell": "many strategies say sell",
+                 "tod:o": "first hour", "tod:m": "middle of the day", "tod:l": "last two hours",
+                 "swing:calm": "calmer than usual", "swing:normal": "usual swings", "swing:wild": "wilder than usual",
+                 "trend:up": "rising this hour", "trend:flat": "flat this hour", "trend:down": "falling this hour"}
+        rows = [(lab, wb.get(k, 0.0), ws.get(k, 0.0)) for k, lab in names.items() if k in wb or k in ws]
+        self._ol_bars(cv, rows, "calls", "puts", "Nothing learned yet.")
+
+    def _ol_home_banner(self):
+        """A strip on Home: the overlord's state and its read, one click from its tab."""
+        home = getattr(self, "_home", None)
+        if home is None:
+            return
+        f = tk.Frame(home, bg=CARD, highlightthickness=1, highlightbackground=self.OL_GOLD, padx=12, pady=8, cursor="hand2")
+        kids = home.pack_slaves()
+        f.pack(fill="x", pady=(0, 10), before=kids[0] if kids else None)
+        tk.Label(f, text="♛ OVERLORD", bg=CARD, fg=self.OL_GOLD, font=("", 11, "bold")).pack(side="left")
+        lbl = self._ol_banner = tk.Label(f, text="", bg=CARD, fg=TEXT, anchor="w", justify="left", font=("", 9))
+        lbl.pack(side="left", padx=(12, 0), fill="x", expand=True)
+        go = tk.Label(f, text="Open ▸", bg=CARD, fg=ACCENT, font=("", 9, "bold"), cursor="hand2")
+        go.pack(side="right")
+        for w_ in (f, lbl, go):
+            w_.bind("<Button-1>", lambda e: self.show_tab("Overlord"))
+        self._ol_tick()
+
+    def _ol_tick(self):
+        """Every 30 s: the Home strip; and the Overlord tab when it's open (its read is refreshed once a minute)."""
+        try:
+            st = E.overlord_status()
+            sk = [st[s_]["skill"] for s_ in ("calls", "puts") if st[s_]["skill"] is not None]
+            hrs = st["calls"]["hours"]
+            if not self.settings.get("overlord", True):
+                txt = "Switched off."
+            elif not sk:
+                txt = f"Learning: {hrs:,} of {E.OL_MIN_EFF} hours before its skill counts. It watches every kind of bot; it doesn't trade yet."
+            else:
+                txt = st["verdict"]
+            now = getattr(self, "_ol_now_cache", None)
+            if now and now[1]:
+                leans = [f"{c} {'calls' if r['call'] / max(r['usual_call'] or 1e-9, 1e-9) >= r['put'] / max(r['usual_put'] or 1e-9, 1e-9) else 'puts'}"
+                         for c, r in now[1].items() if r["call"] >= 1.5 * (r["usual_call"] or 1) or r["put"] >= 1.5 * (r["usual_put"] or 1)]
+                if leans and sk and max(sk) > 0.02:
+                    txt += "  Leaning now: " + ", ".join(leans) + "."
+            if getattr(self, "_ol_banner", None) is not None:
+                self._ol_banner.config(text=txt)
+            if "Overlord" in self.cur_tab() and not self.in_bg():
+                self.refresh_overlord()
+        except tk.TclError:
+            pass
+        except Exception:
+            self._record_error("the overlord strip")
+        if not self.closing():
+            self.root.after(30000, self._ol_tick)
+
+    def build_nav(self):
+        NavMixin.build_nav(self)  # (farmcore) ...then the overlord's strip on Home
+        try:
+            self._ol_home_banner()
+        except Exception:
+            self._record_error("the overlord strip")
+
+    def _overlord_now_safe(self, force=False):
+        """The overlord's read on the session's tickers right now ({} when it can't say); worked out at most once a
+        minute."""
+        c_ = getattr(self, "_ol_now_cache", None)
+        if c_ and not force and time.time() - c_[0] < 60:
+            return c_[1]
+        out = self._overlord_now_calc()
+        self._ol_now_cache = (time.time(), out)
+        return out
+
+    def _overlord_now_calc(self):
         try:
             t = self.tourn
             if t is None or not self.session_coins or not self.settings.get("overlord", True):
@@ -16599,53 +17146,18 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             return {}
 
     def open_overlord(self, parent=None):
-        """Learning > Overlord: one model watching every kind of bot, what it has learned, and its read right now."""
+        """Learning > Overlord: a short summary and the way to its own tab."""
         if parent is None:
-            return self.open_hub("learning", "Overlord")
-        txt = tk.Text(parent, wrap="word", padx=10, pady=8, bg=CARD, fg=TEXT, relief="flat", font=("Consolas", 10))
-        txt.tag_configure("h", font=("", 11, "bold"))
-        txt.tag_configure("good", foreground=GREEN)
-        txt.tag_configure("bad", foreground=RED)
-        txt.tag_configure("dim", foreground=MUTED)
-        put = lambda s_, tag=None: txt.insert("end", s_, tag)
+            return self.show_tab("Overlord")
         st = E.overlord_status()
-        put("THE OVERLORD\n", "h")
-        put("One model that watches every kind of bot on the farm. Every 15 minutes, on every ticker, it sees how each "
-            "kind (strategy and pace) is leaning, how many different strategies agree, the time of day, how wild the "
-            "stock is and which way it has been going, and learns whether a call or a put bought then would have paid "
-            "for itself an hour later (2% out of the money, 14 days out, after its bid/ask gap and decay). Each example "
-            "is scored before it's learned from, so its skill is measured on data it hadn't seen. It learns on the "
-            "session's candles and every Free roam stretch (with the Signal school). It doesn't trade yet.\n\n", "dim")
-        sk = [st[s_]["skill"] for s_ in ("calls", "puts") if st[s_]["skill"] is not None]
-        put(st["verdict"] + "\n\n", "good" if sk and max(sk) > 0.02 else "bad" if sk else None)
-        for side in ("calls", "puts"):
-            x = st[side]
-            put(f"{side.upper()}\n", "h")
-            put(f"  {x['examples']:,} examples ({x['hours']:,} independent hours); a contract paid "
-                f"{(x['paid'] or 0) * 100:.0f}% of the time; skill: "
-                + ("not yet" if x["skill"] is None else f"{x['skill'] * 100:+.1f}% vs guessing") + "\n")
-            if x["listens"]:
-                put("  listens most to: " + ", ".join(
-                    f"{STRAT_LABELS.get(k.split('|')[0], k.split('|')[0])} (every {k.split('|')[1]}) "
-                    f"{'+' if w > 0 else '-'}" for k, w in x["listens"][:5]) + "\n", "dim")
-                put("  (+ = when that kind says buy, " + ("calls" if side == "calls" else "puts")
-                    + " paid more often; - = less often)\n", "dim")
-        now = self._overlord_now_safe()
-        put("\nITS READ RIGHT NOW\n", "h")
-        if not now:
-            put("  nothing yet (it needs a running farm and 400+ candles)\n", "dim")
-        for c, r in now.items():
-            uc, up = r["usual_call"] or 0, r["usual_put"] or 0
-            put(f"  {c}: a call {r['call'] * 100:.0f}% likely to pay (usually {uc * 100:.0f}%), a put "
-                f"{r['put'] * 100:.0f}% (usually {up * 100:.0f}%)")
-            if sk and max(sk) > 0.02 and (r["call"] >= 1.5 * uc or r["put"] >= 1.5 * up):
-                put("  <- it would lean " + ("calls" if r["call"] / max(uc, 1e-9) >= r["put"] / max(up, 1e-9) else "puts"),
-                    "good")
-            put("\n")
-        if not sk:
-            put("  (until it has skill these are only its guesses, not calls)\n", "dim")
-        txt.config(state="disabled")
-        txt.pack(fill="both", expand=True)
+        f = tk.Frame(parent, bg=BG, padx=20, pady=20)
+        f.pack(fill="both", expand=True)
+        tk.Label(f, text="♛ THE OVERLORD", bg=BG, fg=self.OL_GOLD, font=("", 16, "bold")).pack(anchor="w")
+        tk.Label(f, text=st["verdict"], bg=BG, fg=TEXT, wraplength=900, justify="left").pack(anchor="w", pady=(8, 0))
+        tk.Label(f, text="It has its own tab in the main window now, with its skill, its read on each ticker, who it listens "
+                         "to, and saving, exporting and importing overlords.", bg=BG, fg=MUTED, wraplength=900,
+                 justify="left").pack(anchor="w", pady=(8, 12))
+        ttk.Button(f, text="Open the Overlord tab", command=lambda: (self.show_tab("Overlord"), self.root.lift())).pack(anchor="w")
 
     def open_school(self, parent=None):
         """Learning > Signal school: how each kind of signal did on the stock, and what a contract needs to pay for itself."""

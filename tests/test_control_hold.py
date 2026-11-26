@@ -130,3 +130,17 @@ def test_big_farms_move_to_fewer_bots_that_live_longer_once():
     small = E.merge_settings({"max_bots": 24, "retire_hours": 0, "defaults_rev": 3})
     assert small["max_bots"] == 24 and small["retire_hours"] == 0  # already small, and "never": kept
     assert E.DEFAULT_SETTINGS["retire_hours"] == 48.0 and E.DEFAULT_SETTINGS["min_hold"] == 60
+
+
+def test_a_bot_that_joins_with_a_replayed_history_gets_its_live_window(monkeypatch):
+    t, closes = _farm(n=700)
+    cl = {c: E.View(closes[c], 700) for c in closes}
+    grad = t.add_variant("RSI", dict(E.STRATS["RSI"]["params"]), cl, 1.0, note="From the auto training camp:", tf=1,
+                         origin="training camp")
+    assert grad is not None and grad.age >= t.window_for(grad.tf)  # its replay made it a full window "old" at once
+    real = t.score
+    monkeypatch.setattr(t, "score", lambda v: None if v is grad else real(v))  # ...and the replay didn't score it
+    assert grad.live_n == 0 and t.young(grad)  # no live decision yet: too new to judge
+    assert grad not in [v for v, _ in t.weakest()]  # so it's never the one dropped to make room
+    grad.live_n = t.window_for(grad.tf)
+    assert not t.young(grad) and grad in [v for v, _ in t.weakest()]  # a full live window later, it's judged like anyone

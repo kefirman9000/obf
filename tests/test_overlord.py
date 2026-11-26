@@ -1,5 +1,7 @@
 """1.49: the overlord, one model that watches every kind of bot and learns whether a call or a put bought then would
 have paid for itself an hour later (watch and report only)."""
+import json
+import math
 import random
 
 import pytest
@@ -106,3 +108,62 @@ def test_it_is_kept_in_the_learning_book_and_shows_in_the_report(tmp_path, monke
              overlord=dict(E.overlord_status(), now={"T0": dict(call=0.4, put=0.3, usual_call=0.35, usual_put=0.35)}))
     text = M.App._report_summary(d)
     assert "--- Overlord" in text and "now T0: call 40%" in text
+
+
+def _trained():
+    closes, extra = _prices(9, n=2500, trend=True)
+    E.merge_overlord(E.school_study(closes, extra, GENES)["overlord"])
+
+
+def test_a_saved_overlord_comes_back_exactly_and_keeps_its_record():
+    E.OVERLORD_HIST.clear()
+    _trained()
+    assert E.OVERLORD_HIST and E.OVERLORD_META.get("born")
+    d = json.loads(json.dumps(E.overlord_pack("Trend hunter", "a test")))
+    assert d["kind"] == E.OL_FORMAT and d["summary"]["calls"]["hours"] > 0
+    before = {k: dict(m) for k, m in E.OVERLORD.items()}
+    E.overlord_reset()
+    assert not E.OVERLORD and not E.OVERLORD_HIST
+    assert E.overlord_install(d, origin="imported from x.json") == "Trend hunter"
+    assert E.OVERLORD["b"]["w"] == before["b"]["w"] and E.OVERLORD["s"]["n"] == before["s"]["n"]
+    assert E.OVERLORD_HIST and E.OVERLORD_META["origin"] == "imported from x.json"
+    f = {"bias": 1.0, "trend:up": 1.0}
+    assert E.overlord_prob("b", f) == pytest.approx(1 / (1 + math.exp(-sum(before["b"]["w"].get(k, 0) for k in f))))
+
+
+@pytest.mark.parametrize("bad", [None, {}, {"kind": "something else"}, {"kind": E.OL_FORMAT, "models": {}},
+                                 {"kind": E.OL_FORMAT, "version": 99, "models": {"b": {}, "s": {}}},
+                                 {"kind": E.OL_FORMAT, "models": {"b": {"w": {"x": "nan"}}, "s": {}}},
+                                 {"kind": E.OL_FORMAT, "models": {"b": {"w": {"x": "abc"}}, "s": {}}}])
+def test_files_that_arent_overlords_are_refused_and_change_nothing(bad):
+    _trained()
+    n = E.OVERLORD["b"]["n"]
+    with pytest.raises(ValueError):
+        E.overlord_install(bad)
+    assert E.OVERLORD["b"]["n"] == n
+
+
+def test_the_app_saves_backs_up_and_lists_overlords(tmp_path, monkeypatch):
+    pytest.importorskip("tkinter")
+    import types
+
+    import main as M
+    monkeypatch.setattr(E, "HOME_DIR", str(tmp_path))
+    a = types.SimpleNamespace(settings=dict(E.DEFAULT_SETTINGS), logs=[])
+    for k in ("ol_dir", "ol_saved", "_ol_write", "_ol_backup", "learning_path", "save_learning_book", "load_learning_book"):
+        setattr(a, k, (lambda fn: lambda *x, **kw: fn(a, *x, **kw))(getattr(M.App, k)))
+    a._ol_backup("a test")
+    assert a.ol_saved() == []  # nothing learned: nothing to back up
+    _trained()
+    E.OVERLORD_META["name"] = "Mine"
+    a._ol_backup("loading another")
+    a._ol_write(E.overlord_pack("Second", "kept"))
+    names = [d["name"] for _, d in a.ol_saved()]
+    assert names[0] == "Second" and names[1].startswith("Backup before loading another")
+    (tmp_path / "overlords" / "junk.json").write_text("{not json")
+    assert len(a.ol_saved()) == 2  # unreadable files are left out
+    hist, meta = [list(x) for x in E.OVERLORD_HIST], dict(E.OVERLORD_META)
+    a.save_learning_book()
+    E.overlord_reset()
+    a.load_learning_book()
+    assert E.OVERLORD_HIST == hist and E.OVERLORD_META["name"] == "Mine" and E.OVERLORD_META["born"] == meta["born"]
