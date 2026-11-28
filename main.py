@@ -5933,7 +5933,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         and their bid/ask gap is what scalpers pay. Needs the Alpaca login."""
         if not self.client or getattr(self, "_quotes_busy", False):
             return
-        if not (0 < E.minutes_to_close(time.time()) <= 390) or datetime.now().weekday() >= 5:
+        if not E.market_hours(time.time()) or datetime.now().weekday() >= 5:
             return
         seen = getattr(self, "_quotes_at", {})
         due = [c for c in self.session_coins if time.time() - seen.get(c, 0) > 900]
@@ -7121,12 +7121,15 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             per["candle"].set(cn)
             per["length"].set(rng.choice(fits))
             days = dict(self.PERIODS)[per["length"].get()]
-            if rng.random() < 0.3:
-                per["when"].set("Most recent")
-            else:  # somewhere in the last 3 years (newer tickers don't go back further)
-                back = rng.uniform(days + 2, max(days + 3, 3 * 365))
-                per["when"].set("Starting on")
-                per["date"].set((datetime.now() - timedelta(days=back)).strftime("%Y-%m-%d"))
+            # somewhere in the last 3 years (newer tickers don't go back further), ending before the farm's own
+            # history starts: graduates join by replaying those prices, and a camp held on them picks bots that already
+            # know them (in the 11/28 report every top bot was such a graduate: 100% winners on the replay, while 10 of
+            # 13 failed their exams on prices they hadn't seen)
+            t0s = [x["t"][0] for x in (getattr(self, "hx", None) or {}).values() if isinstance(x, dict) and x.get("t")]
+            own = max(0.0, (time.time() - min(t0s)) / 86400) if t0s else 10.0
+            back = rng.uniform(days + own + 2, max(days + own + 3, 3 * 365))
+            per["when"].set("Starting on")
+            per["date"].set((datetime.now() - timedelta(days=back)).strftime("%Y-%m-%d"))
             passes.set(str(n_pass))
             size.set(str(rng.choice([20, 30, 40])))
             exam.set("25%")
@@ -7989,7 +7992,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             bars = {}
             for d in order[:8]:
                 day0 = E.ny_time(d.isoformat(), 9, 30)
-                close = day0 + 390 * 60
+                close = day0 + E.session_minutes(day0) * 60
                 bars = {}
                 got_any = False
                 for i, sym in enumerate(tickers + ["VIXY", "SPY"]):
@@ -8074,7 +8077,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         allg = genes + newbies
         who = {g["uid"]: E.bot_nickname(E.bot_key(g)) for g in allg}
         day0 = E.ny_time(day.isoformat(), 9, 30)
-        close = day0 + 390 * 60
+        close = day0 + E.session_minutes(day0) * 60
         on_day = {c: [p for p, tt in zip(b["c"], b["t"]) if tt >= day0] for c, b in trade.items()}
         on_day = {c: p for c, p in on_day.items() if len(p) > 2}
         n_ = min(len(p) for p in on_day.values())
@@ -9906,8 +9909,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         mkt = self.market if isinstance(self.market, dict) else {}
         if "is_open" in mkt:
             return bool(mkt.get("is_open"))
-        m = E.minutes_to_close(time.time())
-        return 0 < m <= 390 and datetime.now().weekday() < 5
+        return E.market_hours(time.time()) and datetime.now().weekday() < 5
 
     def expiring_soon(self, extra=0):
         """Labels of account contracts inside the expiry window (+ extra trading days)."""
@@ -11013,7 +11015,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             return
         dte, otm = E.dte_for(g), float(g.get("otm", 1.0) or 1.0)
         scalp = g.get("_scalp")
-        if scalp and not (scalp["flatby"] < E.minutes_to_close(time.time()) <= 390):
+        if scalp and not (scalp["flatby"] < E.minutes_to_close(time.time()) <= E.session_minutes(time.time())):
             return  # scalps only open during the trading day, never in the scalpers' last minutes
         if scalp:
             dte = max(dte, int(self.settings.get("expiry_days", 2) or 2) + 1)  # the expiry guard still decides the soonest contract
@@ -14087,7 +14089,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         auto = bool(self.settings.get("alpaca_adopt_all", False))
         if (not kept and not auto) or not E.ALPACA.get("key") or not self.client or getattr(self, "_kept_busy", False):
             return
-        if not (0 < E.minutes_to_close(time.time()) <= 390) or datetime.now().weekday() >= 5:
+        if not E.market_hours(time.time()) or datetime.now().weekday() >= 5:
             return
         if time.time() - getattr(self, "_kept_try", 0) < 55:
             return
@@ -14664,7 +14666,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         option quotes. It moves with the VIX itself, minute by minute (VIXY, the VIX fund, follows it slowly)."""
         if not self.client or time.time() - getattr(self, "_ivx_at", 0) < 55 or not E.scalp_share(self.settings):
             return
-        if not (0 < E.minutes_to_close(time.time()) <= 390) or datetime.now().weekday() >= 5:
+        if not E.market_hours(time.time()) or datetime.now().weekday() >= 5:
             return
         self._ivx_at = time.time()
         S = self.last.get("SPY") or (E.spot_many(["SPY"]) or {}).get("SPY")
@@ -16708,7 +16710,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
             if (self.settings.get("rotate_tickers", True) and self.running and self.wild and self.tourn is not None
                     and self.seeded and mkt.get("is_open") and self.cfg.get("rotated_day") != today
                     and not getattr(self, "_rotating", False) and not self.cfg.get("essentials")
-                    and E.minutes_to_close(time.time()) <= 375):
+                    and E.minutes_since_open(time.time()) >= 15):
                 self.rotate_tickers()
         except Exception:
             self._record_error("ticker rotation")

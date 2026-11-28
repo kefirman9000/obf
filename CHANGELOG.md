@@ -10,6 +10,24 @@
 
 
 
+## 1.49.1
+From the 11/28 report:
+- **The coin-flip check no longer counts replayed history.** A bot joining the farm replays recent prices to get a
+  record, and those trades went into the farm's side of the check (the coin-flip bots never get a replay). The farm's
+  side showed 65% winners and +4.8% a typical trade while the bots' real trades won 33% at -5.7%: the "beats coin
+  flips" verdict was mostly replays. Replayed trades also no longer count toward the finished trades a bot needs
+  before it may vote.
+- **Training camp graduates no longer come back as copies.** Auto training camps often start from your current farm,
+  and the same bot rejoined again and again (three Lucky Wolfs, two Jade Foxes), each copy pushing another bot off the
+  farm. A training camp or Free roam graduate that's already on the farm isn't added again.
+- **Auto training camps train on prices before the farm's own.** Graduates join by replaying the farm's recent prices;
+  a camp held on those same prices picked bots that already knew them. Every top bot in the report was a graduate with
+  a 100% winning replay, and 10 of the 13 failed their exams on prices they hadn't seen.
+- **Half days close at 1 pm.** The day after Thanksgiving, and Christmas Eve and July 3 on Monday to Thursday. On 11/27
+  the app treated 1 pm as mid-afternoon: none of the "goes flat before the close" sells happened, bots opened contracts
+  at 12:54 and 12:57 despite their closing-minutes rules, and the report flagged the thin prints after the close as
+  gaps in the price feed. Candles after a half day's close are left out now, like after-hours ones.
+
 ## 1.49.0
 - **The overlord.** The account only ever heard from a few proven bots (with none proven, from stand-ins on a lucky
   streak); what the rest of the farm was saying was thrown away. The overlord is one model that watches every kind of

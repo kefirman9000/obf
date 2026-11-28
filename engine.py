@@ -351,7 +351,7 @@ def regular_hours(t, gran):
         return False
     m = ny.hour * 60 + ny.minute
     first = 9 * 60 if gran >= 3600 else 9 * 60 + 30  # the 9:00 hourly bar holds the 9:30 open
-    return first <= m < 16 * 60
+    return first <= m < close_hour(ny) * 60
 
 
 def _hist_path(coin, gran, year):
@@ -1543,11 +1543,46 @@ def ny_hour(ts):
     return (d - timedelta(hours=_ny_offset(d))).hour
 
 
+def half_day(d):
+    """True on the US stock market's 1 pm early-close days: the day after Thanksgiving, and Christmas Eve and July 3
+    when they fall Monday to Thursday (on a Friday they're the holiday itself). On 11/27 the app still treated 1 pm as
+    the middle of the afternoon: nothing went flat before the close and bots opened contracts at 12:54 and 12:57."""
+    if d.month == 11 and d.weekday() == 4:
+        first = datetime(d.year, 11, 1).weekday()
+        thanksgiving = 1 + (3 - first) % 7 + 21
+        return d.day == thanksgiving + 1
+    if (d.month, d.day) in ((12, 24), (7, 3)):
+        return d.weekday() <= 3
+    return False
+
+
+def close_hour(ny):
+    """The hour (New York) the regular session ends on that day: 16, or 13 on a half day."""
+    return 13 if half_day(ny) else 16
+
+
+def session_minutes(ts):
+    """Length of that day's regular session in minutes: 390, or 210 on a half day."""
+    d = datetime.fromtimestamp(ts, timezone.utc)
+    return 390 if close_hour(d - timedelta(hours=_ny_offset(d))) == 16 else 210
+
+
 def minutes_to_close(ts):
-    """Minutes from ts until 4 pm New York on that day (negative after the close, over 390 before the 9:30 open)."""
+    """Minutes from ts until that day's close in New York (4 pm, 1 pm on a half day): negative after the close, over
+    session_minutes(ts) before the 9:30 open."""
     d = datetime.fromtimestamp(ts, timezone.utc)
     ny = d - timedelta(hours=_ny_offset(d))
-    return (ny.replace(hour=16, minute=0, second=0, microsecond=0) - ny).total_seconds() / 60
+    return (ny.replace(hour=close_hour(ny), minute=0, second=0, microsecond=0) - ny).total_seconds() / 60
+
+
+def minutes_since_open(ts):
+    """Minutes from that day's 9:30 open (New York) to ts (negative before it)."""
+    return session_minutes(ts) - minutes_to_close(ts)
+
+
+def market_hours(ts):
+    """True between the 9:30 open and that day's close (the weekday isn't checked)."""
+    return 0 < minutes_to_close(ts) <= session_minutes(ts)
 
 
 OPEN_SETTLE_MIN = 5  # minutes after the 9:30 open when bots' profit targets and trailing stops wait
@@ -1557,7 +1592,7 @@ def opening_rush(ts, within=OPEN_SETTLE_MIN):
     """True in the first `within` minutes after the 9:30 open (New York). The first prints of the day can be far off
     where the stock really trades, and option quotes are at their widest: on 11/12 NVDA's first print was $149.71
     (it was back over $160 ten minutes later), and three bots booked +300% to +1,300% on puts at that one print."""
-    m = 390 - minutes_to_close(ts)
+    m = minutes_since_open(ts)
     return 0 <= m < within
 
 
@@ -1591,7 +1626,7 @@ def opening_calm(ts):
 
 def open_spread_mult(ts):
     """How much wider option bid/ask gaps run right after the open than later in the day (estimated prices only)."""
-    m = 390 - minutes_to_close(ts)
+    m = minutes_since_open(ts)
     return 2.0 if 0 <= m < 5 else 1.5 if 0 <= m < 15 else 1.0
 
 
@@ -2711,10 +2746,11 @@ def _veto(v, k, x, c, closes, n, extra, coins):
         base = sum(vol[-L - 1:-1]) / L
         return base > 0 and vol[-1] < x * base
     if k in TIME_VETOES:
-        d = datetime.fromtimestamp(_bar_time(extra, c, v.sim), timezone.utc)
+        ts_ = _bar_time(extra, c, v.sim)
+        d = datetime.fromtimestamp(ts_, timezone.utc)
         ny = d - timedelta(hours=_ny_offset(d))
         m = ny.hour * 60 + ny.minute - (9 * 60 + 30)  # minutes since the open
-        return (0 <= m < x) if k == "opening" else (0 <= 390 - m <= x)
+        return (0 <= m < x) if k == "opening" else (0 <= session_minutes(ts_) - m <= x)  # (1 pm on half days)
     if k in ("preev", "prefed", "postev"):
         if not events():
             return False
@@ -2844,7 +2880,7 @@ def tod_bucket(ts):
     if not ts:
         return "m"
     left = minutes_to_close(ts)
-    return "o" if left > 330 else "l" if left <= 120 else "m"
+    return "o" if minutes_since_open(ts) < 60 else "l" if left <= 120 else "m"
 
 
 def bar_minutes_of(x):
@@ -3822,7 +3858,7 @@ def bot_step(v, closes, n, coins, extra=None):
             if opt and s == "sell" and sim.pos.get(c, 0) <= 0 and int(tr.get("omode", 3) or 3) == 1:
                 s = None  # calls-only bot with nothing to close
             if s and opt and tr.get("flatby") and sim.pos.get(c, 0) <= 0 \
-                    and not (tr["flatby"] < minutes_to_close(sim.now) <= 390):
+                    and not (tr["flatby"] < minutes_to_close(sim.now) <= session_minutes(sim.now)):
                 s = None  # scalper: only opens during the trading day, and not in its last minutes
             if s and opt and int(tr.get("vixmode", 5) or 5) != 5 and sim.pos.get(c, 0) <= 0 \
                     and not vix_allows(tr["vixmode"], vol_regime(closes, extra, c)[0]):
@@ -3965,9 +4001,9 @@ def market_conds(closes, extra, coins):
         note_error("market_conds")
     t = ((extra or {}).get(coins[0]) or {}).get("t")
     if t and len(t) >= 2 and t[-1] - t[-2] < 6 * 3600:
-        m = 390 - minutes_to_close(t[-1])  # minutes since the open
-        if 0 <= m <= 390:
-            out.append("tod:" + ("open" if m < 60 else "late" if m >= 330 else "mid"))
+        m = minutes_since_open(t[-1])  # minutes since the open
+        if 0 <= m <= session_minutes(t[-1]):
+            out.append("tod:" + ("open" if m < 60 else "late" if m >= session_minutes(t[-1]) - 60 else "mid"))
     if t and events():
         out.append("day:news" if _news_day(t[-1]) else "day:plain")
     return out
@@ -4014,6 +4050,7 @@ CONTROL_N = 6          # coin-flip bots per farm
 CONTROL_OPEN = 1 / 30  # chance a coin-flip bot opens a contract on a ticker at each of its decisions while flat there
 CONTROL_CLOSE = 1 / 45  # chance its "signal" says close at each decision while holding (its exits work as well)
 CONTROL_LIFE = 600     # decisions before a coin-flip bot is re-hatched from a fresh farm bot (it follows the farm)
+TWIN_CHECKED = ("training camp", "free roam")  # bots that join from these aren't added when an exact copy is on the farm
 CONTROL_KEEP = 600     # recent finished trades kept on each side of the comparison
 CONTROL_MIN = 30       # finished trades on each side before the comparison says anything
 FLIP_COPY = ("trail", "maxhold", "minhold", "exit", "adapt", "omode", "odte", "otm", "night", "maxotm", "oexit", "decay",
@@ -4110,6 +4147,7 @@ class Variant:
         # lifetime track record (since this bot was created)
         self.born_px = None
         self.age = self.ntrades = self.wins = self.losses = 0
+        self.replayed = 0  # finished trades that came from replaying old prices when it joined (not new evidence)
         self.win_steps = self.streak = 0
         self.peak, self.maxdd = 0.0, 0.0
         self.mood_gain = {}   # mood -> summed equity change (fraction) while that mood ruled
@@ -5462,6 +5500,8 @@ class Tournament(FarmMixin):
                     v.wins += 1
                 else:
                     v.losses += 1
+                if self.replaying:
+                    v.replayed = int(getattr(v, "replayed", 0) or 0) + 1
                 paid_ = t["usd"] - t["pl"]
                 if paid_ > 0:
                     pc_ = t["pl"] / paid_ * 100
@@ -5478,8 +5518,10 @@ class Tournament(FarmMixin):
                         self.learn_lesson(dict(t, strat=v.name, **habit_), pc_)
                     if not self.replaying:
                         self.note_habit(v, t, pc_)
-                    if isinstance(v.sim, OptionSim) and not is_scalp(v.name) and not is_kami(v):
-                        self.control_book["farm"].append(round(pc_, 2))  # (against the coin-flip bots')
+                    if not self.replaying and isinstance(v.sim, OptionSim) and not is_scalp(v.name) and not is_kami(v):
+                        # (against the coin-flip bots'; replayed history isn't: the coin-flip bots never get one, and in
+                        # the 11/28 report replays made the farm's side 65% winners while its real trades won 33%)
+                        self.control_book["farm"].append(round(pc_, 2))
                     if not self.replaying and isinstance(v.sim, OptionSim) and not is_scalp(v.name) and not is_kami(v) \
                             and (t.get("contract") or {}).get("t0"):
                         judge_learn(trade_features(dict(t, strat=v.name, tf=v.tf)), pc_ > 0)
@@ -5747,7 +5789,9 @@ class Tournament(FarmMixin):
             return ["kamikazes don't trade the account (Settings > Wildcard)"]
         gaps = []
         need = int(self.o.get("proven_trades", 8) or 0)
-        closed = v.wins + v.losses + exam_trades(v)  # trades on days it never trained on count: they're the best evidence
+        # trades on days it never trained on count: they're the best evidence. Trades from replaying old prices when it
+        # joined don't: a training camp graduate replayed onto the prices its camp just picked it on wins them all
+        closed = v.wins + v.losses - int(getattr(v, "replayed", 0) or 0) + exam_trades(v)
         if closed < need:
             gaps.append(f"{need - closed} more finished trade{'s' if need - closed != 1 else ''}")
         window = self.window_for(v.tf)
@@ -6111,12 +6155,18 @@ class Tournament(FarmMixin):
                 val = dv
             p[k] = int(round(val)) if isinstance(dv, int) else round(val, 2)
         fix_params(name, p)
+        v = self._new(name, p, tf, risk, traits, vetoes, layers)
+        if origin in TWIN_CHECKED and any(x.key() == v.key() for x in self.vars):
+            # already on the farm (on any island): auto training camps start from the current farm and sent the same
+            # bot back again and again (3 Lucky Wolfs and 2 Jade Foxes in the 11/28 report), each copy pushing a
+            # different bot off the farm and voting a second time for the same idea
+            self.events.append(f"Not added (already on the farm): {v.label}")
+            return None
         if len(self.vars) >= self.cap:  # a full farm makes room first (never for a bot too young to judge)
             cands = [x for x, _ in self.weakest() if x not in self.active]
             if cands:
                 self._remove(cands[0], "dropped to make room")
                 self.events.append(f"Dropped {cands[0].label}")
-        v = self._new(name, p, tf, risk, traits, vetoes, layers)
         self._register(v, [], origin)
         v.size_mult = min(max(float(size), 0.25), 3.0)
         if closes:
@@ -6223,7 +6273,7 @@ class Tournament(FarmMixin):
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
-                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src", "legend_src", "trade_pcts", "best_pl", "windfalls", "habits")
+                "backtests", "own_review", "roam_scan", "exams", "cond_gain", "cond_n", "hs_src", "mine_src", "legend_src", "trade_pcts", "best_pl", "windfalls", "habits", "replayed")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -6566,7 +6616,7 @@ def _fresh_money(t):
         v.veto_wait, v.lost_at, v.entry_flags, v.conf_last = [], {}, {}, {}
         v.log.clear()
         v.born_px = None
-        v.age = v.ntrades = v.wins = v.losses = v.win_steps = v.streak = 0
+        v.age = v.ntrades = v.wins = v.losses = v.win_steps = v.streak = v.replayed = 0
         v.peak, v.maxdd, v.strikes, v.live_n, v.live_eq0 = 0.0, 0.0, 0, 0, None
         v.inducted = False
     t.hold_curve = deque([1.0], maxlen=t.W * 10 + 2)
