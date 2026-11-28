@@ -29,6 +29,9 @@ def _repeatable(monkeypatch):
     engine.SCHOOL_SEEN.clear()
     engine.JUDGE.clear()
     engine.JUDGE.update(w={}, n=0, wins=0.0, brier=[0.0, 0.0, 0.0])
+    # measured volatility is cached by the price list's id(): a list from an earlier test can leave its id behind for
+    # a new one, which then got the old list's volatility (test_pricing failed that way on Windows)
+    engine._VOL_CACHE.clear()
     yield
     for d, x in zip((engine.SCHOOL, engine.SCHOOL_SEEN, engine.JUDGE, engine.GATES), saved):
         d.clear()
