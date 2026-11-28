@@ -5,12 +5,15 @@ import random
 import engine as E
 from test_proving import farm, plain
 
+WEDNESDAY = 1795021200.0  # 2026-11-18, noon in New York
+
 
 def _buy(S, traits, hi):
     E.set_prem_range(0, hi)
     try:
         sim = E.make_sim(10000.0, 0.0, 0.5, genes=traits)
         sim._vol = lambda c: 0.5
+        sim.now = WEDNESDAY  # (a fixed weekday: from Saturday to Monday the test failed)
         ok = sim.buy("XYZ", S, 0)
         return ok, sim
     finally:
